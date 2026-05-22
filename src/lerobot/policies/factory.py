@@ -49,6 +49,7 @@ from .diffusion.configuration_diffusion import DiffusionConfig
 from .eo1.configuration_eo1 import EO1Config
 from .gaussian_actor.configuration_gaussian_actor import GaussianActorConfig
 from .groot.configuration_groot import GrootConfig
+from .latent_sde.configuration_latent_sde import LatentSDEConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
 from .pi05.configuration_pi05 import PI05Config
@@ -151,6 +152,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .eo1.modeling_eo1 import EO1Policy
 
         return EO1Policy
+    elif name == "latent_sde":
+        from .latent_sde.modeling_latent_sde import LatentSDEPolicy
+
+        return LatentSDEPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -203,6 +208,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return WallXConfig(**kwargs)
     elif policy_type == "eo1":
         return EO1Config(**kwargs)
+    elif policy_type == "latent_sde":
+        return LatentSDEConfig(**kwargs)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -410,6 +417,14 @@ def make_pre_post_processors(
         from .eo1.processor_eo1 import make_eo1_pre_post_processors
 
         processors = make_eo1_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
+    elif isinstance(policy_cfg, LatentSDEConfig):
+        from .latent_sde.processor_latent_sde import make_latent_sde_pre_post_processors
+
+        processors = make_latent_sde_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

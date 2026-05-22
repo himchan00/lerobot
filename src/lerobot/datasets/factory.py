@@ -51,13 +51,20 @@ def resolve_delta_timestamps(
             returns `None` if the resulting dict is empty.
     """
     delta_timestamps = {}
+    # Optional per-key override for observation features. When set, it takes precedence
+    # over the single-valued `observation_delta_indices` on a per-key basis. Use getattr
+    # so reward configs (which don't define this hook) are unaffected.
+    per_key_overrides = getattr(cfg, "observation_delta_indices_per_key", None) or {}
     for key in ds_meta.features:
         if key == REWARD and cfg.reward_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.reward_delta_indices]
         if key == ACTION and cfg.action_delta_indices is not None:
             delta_timestamps[key] = [i / ds_meta.fps for i in cfg.action_delta_indices]
-        if key.startswith(OBS_PREFIX) and cfg.observation_delta_indices is not None:
-            delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
+        if key.startswith(OBS_PREFIX):
+            if key in per_key_overrides:
+                delta_timestamps[key] = [i / ds_meta.fps for i in per_key_overrides[key]]
+            elif cfg.observation_delta_indices is not None:
+                delta_timestamps[key] = [i / ds_meta.fps for i in cfg.observation_delta_indices]
 
     if len(delta_timestamps) == 0:
         delta_timestamps = None

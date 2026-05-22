@@ -115,6 +115,18 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     def reward_delta_indices(self) -> list | None:  # type: ignore[type-arg]    #TODO: No implementation
         raise NotImplementedError
 
+    @property
+    def observation_delta_indices_per_key(self) -> dict[str, list[int]] | None:
+        """Per-feature override for `observation_delta_indices`.
+
+        When a key appears here, its delta indices take precedence over the single-valued
+        `observation_delta_indices` for that key only; other observation keys keep using
+        `observation_delta_indices`. Default `None` (no overrides) — unchanged behavior for
+        every existing policy. Useful when a policy needs different windows for proprio vs.
+        image streams (e.g. future states without future images).
+        """
+        return None
+
     @abc.abstractmethod
     def get_optimizer_preset(self) -> OptimizerConfig:
         raise NotImplementedError
