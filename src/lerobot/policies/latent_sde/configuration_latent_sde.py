@@ -144,6 +144,7 @@ class LatentSDEConfig(PreTrainedConfig):
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
     kl_weight: float = 1.0
+    kl_min: float = 0.0 # Per-dim KL floor in nats (free bits).
     z_log_sigma_min: float = -5.0
     z_log_sigma_max: float = 2.0
     deterministic_z_inference: bool = False

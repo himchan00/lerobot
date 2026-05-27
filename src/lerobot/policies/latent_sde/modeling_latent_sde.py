@@ -429,7 +429,7 @@ class LatentSDEModel(nn.Module):
             nll_loss = nll.mean()
 
         if self.use_latent_z:
-            kl_loss = _gaussian_kl_diag(mu_q, log_sigma_q, mu_p, log_sigma_p).mean()
+            kl_loss = _gaussian_kl_loss(mu_q, log_sigma_q, mu_p, log_sigma_p, self.config.kl_min).mean()
             loss = nll_loss + self.config.kl_weight * kl_loss
         else:
             kl_loss = torch.zeros((), device=nll_loss.device, dtype=nll_loss.dtype)
@@ -554,13 +554,24 @@ class LatentPosterior(nn.Module):
         return mu, log_sigma
 
 
-def _gaussian_kl_diag(
-    mu_q: Tensor, log_sigma_q: Tensor, mu_p: Tensor, log_sigma_p: Tensor
+def _gaussian_kl_loss(
+    mu_q: Tensor, log_sigma_q: Tensor, mu_p: Tensor, log_sigma_p: Tensor, kl_min: float = 0.0
 ) -> Tensor:
-    """KL[N(μ_q, diag σ_q²) || N(μ_p, diag σ_p²)], per-sample (sum over latent dim)."""
+    """KL[N(μ_q, diag σ_q²) || N(μ_p, diag σ_p²)] per sample, summed over latent dim.
+
+    kl_min: Per-dim KL floor in nats (free bits). Each dim's KL is clamped to
+        max(kl, kl_min) before summing, so the model uses up to kl_min nats
+        per dim without KL penalty, preventing posterior collapse.
+
+        For a task with N modes, set kl_min ≈ log(N) / z_dim so the total
+        budget z_dim × kl_min ≈ log(N) nats covers the mode bits.
+        E.g., N=2 → 0.35 (z_dim=2), 0.04 (z_dim=16). Default 0 disables.
+    """
     var_q = (2 * log_sigma_q).exp().clamp_min(1e-12)
     var_p = (2 * log_sigma_p).exp().clamp_min(1e-12)
     per_dim = 2 * (log_sigma_p - log_sigma_q) + (var_q + (mu_q - mu_p) ** 2) / var_p - 1.0
+    if kl_min > 0.0:
+        per_dim = per_dim.clamp_min(kl_min)
     return 0.5 * per_dim.sum(dim=-1)
 
 
