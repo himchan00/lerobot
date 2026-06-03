@@ -150,6 +150,16 @@ class LatentSDEConfig(PreTrainedConfig):
     deterministic_z_inference: bool = False
     conditional_prior: bool = True
 
+    # ---- VQ-VAE variant (mutually exclusive with the Gaussian CVAE) ---------------------------
+    # Discrete latent (van den Oord et al. 1711.00937): deterministic posterior + vector
+    # quantizer, categorical prior p(k|h) trained with CE on the posterior's index.
+    # Requires extras `lerobot[latent-sde-vq]`.
+    use_vq: bool = False
+    vq_codebook_size: int = 4
+    vq_commit_weight: float = 1.0 # matches VectorQuantize default
+    vq_decay: float = 0.8 # matches VectorQuantize default
+    vq_prior_weight: float = 1.0
+
     # ---- Optimization --------------------------------------------------------------------------
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
@@ -208,6 +218,18 @@ class LatentSDEConfig(PreTrainedConfig):
                 f"`z_posterior_hidden_dim` must be positive or None. Got "
                 f"{self.z_posterior_hidden_dim}."
             )
+
+        if self.use_vq:
+            if not self.use_latent_z:
+                raise ValueError("`use_vq=True` requires `use_latent_z=True`.")
+            if self.vq_codebook_size < 2:
+                raise ValueError(
+                    f"`vq_codebook_size` must be >= 2. Got {self.vq_codebook_size}."
+                )
+            if not (0.0 < self.vq_decay <= 1.0):
+                raise ValueError(f"`vq_decay` must be in (0, 1]. Got {self.vq_decay}.")
+            if self.vq_commit_weight < 0 or self.vq_prior_weight < 0:
+                raise ValueError("`vq_commit_weight` and `vq_prior_weight` must be non-negative.")
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)

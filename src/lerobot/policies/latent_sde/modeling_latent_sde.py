@@ -152,34 +152,61 @@ class LatentSDEModel(nn.Module):
         self.h_dim = cond_dim
         self.use_latent_z = config.use_latent_z
 
-        # use_latent_z=False → prior/posterior not built, z_dim=0, cond is just h.
+        # use_latent_z=False → no prior/posterior, z_dim=0. Otherwise: VQ-VAE if use_vq else Gaussian CVAE.
+        self.use_vq = config.use_vq
         if self.use_latent_z:
             z_dim = config.z_dim
             posterior_hidden = config.z_posterior_hidden_dim or cond_dim
-            if config.conditional_prior:
-                prior_hidden = config.z_prior_hidden_dim or cond_dim
-                self.prior = LatentPrior(
+            if self.use_vq:
+                from vector_quantize_pytorch import VectorQuantize
+                if config.conditional_prior:
+                    self.prior = LatentPriorVQ(
+                        h_dim=cond_dim,
+                        codebook_size=config.vq_codebook_size,
+                        hidden_dim=config.z_prior_hidden_dim or cond_dim,
+                    )
+                else:
+                    self.prior = LearnableCategoricalPrior(codebook_size=config.vq_codebook_size)
+                self.posterior = LatentPosteriorVQ(
                     h_dim=cond_dim,
+                    state_dim=config.robot_state_feature.shape[0],
+                    horizon=config.n_action_steps,
                     z_dim=z_dim,
-                    hidden_dim=prior_hidden,
+                    hidden_dim=posterior_hidden,
+                )
+                self.vq = VectorQuantize(
+                    dim=z_dim,
+                    codebook_size=config.vq_codebook_size,
+                    decay=config.vq_decay,
+                    commitment_weight=config.vq_commit_weight,
+                )
+            else:
+                if config.conditional_prior:
+                    prior_hidden = config.z_prior_hidden_dim or cond_dim
+                    self.prior = LatentPrior(
+                        h_dim=cond_dim,
+                        z_dim=z_dim,
+                        hidden_dim=prior_hidden,
+                        log_sigma_min=config.z_log_sigma_min,
+                        log_sigma_max=config.z_log_sigma_max,
+                    )
+                else:
+                    self.prior = StandardNormalPrior(z_dim=z_dim)
+                self.posterior = LatentPosterior(
+                    h_dim=cond_dim,
+                    state_dim=config.robot_state_feature.shape[0],
+                    horizon=config.n_action_steps,
+                    z_dim=z_dim,
+                    hidden_dim=posterior_hidden,
                     log_sigma_min=config.z_log_sigma_min,
                     log_sigma_max=config.z_log_sigma_max,
                 )
-            else:
-                self.prior = StandardNormalPrior(z_dim=z_dim)
-            self.posterior = LatentPosterior(
-                h_dim=cond_dim,
-                state_dim=config.robot_state_feature.shape[0],
-                horizon=config.n_action_steps,
-                z_dim=z_dim,
-                hidden_dim=posterior_hidden,
-                log_sigma_min=config.z_log_sigma_min,
-                log_sigma_max=config.z_log_sigma_max,
-            )
+                self.vq = None
         else:
             z_dim = 0
             self.prior = None
             self.posterior = None
+            self.vq = None
         self.z_dim = z_dim
 
         # Net input is the augmented state (n_obs_steps frames flattened) so the drift sees
@@ -273,16 +300,26 @@ class LatentSDEModel(nn.Module):
         deterministic: bool | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor | None:
-        """Sample z ~ p(z|h), or return μ_p if `deterministic`. Returns None when use_latent_z=False."""
+        """Sample z ~ p(z|h) (Gaussian or VQ-categorical). Returns None when use_latent_z=False."""
         if not self.use_latent_z:
             return None
         if deterministic is None:
             deterministic = self.config.deterministic_z_inference
-        mu_p, log_sigma_p = self.prior(h)
-        if deterministic:
-            return mu_p
-        eps = torch.randn(mu_p.shape, dtype=mu_p.dtype, device=mu_p.device, generator=generator)
-        return mu_p + log_sigma_p.exp() * eps
+        if self.use_vq:
+            logits = self.prior(h)
+            if deterministic:
+                k = logits.argmax(dim=-1)
+            else:
+                # `torch.multinomial` is the only categorical sampler that accepts `generator`.
+                probs = F.softmax(logits, dim=-1)
+                k = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+            return self.vq.get_output_from_indices(k)
+        else:
+            mu_p, log_sigma_p = self.prior(h)
+            if deterministic:
+                return mu_p
+            eps = torch.randn(mu_p.shape, dtype=mu_p.dtype, device=mu_p.device, generator=generator)
+            return mu_p + log_sigma_p.exp() * eps
 
     def step(
         self,
@@ -383,13 +420,19 @@ class LatentSDEModel(nn.Module):
 
         h = self.encode_observations(batch)                  # (B, cond_dim)
 
-        # CVAE: z ~ q (reparam) at training, KL[q||p] regularizes the prior. q sees the
-        # measured-state trajectory — same distribution as inference up to chunk length.
         if self.use_latent_z:
-            mu_p, log_sigma_p = self.prior(h)
-            mu_q, log_sigma_q = self.posterior(h, x_seq)
-            eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
-            z_q = mu_q + log_sigma_q.exp() * eps_z
+            if self.use_vq:
+                prior_logits = self.prior(h)
+                z_e = self.posterior(h, x_seq)
+                z_q_quant, idx_q, vq_commit_loss = self.vq(z_e.unsqueeze(1))
+                z_q = z_q_quant.squeeze(1)
+                vq_indices = idx_q.squeeze(1)
+                mu_p = log_sigma_p = mu_q = log_sigma_q = None
+            else:
+                mu_p, log_sigma_p = self.prior(h)
+                mu_q, log_sigma_q = self.posterior(h, x_seq)
+                eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
+                z_q = mu_q + log_sigma_q.exp() * eps_z
         else:
             mu_p = log_sigma_p = mu_q = log_sigma_q = None
             z_q = None
@@ -429,21 +472,39 @@ class LatentSDEModel(nn.Module):
             nll_loss = nll.mean()
 
         if self.use_latent_z:
-            kl_loss = _gaussian_kl_loss(mu_q, log_sigma_q, mu_p, log_sigma_p, self.config.kl_min).mean()
-            loss = nll_loss + self.config.kl_weight * kl_loss
+            if self.use_vq:
+                # k detached: prior CE doesn't backprop into posterior/codebook (van den Oord §3.2).
+                vq_prior_ce_loss = F.cross_entropy(prior_logits, vq_indices.detach())
+                loss = (
+                    nll_loss
+                    + vq_commit_loss  # pre-scaled by `commitment_weight` inside VectorQuantize
+                    + self.config.vq_prior_weight * vq_prior_ce_loss
+                )
+            else:
+                kl_loss = _gaussian_kl_loss(mu_q, log_sigma_q, mu_p, log_sigma_p, self.config.kl_min).mean()
+                loss = nll_loss + self.config.kl_weight * kl_loss
         else:
-            kl_loss = torch.zeros((), device=nll_loss.device, dtype=nll_loss.dtype)
             loss = nll_loss
 
         with torch.no_grad():
             loss_dict: dict[str, float] = {
                 "nll_loss": nll_loss.detach().item(),
-                "kl_loss": kl_loss.detach().item(),
                 "action_sigma_mean": log_sigma.exp().mean().item(),
             }
             if self.use_latent_z:
-                loss_dict["z_sigma_q_mean"] = log_sigma_q.exp().mean().item()
-                loss_dict["z_sigma_p_mean"] = log_sigma_p.exp().mean().item()
+                if self.use_vq:
+                    loss_dict["vq_commit_loss"] = vq_commit_loss.detach().item()
+                    loss_dict["vq_prior_ce_loss"] = vq_prior_ce_loss.detach().item()
+                    # Perplexity = exp(H(p)) over batch index distribution; max = K.
+                    counts = torch.bincount(vq_indices, minlength=self.config.vq_codebook_size).float()
+                    probs = counts / counts.sum().clamp_min(1.0)
+                    entropy = -(probs * (probs.clamp_min(1e-12)).log()).sum()
+                    loss_dict["vq_perplexity"] = entropy.exp().item()
+                    loss_dict["vq_active_codes"] = float((counts > 0).sum().item())
+                else:
+                    loss_dict["kl_loss"] = kl_loss.detach().item()
+                    loss_dict["z_sigma_q_mean"] = log_sigma_q.exp().mean().item()
+                    loss_dict["z_sigma_p_mean"] = log_sigma_p.exp().mean().item()
         return loss, loss_dict
 
 
@@ -554,6 +615,80 @@ class LatentPosterior(nn.Module):
         return mu, log_sigma
 
 
+class LearnableCategoricalPrior(nn.Module):
+    """Unconditional learnable prior over codebook indices: trainable logits θ ∈ ℝ^K.
+
+    Trained via CE against the posterior's (detached) index; softmax(θ) converges to the
+    empirical marginal p(k). Init zeros → uniform at start.
+    """
+
+    def __init__(self, codebook_size: int):
+        super().__init__()
+        self.logits = nn.Parameter(torch.zeros(codebook_size))
+
+    def forward(self, h: Tensor) -> Tensor:
+        return self.logits.unsqueeze(0).expand(h.shape[0], -1)
+
+
+class LatentPriorVQ(nn.Module):
+    """p(k | h) over codebook indices, parameterised as a 2-layer MLP classifier.
+
+    Trained via CE against the posterior's (detached) index. Head init zeros → uniform prior at init.
+    """
+
+    def __init__(self, h_dim: int, codebook_size: int, hidden_dim: int):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            nn.Linear(h_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Mish(),
+        )
+        self.head = nn.Linear(hidden_dim, codebook_size)
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, h: Tensor) -> Tensor:
+        return self.head(self.trunk(h))
+
+
+class LatentPosteriorVQ(nn.Module):
+    """Deterministic posterior for the VQ path: (h, x_seq) → z_e ∈ ℝ^{z_dim}.
+
+    Mirrors LatentPosterior's trunk with a single linear head (no σ); the quantizer downstream
+    snaps z_e to the nearest codebook entry. Horizon-tied via flattened x_seq.
+    """
+
+    def __init__(
+        self,
+        h_dim: int,
+        state_dim: int,
+        horizon: int,
+        z_dim: int,
+        hidden_dim: int,
+    ):
+        super().__init__()
+        self.horizon = horizon
+        traj_summary_dim = horizon * state_dim
+        self.trunk = nn.Sequential(
+            nn.Linear(h_dim + traj_summary_dim, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Mish(),
+        )
+        self.head = nn.Linear(hidden_dim, z_dim)
+
+    def forward(self, h: Tensor, x_seq: Tensor) -> Tensor:
+        B, H, _ = x_seq.shape
+        if H != self.horizon:
+            raise ValueError(
+                f"LatentPosteriorVQ built with horizon={self.horizon} but got x_seq with H={H}. "
+                "The flatten-based posterior is tied to a fixed horizon."
+            )
+        feat = self.trunk(torch.cat([h, x_seq.reshape(B, -1)], dim=-1))
+        return self.head(feat)
+
+
 def _gaussian_kl_loss(
     mu_q: Tensor, log_sigma_q: Tensor, mu_p: Tensor, log_sigma_p: Tensor, kl_min: float = 0.0
 ) -> Tensor:
@@ -569,10 +704,10 @@ def _gaussian_kl_loss(
     """
     var_q = (2 * log_sigma_q).exp().clamp_min(1e-12)
     var_p = (2 * log_sigma_p).exp().clamp_min(1e-12)
-    per_dim = 2 * (log_sigma_p - log_sigma_q) + (var_q + (mu_q - mu_p) ** 2) / var_p - 1.0
+    per_dim = (log_sigma_p - log_sigma_q) + 0.5 * (var_q + (mu_q - mu_p) ** 2) / var_p - 0.5
     if kl_min > 0.0:
         per_dim = per_dim.clamp_min(kl_min)
-    return 0.5 * per_dim.sum(dim=-1)
+    return per_dim.sum(dim=-1)
 
 
 class LatentSDEDriftDiffusionNet(nn.Module):

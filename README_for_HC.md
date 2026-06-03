@@ -37,7 +37,8 @@ lerobot-train \
     --job_name=diffusion_pusht \
     --batch_size=64 \
     --eval.use_async_envs=false \
-    --wandb.enable=True
+    --wandb.enable=True \
+    --wandb.project=lerobot_pusht
 ```
 
 > `batch_size=64`: `examples/training/train_policy.py`의 Diffusion+PushT 예제 값을 사용.
@@ -45,6 +46,20 @@ lerobot-train \
 > `--eval.use_async_envs=false`: Push-T는 eval async forkserver 워커에서 gym_pusht가 재등록 안 돼서 NamespaceNotFound 발생해서 -> false로 지정해서 우회.
 
 콘솔 스크립트가 안 잡히면 `python -m lerobot.scripts.lerobot_train ...` 로도 가능.
+
+## 2.1 Eval 커맨드 (저장된 체크포인트 필요)
+
+```bash
+lerobot-eval \
+    --policy.path=outputs/train/diffusion_pusht/checkpoints/100000/pretrained_model \
+    --env.type=pusht \
+    --eval.n_episodes=50 \
+    --eval.use_async_envs=false \
+    --output_dir=outputs/eval/diffusion_pusht \
+    --job_name=diffusion_pusht_eval \
+    --seed=1000
+```
+- `--policy.*` 오버라이드로 학습 시 config의 정책 옵션을 평가용으로만 바꿀 수 있음 (`deterministic_inference`, `n_action_steps` 등).
 
 
 ## 3. 메모
