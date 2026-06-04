@@ -463,13 +463,11 @@ class LatentSDEModel(nn.Module):
         nll = 0.5 * ((action_target - mean) ** 2 / var.clamp_min(1e-12) + 2 * log_std)
         nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
 
+        # Strict trajectory NLL: sum over H and action_dim, mean over batch.
         if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
-            in_episode_bound = ~batch["action_is_pad"]
-            mask = in_episode_bound.unsqueeze(-1).to(nll.dtype)
-            num_valid = mask.sum().clamp_min(1) * nll.shape[-1]
-            nll_loss = (nll * mask).sum() / num_valid
-        else:
-            nll_loss = nll.mean()
+            mask = (~batch["action_is_pad"]).unsqueeze(-1).to(nll.dtype)
+            nll = nll * mask
+        nll_loss = nll.sum(dim=(1, 2)).mean()
 
         if self.use_latent_z:
             if self.use_vq:
@@ -485,6 +483,9 @@ class LatentSDEModel(nn.Module):
                 loss = nll_loss + self.config.kl_weight * kl_loss
         else:
             loss = nll_loss
+
+        # Final normalization so optimizer/lr scale is independent of H, action_dim.
+        loss = loss / (H * action_dim)
 
         with torch.no_grad():
             loss_dict: dict[str, float] = {
