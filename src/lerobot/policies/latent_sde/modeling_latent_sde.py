@@ -382,15 +382,12 @@ class LatentSDEModel(nn.Module):
             "observation.state":  (B, n_obs_steps + H - 1, state_dim) — past + future
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
             "action":             (B, H=n_action_steps, action_dim)
-            "action_is_pad":      (B, H) bool — used iff config.do_mask_loss_for_padding.
+
+        Padding handling: chunks are kept padding-free by `config.drop_n_last_frames`
+        at the sampler level, so no loss masking is needed here.
         """
         assert set(batch).issuperset({OBS_STATE, ACTION})
         assert OBS_IMAGES in batch
-        if self.config.do_mask_loss_for_padding and "action_is_pad" not in batch:
-            raise ValueError(
-                "`action_is_pad` must be provided in the batch when "
-                "`do_mask_loss_for_padding` is True."
-            )
 
         action_target = batch[ACTION]                        # (B, H, action_dim)
         B, H, action_dim = action_target.shape
@@ -463,10 +460,7 @@ class LatentSDEModel(nn.Module):
         nll = 0.5 * ((action_target - mean) ** 2 / var.clamp_min(1e-12) + 2 * log_std)
         nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
 
-        # Strict trajectory NLL: sum over H and action_dim, mean over batch.
-        if self.config.do_mask_loss_for_padding and "action_is_pad" in batch:
-            mask = (~batch["action_is_pad"]).unsqueeze(-1).to(nll.dtype)
-            nll = nll * mask
+        # Sum over H and action_dim, mean over batch (chunks are padding-free via drop_n_last_frames).
         nll_loss = nll.sum(dim=(1, 2)).mean()
 
         if self.use_latent_z:

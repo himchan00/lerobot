@@ -80,13 +80,13 @@ class LatentSDEConfig(PreTrainedConfig):
                           to allow gradient flow.
 
     Removed (no analog in single-step SDE):
-        horizon, drop_n_last_frames, noise scheduler block, diffusion_step_embed_dim,
+        horizon, noise scheduler block, diffusion_step_embed_dim,
         num_inference_steps, kernel_size, clip_sample*.
     """
 
     # ---- Inputs / output structure ------------------------------------------------------------
     n_obs_steps: int = 2
-    n_action_steps: int = 32
+    n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -164,7 +164,9 @@ class LatentSDEConfig(PreTrainedConfig):
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
 
-    do_mask_loss_for_padding: bool = False
+    # Skip the last `drop_n_last_frames` anchors of each episode at sampling time so chunks
+    # never extend past episode end. None → auto = `n_action_steps - 1` (no padded actions).
+    drop_n_last_frames: int | None = None
 
     # ---- Training presets (copied verbatim from DiffusionConfig for fairness) ----------------
     optimizer_lr: float = 1e-4
@@ -176,6 +178,11 @@ class LatentSDEConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.drop_n_last_frames is None:
+            self.drop_n_last_frames = self.n_action_steps - 1
+        if self.drop_n_last_frames < 0:
+            raise ValueError(f"`drop_n_last_frames` must be >= 0. Got {self.drop_n_last_frames}.")
 
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
