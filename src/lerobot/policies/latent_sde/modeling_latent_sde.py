@@ -276,12 +276,8 @@ class LatentSDEModel(nn.Module):
     ) -> Tensor:
         log_sigma = log_sigma.clamp(self.config.log_sigma_min, self.config.log_sigma_max)
         sigma = log_sigma.exp()
-        if self.config.drift_target == "delta":
-            mean = x_now + mu * dt
-            std = sigma * (dt ** 0.5)
-        else:  # "absolute" — network outputs x_d directly
-            mean = mu
-            std = sigma
+        mean = x_now + mu * dt
+        std = sigma * (dt ** 0.5)
         if deterministic:
             return mean
         if noise is not None:
@@ -449,12 +445,8 @@ class LatentSDEModel(nn.Module):
 
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         dt_t = torch.tensor(dt, device=mu.device, dtype=mu.dtype)
-        if self.config.drift_target == "delta":
-            mean = x_seq + mu * dt
-            log_std = log_sigma + 0.5 * torch.log(dt_t)
-        else:  # "absolute"
-            mean = mu
-            log_std = log_sigma
+        mean = x_seq + mu * dt
+        log_std = log_sigma + 0.5 * torch.log(dt_t)
         var = (2 * log_std).exp()
 
         nll = 0.5 * ((action_target - mean) ** 2 / var.clamp_min(1e-12) + 2 * log_std)

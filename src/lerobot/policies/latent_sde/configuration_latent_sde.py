@@ -72,9 +72,6 @@ class LatentSDEConfig(PreTrainedConfig):
                           under teacher-forced demo actions — same per-image-encode
                           supervision budget as DP's horizon-length chunk loss.
         sde_dt:           Δt for one Euler-Maruyama step. Push-T fps=10 Hz → 0.1 s.
-        drift_target:     "delta" (network outputs per-second drift, scaled by dt) or
-                          "absolute" (network outputs x_d directly, dt-free). "delta"
-                          matches the SDE formulation literally.
         log_sigma_init:   initial bias of the log-σ head. -2.0 → σ ≈ 0.13 in normalized
                           action space — small enough not to overwhelm the drift, non-zero
                           to allow gradient flow.
@@ -118,7 +115,6 @@ class LatentSDEConfig(PreTrainedConfig):
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
-    drift_target: str = "delta"
     log_sigma_init: float = -2.0
     log_sigma_min: float = -5.0
     log_sigma_max: float = 2.0
@@ -144,16 +140,16 @@ class LatentSDEConfig(PreTrainedConfig):
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
     kl_weight: float = 1.0
-    kl_min: float = 0.0 # Per-dim KL floor in nats (free bits).
+    kl_min: float = 0.5 # Per-dim KL floor in nats (free bits).
     z_log_sigma_min: float = -5.0
     z_log_sigma_max: float = 2.0
     deterministic_z_inference: bool = False
-    conditional_prior: bool = True
+    conditional_prior: bool = False
 
     # ---- VQ-VAE variant (mutually exclusive with the Gaussian CVAE) ---------------------------
     # Discrete latent (van den Oord et al. 1711.00937): deterministic posterior + vector
     # quantizer, categorical prior p(k|h) trained with CE on the posterior's index.
-    # Requires extras `lerobot[latent-sde-vq]`.
+    # Requires extras `lerobot[latent_sde]`.
     use_vq: bool = False
     vq_codebook_size: int = 4
     vq_commit_weight: float = 1.0 # matches VectorQuantize default
@@ -187,11 +183,6 @@ class LatentSDEConfig(PreTrainedConfig):
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
-            )
-
-        if self.drift_target not in ("delta", "absolute"):
-            raise ValueError(
-                f"`drift_target` must be 'delta' or 'absolute'. Got {self.drift_target!r}."
             )
 
         if self.n_action_steps < 1:

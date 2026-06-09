@@ -113,7 +113,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # The original implementation doesn't sample frames for the last 7 steps,
     # which avoids excessive padding and leads to improved training results.
-    drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
+    drop_n_last_frames: int | None = None # default: horizon - n_action_steps - n_obs_steps + 1
 
     # Architecture / modeling.
     # Vision backbone.
@@ -162,6 +162,9 @@ class DiffusionConfig(PreTrainedConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.drop_n_last_frames is None:
+            self.drop_n_last_frames = self.horizon - self.n_action_steps - self.n_obs_steps + 1
 
         """Input validation (not exhaustive)."""
         if not self.vision_backbone.startswith("resnet"):
