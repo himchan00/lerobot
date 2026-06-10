@@ -53,6 +53,10 @@ class LatentSDEPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.model.parameters()
 
+    def set_train_dataset(self, dataset) -> None:
+        """Forward to the model (trainer calls this once after dataset construction)."""
+        self.model.set_train_dataset(dataset)
+
     def reset(self):
         """Clear observation queue and the cached image conditioning. Call on `env.reset()`."""
         self._queues = {
@@ -79,8 +83,8 @@ class LatentSDEPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """One SDE step per tick with per-tick state-feedback.
 
-        Refresh h and z together every `n_action_steps` ticks; otherwise read the latest
-        x and step the SDE with cached h, z. No action queue, no rollout-in-advance.
+        Refresh h every `n_action_steps` ticks. per_chunk re-samples z alongside h;
+        per_episode samples z once per reset() and holds it for the whole rollout.
         """
         if ACTION in batch:
             batch.pop(ACTION)
@@ -90,12 +94,13 @@ class LatentSDEPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         self._queues = populate_queues(self._queues, batch)
 
-        # Slow path: re-encode h and re-sample z in lock-step every n_action_steps ticks.
-        # z commits the chunk to one mode. sample_z_from_prior returns None when use_latent_z=False.
+        # Slow path: re-encode h every n_action_steps ticks. per_chunk re-samples z with h;
+        # per_episode samples once (held until reset() clears _cached_z).
         if self._cached_h is None or self._steps_until_h_refresh == 0:
             stacked_images = torch.stack(list(self._queues[OBS_IMAGES]), dim=1)
             self._cached_h = self.model.encode_observations({OBS_IMAGES: stacked_images})
-            self._cached_z = self.model.sample_z_from_prior(self._cached_h)
+            if not self.model.per_episode_z or self._cached_z is None:
+                self._cached_z = self.model.sample_z_from_prior(self._cached_h)
             self._steps_until_h_refresh = self.config.n_action_steps
 
         # Fast path: flatten the n_obs_steps state window into x_aug so the drift can read
@@ -148,74 +153,100 @@ class LatentSDEModel(nn.Module):
             self.rgb_encoder = DiffusionRgbEncoder(config)
             global_cond_dim += self.rgb_encoder.feature_dim * num_images
 
-        cond_dim = global_cond_dim * config.n_obs_steps  # h is stacked over n_obs_steps
-        self.h_dim = cond_dim
+        self.h_dim = global_cond_dim * config.n_obs_steps # h is stacked over n_obs_steps
         self.use_latent_z = config.use_latent_z
 
-        # use_latent_z=False → no prior/posterior, z_dim=0. Otherwise: VQ-VAE if use_vq else Gaussian CVAE.
+        # use_latent_z=False → no prior/posterior/vq, z_dim=0. Otherwise the three modules below
+        # branch on independent axes:
+        #   * self.prior     : (use_vq) × (config.conditional_prior)
+        #   * self.posterior : (use_vq) × (per_episode_z) — Traj* sees full episode, others H-chunk
+        #   * self.vq        : built iff use_vq
         self.use_vq = config.use_vq
-        if self.use_latent_z:
-            z_dim = config.z_dim
-            posterior_hidden = config.z_posterior_hidden_dim or cond_dim
+        self.per_episode_z = (config.z_sampling_mode == "per_episode")
+        self.state_dim = config.robot_state_feature.shape[0]
+        if not self.use_latent_z:
+            self.z_dim = 0
+            self.prior = None
+            self.posterior = None
+            self.vq = None
+        else:
+            self.z_dim = config.z_dim
+            posterior_hidden = config.z_posterior_hidden_dim or self.h_dim
+            prior_hidden = config.z_prior_hidden_dim or self.h_dim
+
             if self.use_vq:
-                from vector_quantize_pytorch import VectorQuantize
-                if config.conditional_prior:
-                    self.prior = LatentPriorVQ(
-                        h_dim=cond_dim,
+                self.prior = (
+                    LatentPriorVQ(
+                        h_dim=self.h_dim,
                         codebook_size=config.vq_codebook_size,
-                        hidden_dim=config.z_prior_hidden_dim or cond_dim,
+                        hidden_dim=prior_hidden,
                     )
-                else:
-                    self.prior = LearnableCategoricalPrior(codebook_size=config.vq_codebook_size)
-                self.posterior = LatentPosteriorVQ(
-                    h_dim=cond_dim,
-                    state_dim=config.robot_state_feature.shape[0],
-                    horizon=config.n_action_steps,
-                    z_dim=z_dim,
-                    hidden_dim=posterior_hidden,
+                    if config.conditional_prior
+                    else LearnableCategoricalPrior(codebook_size=config.vq_codebook_size)
                 )
+                self.posterior = (
+                    LatentPosteriorTrajVQ(
+                        state_dim=self.state_dim,
+                        z_dim=self.z_dim,
+                        hidden_dim=posterior_hidden,
+                        n_groups=config.n_groups,
+                    )
+                    if self.per_episode_z
+                    else LatentPosteriorVQ(
+                        h_dim=self.h_dim,
+                        state_dim=self.state_dim,
+                        horizon=config.n_action_steps,
+                        z_dim=self.z_dim,
+                        hidden_dim=posterior_hidden,
+                    )
+                )
+                from vector_quantize_pytorch import VectorQuantize
                 self.vq = VectorQuantize(
-                    dim=z_dim,
+                    dim=self.z_dim,
                     codebook_size=config.vq_codebook_size,
                     decay=config.vq_decay,
                     commitment_weight=config.vq_commit_weight,
                 )
             else:
-                if config.conditional_prior:
-                    prior_hidden = config.z_prior_hidden_dim or cond_dim
-                    self.prior = LatentPrior(
-                        h_dim=cond_dim,
-                        z_dim=z_dim,
+                self.prior = (
+                    LatentPrior(
+                        h_dim=self.h_dim,
+                        z_dim=self.z_dim,
                         hidden_dim=prior_hidden,
                         log_sigma_min=config.z_log_sigma_min,
                         log_sigma_max=config.z_log_sigma_max,
                     )
-                else:
-                    self.prior = StandardNormalPrior(z_dim=z_dim)
-                self.posterior = LatentPosterior(
-                    h_dim=cond_dim,
-                    state_dim=config.robot_state_feature.shape[0],
-                    horizon=config.n_action_steps,
-                    z_dim=z_dim,
-                    hidden_dim=posterior_hidden,
-                    log_sigma_min=config.z_log_sigma_min,
-                    log_sigma_max=config.z_log_sigma_max,
+                    if config.conditional_prior
+                    else StandardNormalPrior(z_dim=self.z_dim)
+                )
+                self.posterior = (
+                    LatentPosteriorTraj(
+                        state_dim=self.state_dim,
+                        z_dim=self.z_dim,
+                        hidden_dim=posterior_hidden,
+                        log_sigma_min=config.z_log_sigma_min,
+                        log_sigma_max=config.z_log_sigma_max,
+                        n_groups=config.n_groups,
+                    )
+                    if self.per_episode_z
+                    else LatentPosterior(
+                        h_dim=self.h_dim,
+                        state_dim=self.state_dim,
+                        horizon=config.n_action_steps,
+                        z_dim=self.z_dim,
+                        hidden_dim=posterior_hidden,
+                        log_sigma_min=config.z_log_sigma_min,
+                        log_sigma_max=config.z_log_sigma_max,
+                    )
                 )
                 self.vq = None
-        else:
-            z_dim = 0
-            self.prior = None
-            self.posterior = None
-            self.vq = None
-        self.z_dim = z_dim
 
-        # Net input is the augmented state (n_obs_steps frames flattened) so the drift sees
-        # first-differences ≈ velocity. Cond = concat([h, z]); widens by z_dim (0 if no z).
-        self.state_dim = config.robot_state_feature.shape[0]
+        # Net input is the augmented state (n_obs_steps frames flattened).
+        # Cond = concat([h, z]); widens by z_dim (0 if no z).
         self.net = LatentSDEDriftDiffusionNet(
             input_dim=self.state_dim * config.n_obs_steps,
             action_dim=config.action_feature.shape[0],
-            cond_dim=cond_dim + z_dim,
+            cond_dim=self.h_dim + self.z_dim,
             down_dims=config.down_dims,
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
@@ -224,6 +255,59 @@ class LatentSDEModel(nn.Module):
 
         if config.compile_model:
             self.net = torch.compile(self.net, mode=config.compile_mode)
+
+        # Per-episode mode pre-caches the normalized state trajectory of every episode in RAM.
+        # Populated by `set_train_dataset()` at training start; None otherwise.
+        self._episode_state_cache: dict[int, Tensor] | None = None
+
+    def set_train_dataset(self, dataset) -> None:
+        """Pre-cache normalized per-episode state trajectories. No-op outside per-episode mode.
+
+        State is MIN_MAX-normalized to [-1, 1] using `dataset.meta.stats['observation.state']`,
+        matching the live preprocessor. Memory is negligible (PushT: ~200 KB).
+        """
+        if not self.per_episode_z:
+            return
+
+        stats = dataset.meta.stats.get("observation.state")
+        if stats is None or "min" not in stats or "max" not in stats:
+            raise ValueError(
+                "Per-episode z requires dataset.meta.stats['observation.state'] with 'min'/'max'."
+            )
+        min_val = torch.as_tensor(stats["min"], dtype=torch.float32).reshape(-1)
+        max_val = torch.as_tensor(stats["max"], dtype=torch.float32).reshape(-1)
+        span = (max_val - min_val).clamp_min(1e-8)
+
+        # When `cfg.dataset.episodes` subsets the dataset, hf_dataset rows are densified and
+        # absolute episode indices must be remapped through the reader.
+        ep_indices = dataset.episodes if dataset.episodes is not None else range(dataset.meta.total_episodes)
+        abs_to_rel = getattr(getattr(dataset, "reader", None), "_absolute_to_relative_idx", None)
+
+        cache: dict[int, Tensor] = {}
+        for ep_idx in ep_indices:
+            ep = dataset.meta.episodes[ep_idx]
+            abs_rows = list(range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"])))
+            rows = abs_rows if abs_to_rel is None else [abs_to_rel[i] for i in abs_rows]
+            states = torch.stack(dataset.hf_dataset[rows]["observation.state"]).to(torch.float32)
+            cache[ep_idx] = ((2 * (states - min_val) / span - 1)).contiguous()
+        self._episode_state_cache = cache
+
+    def _get_episode_state_trajs(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        """Look up cached trajectories for `batch["episode_index"]`; return left-aligned
+        `padded` (B, T_max, D) and `valid_mask` (True at in-episode frames)."""
+        if self._episode_state_cache is None:
+            raise RuntimeError(
+                "Per-episode z mode requires set_train_dataset(dataset) before training."
+            )
+        if "episode_index" not in batch:
+            raise KeyError("Per-episode z mode requires 'episode_index' in the batch.")
+        ep_indices = batch["episode_index"]
+        device = ep_indices.device
+        trajs = [self._episode_state_cache[int(i)] for i in ep_indices.reshape(-1).tolist()]
+        lengths = torch.tensor([t.shape[0] for t in trajs], dtype=torch.long, device=device)
+        padded = nn.utils.rnn.pad_sequence(trajs, batch_first=True).to(device)
+        valid_mask = torch.arange(padded.shape[1], device=device)[None, :] < lengths[:, None]
+        return padded, valid_mask
 
     def encode_observations(self, batch: dict[str, Tensor]) -> Tensor:
         """Compute h, the image-only global conditioning vector.
@@ -393,10 +477,8 @@ class LatentSDEModel(nn.Module):
             f"vs config.n_action_steps={self.config.n_action_steps}."
         )
 
-        # state_full: (B, n_obs + H - 1, state_dim). Let x[t] := state at chunk-relative
-        # tick t (stored at state_full[:, base + t], base = n_obs - 1):
-        #   x_seq[k]     = x[k]
-        #   x_seq_aug[k] = flatten(x[k - n_obs + 1], ..., x[k]) 
+        # state_full: (B, n_obs + H - 1, state_dim). x_seq[k] = state at chunk-tick k;
+        # x_seq_aug[k] = flatten(x[k - n_obs + 1], ..., x[k]) — the SDE drift input.
         state_full = batch[OBS_STATE]
         expected_T = n_obs + H - 1
         if state_full.shape[1] != expected_T:
@@ -414,23 +496,39 @@ class LatentSDEModel(nn.Module):
         h = self.encode_observations(batch)                  # (B, cond_dim)
 
         if self.use_latent_z:
+            if self.per_episode_z:
+                # Full-episode trajectories from the RAM cache; left-aligned, padded.
+                ep_state_traj, valid_mask = self._get_episode_state_trajs(batch)
+                # Per-trajectory ELBO: window NLL is an unbiased estimator of the trajectory NLL
+                # up to T_ep/H, so scale KL by H/T_ep to match. clamp_min(H) guards degenerate eps.
+                ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
+                kl_scale = float(H) / ep_lengths  # (B,)
+                posterior_args = (ep_state_traj, valid_mask)
+            else:
+                kl_scale = 1.0
+                posterior_args = (h, x_seq)
+
             if self.use_vq:
                 prior_logits = self.prior(h)
-                z_e = self.posterior(h, x_seq)
-                z_q_quant, idx_q, vq_commit_loss = self.vq(z_e.unsqueeze(1))
+                z_e = self.posterior(*posterior_args)
+                z_q_quant, idx_q, _vq_lib_commit_loss = self.vq(z_e.unsqueeze(1))
                 z_q = z_q_quant.squeeze(1)
                 vq_indices = idx_q.squeeze(1)
+                # Per-sample commit & prior-CE so per_episode can apply H/T_ep per element.
+                # Commit reproduces the lib's formula (commitment_weight * mse(z_e, sg[z_q])).
+                vq_commit_per_sample = (z_e - z_q.detach()).pow(2).mean(dim=-1)  # (B,)
+                # k detached on the CE: prior doesn't backprop into posterior/codebook (van den Oord §3.2).
+                vq_prior_ce_per_sample = F.cross_entropy(prior_logits, vq_indices.detach(), reduction="none")  # (B,)
                 mu_p = log_sigma_p = mu_q = log_sigma_q = None
             else:
                 mu_p, log_sigma_p = self.prior(h)
-                mu_q, log_sigma_q = self.posterior(h, x_seq)
+                mu_q, log_sigma_q = self.posterior(*posterior_args)
                 eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
                 z_q = mu_q + log_sigma_q.exp() * eps_z
         else:
             mu_p = log_sigma_p = mu_q = log_sigma_q = None
             z_q = None
 
-        # Batched net forward: (B*H, n_obs * state_dim) with broadcast cond.
         flat_x_aug = x_seq_aug.reshape(B * H, -1)
         flat_h = h.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
         if self.use_latent_z:
@@ -452,21 +550,24 @@ class LatentSDEModel(nn.Module):
         nll = 0.5 * ((action_target - mean) ** 2 / var.clamp_min(1e-12) + 2 * log_std)
         nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
 
-        # Sum over H and action_dim, mean over batch (chunks are padding-free via drop_n_last_frames).
+        # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
         nll_loss = nll.sum(dim=(1, 2)).mean()
 
         if self.use_latent_z:
             if self.use_vq:
-                # k detached: prior CE doesn't backprop into posterior/codebook (van den Oord §3.2).
-                vq_prior_ce_loss = F.cross_entropy(prior_logits, vq_indices.detach())
-                loss = (
-                    nll_loss
-                    + vq_commit_loss  # pre-scaled by `commitment_weight` inside VectorQuantize
-                    + self.config.vq_prior_weight * vq_prior_ce_loss
-                )
+                vq_commit_loss = (kl_scale * vq_commit_per_sample).mean()
+                vq_prior_ce_loss = (kl_scale * vq_prior_ce_per_sample).mean()
+                other_loss = self.config.vq_commit_weight * vq_commit_loss + self.config.vq_prior_weight * vq_prior_ce_loss
+                # VQ losses are means over latent_dim; scale them up so the final divide
+                # by (H * action_dim) doesn't dwarf them next to the NLL.
+                other_loss = (H * action_dim) * other_loss
             else:
-                kl_loss = _gaussian_kl_loss(mu_q, log_sigma_q, mu_p, log_sigma_p, self.config.kl_min).mean()
-                loss = nll_loss + self.config.kl_weight * kl_loss
+                kl_per_sample = _gaussian_kl_loss(
+                    mu_q, log_sigma_q, mu_p, log_sigma_p, self.config.kl_min
+                )  # (B,)
+                kl_loss = (kl_scale * kl_per_sample).mean()
+                other_loss = self.config.kl_weight * kl_loss
+            loss = nll_loss + other_loss
         else:
             loss = nll_loss
 
@@ -479,6 +580,8 @@ class LatentSDEModel(nn.Module):
                 "action_sigma_mean": log_sigma.exp().mean().item(),
             }
             if self.use_latent_z:
+                if self.per_episode_z:
+                    loss_dict["ep_length_mean"] = ep_lengths.detach().mean().item()
                 if self.use_vq:
                     loss_dict["vq_commit_loss"] = vq_commit_loss.detach().item()
                     loss_dict["vq_prior_ce_loss"] = vq_prior_ce_loss.detach().item()
@@ -674,6 +777,113 @@ class LatentPosteriorVQ(nn.Module):
             )
         feat = self.trunk(torch.cat([h, x_seq.reshape(B, -1)], dim=-1))
         return self.head(feat)
+
+
+# ---- Per-episode latent z (config.z_sampling_mode='per_episode') ------------------------------
+# Variable-length encoder over the full episode state trajectory. Conv1d + masked GroupNorm +
+# masked mean-pool: output at valid positions is bit-equivalent to running on each episode's
+# exact-length tensor (pads are zeroed before each Conv1d so kernel-3 doesn't leak across).
+class _TrajStateEncoder(nn.Module):
+    """Two-layer masked Conv1d encoder + masked mean-pool, returning (B, hidden_dim)."""
+
+    def __init__(self, state_dim: int, hidden_dim: int, n_groups: int = 8):
+        super().__init__()
+        self.conv1 = nn.Conv1d(state_dim, hidden_dim, kernel_size=3, padding=1)
+        self.norm1 = _MaskedGroupNorm(n_groups, hidden_dim)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.norm2 = _MaskedGroupNorm(n_groups, hidden_dim)
+        self.act = nn.Mish()
+        self.post_pool = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Mish())
+
+    def forward(self, x_traj: Tensor, valid_mask: Tensor) -> Tensor:
+        # x_traj: (B, T, state_dim); valid_mask: (B, T) bool.
+        m = valid_mask.to(x_traj.dtype).unsqueeze(1)
+        h = x_traj.transpose(1, 2) * m                     # zero pads (kernel-3 leak)
+        h = self.act(self.norm1(self.conv1(h), valid_mask)) * m
+        h = self.act(self.norm2(self.conv2(h), valid_mask))
+        return self.post_pool(_masked_mean_pool(h, valid_mask))
+
+
+class LatentPosteriorTraj(nn.Module):
+    """q(z | x_{0:T}) — trajectory encoder → (μ, log σ)."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        z_dim: int,
+        hidden_dim: int,
+        log_sigma_min: float,
+        log_sigma_max: float,
+        n_groups: int = 8,
+    ):
+        super().__init__()
+        self.log_sigma_min = log_sigma_min
+        self.log_sigma_max = log_sigma_max
+        self.encoder = _TrajStateEncoder(state_dim, hidden_dim, n_groups)
+        self.mu_head = nn.Linear(hidden_dim, z_dim)
+        self.log_sigma_head = nn.Linear(hidden_dim, z_dim)
+        nn.init.zeros_(self.log_sigma_head.weight)
+        nn.init.zeros_(self.log_sigma_head.bias)
+
+    def forward(self, x_traj: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
+        feat = self.encoder(x_traj, valid_mask)
+        mu = self.mu_head(feat)
+        log_sigma = self.log_sigma_head(feat).clamp(self.log_sigma_min, self.log_sigma_max)
+        return mu, log_sigma
+
+
+class LatentPosteriorTrajVQ(nn.Module):
+    """Deterministic per-episode posterior — trajectory encoder → z_e."""
+
+    def __init__(self, state_dim: int, z_dim: int, hidden_dim: int, n_groups: int = 8):
+        super().__init__()
+        self.encoder = _TrajStateEncoder(state_dim, hidden_dim, n_groups)
+        self.head = nn.Linear(hidden_dim, z_dim)
+
+    def forward(self, x_traj: Tensor, valid_mask: Tensor) -> Tensor:
+        return self.head(self.encoder(x_traj, valid_mask))
+
+
+def _masked_mean_pool(h: Tensor, valid_mask: Tensor) -> Tensor:
+    """Mean of `h` (B, C, T) over T positions where `valid_mask` (B, T) is True."""
+    mask_f = valid_mask.to(h.dtype).unsqueeze(1)
+    summed = (h * mask_f).sum(dim=-1)
+    counts = mask_f.sum(dim=-1).clamp_min(1.0)
+    return summed / counts
+
+
+class _MaskedGroupNorm(nn.Module):
+    """GroupNorm with per-(batch, group) mean/var over `valid_mask` positions only.
+
+    Padded positions still receive the affine transform; caller must zero pads before the next
+    Conv1d so leaked values from kernel-3 don't pollute valid outputs.
+    """
+
+    def __init__(self, num_groups: int, num_channels: int, eps: float = 1e-5):
+        super().__init__()
+        if num_channels % num_groups != 0:
+            raise ValueError(f"num_channels={num_channels} not divisible by num_groups={num_groups}.")
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+
+    def forward(self, x: Tensor, valid_mask: Tensor) -> Tensor:
+        # x: (B, C, T); valid_mask: (B, T) bool
+        B, C, T = x.shape
+        G = self.num_groups
+        Cg = C // G
+        m = valid_mask.to(x.dtype).view(B, 1, 1, T)
+        x_g = x.view(B, G, Cg, T)
+        n_valid = m.sum(dim=-1, keepdim=True).clamp_min(1.0)    # guard all-pad samples
+        count = Cg * n_valid
+        mean = (x_g * m).sum(dim=(2, 3), keepdim=True) / count
+        diff = (x_g - mean) * m
+        var = (diff * diff).sum(dim=(2, 3), keepdim=True) / count
+        x_norm = (x_g - mean) / (var + self.eps).sqrt()
+        x_norm = x_norm.view(B, C, T)
+        return x_norm * self.weight.view(1, C, 1) + self.bias.view(1, C, 1)
 
 
 def _gaussian_kl_loss(

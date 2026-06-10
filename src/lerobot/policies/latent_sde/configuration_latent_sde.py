@@ -15,6 +15,7 @@
 # Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the SDE
 # is integrated one step at a time on the measured state x.
 
+import logging
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
@@ -127,8 +128,7 @@ class LatentSDEConfig(PreTrainedConfig):
 
     # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
     # use_latent_z=False recovers the no-z PoC exactly (prior/posterior not built, no KL).
-    # z_dim=16: Picked by analogy with ACT's CVAE (latent_dim=32, hidden_dim=512 → z/h = 1/16); we use a slightly
-    #   looser ratio since LatentSDE's chunk is shorter and h is image-only (no proprio).
+    # z_dim=8: Picked by analogy with ACT's CVAE (latent_dim=32, hidden_dim=512 → z/h = 1/16);
     # kl_weight: β on KL[q||p]. Too high → posterior collapse (q≡p, z carries no chunk info).
     #   Too low → q ignores prior (deployment z uninformed). 1e-2 .. 1.0 worth sweeping.
     # z_prior_hidden_dim / z_posterior_hidden_dim: hidden width of the (μ,σ) MLPs. None → h_dim.
@@ -136,7 +136,7 @@ class LatentSDEConfig(PreTrainedConfig):
     # conditional_prior: True → p(z|h) (2-layer MLP, current default). False → p(z) = N(0, I)
 
     use_latent_z: bool = True
-    z_dim: int = 16
+    z_dim: int = 8
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
     kl_weight: float = 1.0
@@ -146,12 +146,16 @@ class LatentSDEConfig(PreTrainedConfig):
     deterministic_z_inference: bool = False
     conditional_prior: bool = False
 
+    # z_sampling_mode: "per_chunk" → z resampled with h every n_action_steps (chunk-local posterior).
+    #                  "per_episode" → z sampled once per episode (full-trajectory posterior).
+    z_sampling_mode: str = "per_chunk"
+
     # ---- VQ-VAE variant (mutually exclusive with the Gaussian CVAE) ---------------------------
     # Discrete latent (van den Oord et al. 1711.00937): deterministic posterior + vector
     # quantizer, categorical prior p(k|h) trained with CE on the posterior's index.
     # Requires extras `lerobot[latent_sde]`.
     use_vq: bool = False
-    vq_codebook_size: int = 4
+    vq_codebook_size: int = 8
     vq_commit_weight: float = 1.0 # matches VectorQuantize default
     vq_decay: float = 0.8 # matches VectorQuantize default
     vq_prior_weight: float = 1.0
@@ -229,6 +233,17 @@ class LatentSDEConfig(PreTrainedConfig):
             if self.vq_commit_weight < 0 or self.vq_prior_weight < 0:
                 raise ValueError("`vq_commit_weight` and `vq_prior_weight` must be non-negative.")
 
+        if self.z_sampling_mode not in ("per_chunk", "per_episode"):
+            raise ValueError(
+                f"`z_sampling_mode` must be 'per_chunk' or 'per_episode'. Got {self.z_sampling_mode}."
+            )
+        if self.z_sampling_mode == "per_episode" and self.conditional_prior:
+            logging.warning(
+                "z_sampling_mode='per_episode' is incompatible with conditional_prior=True "
+                "falling back to conditional_prior=False."
+            )
+            self.conditional_prior = False
+
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
         ):
@@ -289,8 +304,10 @@ class LatentSDEConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
-        # State: past n_obs_steps + next H-1 frames, so compute_loss sees the actual
-        # demo state trajectory instead of teacher-forcing from demo actions.
+        # State: past n_obs_steps + next H-1 frames, so compute_loss sees the actual demo
+        # state trajectory instead of teacher-forcing from demo actions. per_episode mode
+        # keeps this same narrow window — the full episode trajectory is served via an
+        # in-RAM cache populated by `set_train_dataset()` at training start.
         return {OBS_STATE: list(range(1 - self.n_obs_steps, self.n_action_steps))}
 
     @property
