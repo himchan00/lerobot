@@ -119,6 +119,8 @@ class LatentSDEConfig(PreTrainedConfig):
     log_sigma_init: float = -2.0
     log_sigma_min: float = -5.0
     log_sigma_max: float = 2.0
+    # If True, learn log_sigma as a state-independent nn.Parameter of shape (action_dim,).
+    state_independent_sigma: bool = False
 
     # ---- Inference -----------------------------------------------------------------------------
     # If True, deploy with σ=0 (drift-only). Useful for sanity-checking the drift in

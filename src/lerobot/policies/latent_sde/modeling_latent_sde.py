@@ -251,6 +251,7 @@ class LatentSDEModel(nn.Module):
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
             log_sigma_init=config.log_sigma_init,
+            state_independent_sigma=config.state_independent_sigma,
         )
 
         if config.compile_model:
@@ -932,6 +933,7 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         n_groups: int = 8,
         use_film_scale_modulation: bool = True,
         log_sigma_init: float = -2.0,
+        state_independent_sigma: bool = False,
     ):
         super().__init__()
         assert len(down_dims) >= 1, "`down_dims` must contain at least one width."
@@ -956,9 +958,13 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         # mu: default init (~0). log_sigma: zeros weight + log_sigma_init bias → σ ≈ exp(init)
         # at the start (e.g. log_sigma_init=-2.0 → σ ≈ 0.13 in normalized action space).
         self.mu_head = nn.Linear(widths[-1], action_dim)
-        self.log_sigma_head = nn.Linear(widths[-1], action_dim)
-        nn.init.zeros_(self.log_sigma_head.weight)
-        nn.init.constant_(self.log_sigma_head.bias, log_sigma_init)
+        self.state_independent_sigma = state_independent_sigma
+        if state_independent_sigma:
+            self.log_sigma_param = nn.Parameter(torch.full((action_dim,), log_sigma_init))
+        else:
+            self.log_sigma_head = nn.Linear(widths[-1], action_dim)
+            nn.init.zeros_(self.log_sigma_head.weight)
+            nn.init.constant_(self.log_sigma_head.bias, log_sigma_init)
 
     def forward(self, x: Tensor, cond: Tensor) -> tuple[Tensor, Tensor]:
         feat = x
@@ -966,7 +972,11 @@ class LatentSDEDriftDiffusionNet(nn.Module):
             feat = block(feat, cond)
         feat = self.final_act(self.final_norm(feat.unsqueeze(-1)).squeeze(-1))
         mu = self.mu_head(feat)
-        log_sigma = self.log_sigma_head(feat)
+        log_sigma = (
+            self.log_sigma_param.expand(mu.shape)
+            if self.state_independent_sigma
+            else self.log_sigma_head(feat)
+        )
         return mu, log_sigma
 
 
