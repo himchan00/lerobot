@@ -116,8 +116,8 @@ class LatentSDEConfig(PreTrainedConfig):
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
-    log_sigma_init: float = -2.0
-    log_sigma_min: float = -5.0
+    log_sigma_init: float = -3.0
+    log_sigma_min: float = -20.0
     log_sigma_max: float = 2.0
     # If True, learn log_sigma as a state-independent nn.Parameter of shape (action_dim,).
     state_independent_sigma: bool = False
@@ -143,7 +143,7 @@ class LatentSDEConfig(PreTrainedConfig):
     z_posterior_hidden_dim: int | None = None
     kl_weight: float = 1.0
     kl_min: float = 0.5 # Per-dim KL floor in nats (free bits).
-    z_log_sigma_min: float = -5.0
+    z_log_sigma_min: float = -20.0
     z_log_sigma_max: float = 2.0
     deterministic_z_inference: bool = False
     conditional_prior: bool = False

@@ -503,7 +503,7 @@ class LatentSDEModel(nn.Module):
                 # Per-trajectory ELBO: window NLL is an unbiased estimator of the trajectory NLL
                 # up to T_ep/H, so scale KL by H/T_ep to match. clamp_min(H) guards degenerate eps.
                 ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
-                kl_scale = float(H) / ep_lengths  # (B,)
+                kl_scale = float(H) / ep_lengths  if not self.use_vq else 1.0  # Scaling is needed for VAE, but not for VQ-VAE
                 posterior_args = (ep_state_traj, valid_mask)
             else:
                 kl_scale = 1.0
@@ -548,7 +548,7 @@ class LatentSDEModel(nn.Module):
         log_std = log_sigma + 0.5 * torch.log(dt_t)
         var = (2 * log_std).exp()
 
-        nll = 0.5 * ((action_target - mean) ** 2 / var.clamp_min(1e-12) + 2 * log_std)
+        nll = 0.5 * ((action_target - mean) ** 2 / var + 2 * log_std)
         nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
 
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
@@ -900,8 +900,8 @@ def _gaussian_kl_loss(
         budget z_dim × kl_min ≈ log(N) nats covers the mode bits.
         E.g., N=2 → 0.35 (z_dim=2), 0.04 (z_dim=16). Default 0 disables.
     """
-    var_q = (2 * log_sigma_q).exp().clamp_min(1e-12)
-    var_p = (2 * log_sigma_p).exp().clamp_min(1e-12)
+    var_q = (2 * log_sigma_q).exp()
+    var_p = (2 * log_sigma_p).exp()
     per_dim = (log_sigma_p - log_sigma_q) + 0.5 * (var_q + (mu_q - mu_p) ** 2) / var_p - 0.5
     if kl_min > 0.0:
         per_dim = per_dim.clamp_min(kl_min)
