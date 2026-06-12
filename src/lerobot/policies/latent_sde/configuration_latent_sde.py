@@ -56,9 +56,10 @@ class LatentSDEConfig(PreTrainedConfig):
     if the experiment warrants it.
 
     Drift/diffusion network output:
-        mu     — SDE drift, shape (B, action_dim).
-        logsig — log of the per-coordinate diagonal diffusion scale.
-        SDE step: x_d = x + mu·dt + diag(exp(logsig))·√dt·ε.
+        mu    — SDE drift, shape (B, action_dim).
+        sigma — per-coordinate diagonal diffusion scale; σ = act(s) + sigma_min
+                with act ∈ {exp, softplus}.
+        SDE step: x_d = x + mu·dt + diag(sigma)·√dt·ε.
 
     Push-T I/O (mirrors DiffusionConfig):
         - "observation.state" required.
@@ -73,9 +74,11 @@ class LatentSDEConfig(PreTrainedConfig):
                           under teacher-forced demo actions — same per-image-encode
                           supervision budget as DP's horizon-length chunk loss.
         sde_dt:           Δt for one Euler-Maruyama step. Push-T fps=10 Hz → 0.1 s.
-        log_sigma_init:   initial bias of the log-σ head. -2.0 → σ ≈ 0.13 in normalized
-                          action space — small enough not to overwhelm the drift, non-zero
-                          to allow gradient flow.
+        sigma_init:       initial σ of the drift/diffusion σ-head. 0.05 ≈ exp(-3.0),
+                          small enough not to overwhelm the drift, non-zero to allow
+                          gradient flow.
+        sigma_activation: "exp" (current behaviour) or "softplus" (gentler near zero).
+        sigma_min:        hard positive floor σ ≥ sigma_min; keeps KL log(σ) finite.
 
     Removed (no analog in single-step SDE):
         horizon, noise scheduler block, diffusion_step_embed_dim,
@@ -116,10 +119,10 @@ class LatentSDEConfig(PreTrainedConfig):
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
-    log_sigma_init: float = -3.0
-    log_sigma_min: float = -20.0
-    log_sigma_max: float = 2.0
-    # If True, learn log_sigma as a state-independent nn.Parameter of shape (action_dim,).
+    sigma_activation: str = "exp"   # "exp" | "softplus"; shared across action & z heads
+    sigma_init: float = 0.05         # initial action σ (exp(-3.0) ≈ 0.0498)
+    sigma_min: float = 1e-6          # hard floor: σ = act(s) + sigma_min
+    # If True, learn σ as a state-independent nn.Parameter of shape (action_dim,).
     state_independent_sigma: bool = False
 
     # ---- Inference -----------------------------------------------------------------------------
@@ -143,8 +146,7 @@ class LatentSDEConfig(PreTrainedConfig):
     z_posterior_hidden_dim: int | None = None
     kl_weight: float = 1.0
     kl_min: float = 0.5 # Per-dim KL floor in nats (free bits).
-    z_log_sigma_min: float = -20.0
-    z_log_sigma_max: float = 2.0
+    z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
     conditional_prior: bool = False
 
@@ -197,15 +199,17 @@ class LatentSDEConfig(PreTrainedConfig):
         if self.sde_dt is not None and self.sde_dt <= 0:
             raise ValueError(f"`sde_dt` must be positive (or None). Got {self.sde_dt}.")
 
-        if self.log_sigma_min >= self.log_sigma_max:
+        if self.sigma_activation not in ("exp", "softplus"):
             raise ValueError(
-                f"Require log_sigma_min < log_sigma_max. Got {self.log_sigma_min} >= {self.log_sigma_max}."
+                f"`sigma_activation` must be 'exp' or 'softplus'. Got {self.sigma_activation!r}."
             )
-
-        if self.z_log_sigma_min >= self.z_log_sigma_max:
+        if self.sigma_min <= 0:
+            raise ValueError(f"`sigma_min` must be > 0. Got {self.sigma_min}.")
+        if self.z_sigma_min <= 0:
+            raise ValueError(f"`z_sigma_min` must be > 0. Got {self.z_sigma_min}.")
+        if self.sigma_init <= self.sigma_min:
             raise ValueError(
-                f"Require z_log_sigma_min < z_log_sigma_max. Got "
-                f"{self.z_log_sigma_min} >= {self.z_log_sigma_max}."
+                f"Require sigma_init > sigma_min. Got {self.sigma_init} <= {self.sigma_min}."
             )
 
         if self.kl_weight < 0:

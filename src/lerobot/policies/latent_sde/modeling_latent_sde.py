@@ -7,6 +7,7 @@
 # into per-block residuals. FiLM-with-scale / GroupNorm / Mish / down_dims widths / FiLM
 # conditioning are preserved verbatim for architectural fairness vs. DiffusionPolicy.
 
+import math
 from collections import deque
 
 import einops
@@ -20,6 +21,24 @@ from ..diffusion.modeling_diffusion import DiffusionRgbEncoder
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
 from .configuration_latent_sde import LatentSDEConfig
+
+
+def _sigma_act(activation: str):
+    """σ = act(s) + sigma_min; caller adds the floor."""
+    if activation == "exp":
+        return torch.exp
+    if activation == "softplus":
+        return F.softplus
+    raise ValueError(f"sigma_activation must be 'exp' or 'softplus'; got {activation!r}.")
+
+
+def _inverse_sigma(activation: str, value: float) -> float:
+    """Solve act(s) = value for s; value must be > 0."""
+    if activation == "exp":
+        return math.log(value)
+    if activation == "softplus":
+        return math.log(math.expm1(value))
+    raise ValueError(f"sigma_activation must be 'exp' or 'softplus'; got {activation!r}.")
 
 
 class LatentSDEPolicy(PreTrainedPolicy):
@@ -213,8 +232,8 @@ class LatentSDEModel(nn.Module):
                         h_dim=self.h_dim,
                         z_dim=self.z_dim,
                         hidden_dim=prior_hidden,
-                        log_sigma_min=config.z_log_sigma_min,
-                        log_sigma_max=config.z_log_sigma_max,
+                        sigma_activation=config.sigma_activation,
+                        sigma_min=config.z_sigma_min,
                     )
                     if config.conditional_prior
                     else StandardNormalPrior(z_dim=self.z_dim)
@@ -224,8 +243,8 @@ class LatentSDEModel(nn.Module):
                         state_dim=self.state_dim,
                         z_dim=self.z_dim,
                         hidden_dim=posterior_hidden,
-                        log_sigma_min=config.z_log_sigma_min,
-                        log_sigma_max=config.z_log_sigma_max,
+                        sigma_activation=config.sigma_activation,
+                        sigma_min=config.z_sigma_min,
                         n_groups=config.n_groups,
                     )
                     if self.per_episode_z
@@ -235,8 +254,8 @@ class LatentSDEModel(nn.Module):
                         horizon=config.n_action_steps,
                         z_dim=self.z_dim,
                         hidden_dim=posterior_hidden,
-                        log_sigma_min=config.z_log_sigma_min,
-                        log_sigma_max=config.z_log_sigma_max,
+                        sigma_activation=config.sigma_activation,
+                        sigma_min=config.z_sigma_min,
                     )
                 )
                 self.vq = None
@@ -250,7 +269,9 @@ class LatentSDEModel(nn.Module):
             down_dims=config.down_dims,
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
-            log_sigma_init=config.log_sigma_init,
+            sigma_activation=config.sigma_activation,
+            sigma_init=config.sigma_init,
+            sigma_min=config.sigma_min,
             state_independent_sigma=config.state_independent_sigma,
         )
 
@@ -290,7 +311,7 @@ class LatentSDEModel(nn.Module):
             abs_rows = list(range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"])))
             rows = abs_rows if abs_to_rel is None else [abs_to_rel[i] for i in abs_rows]
             states = torch.stack(dataset.hf_dataset[rows]["observation.state"]).to(torch.float32)
-            cache[ep_idx] = ((2 * (states - min_val) / span - 1)).contiguous()
+            cache[ep_idx] = (2 * (states - min_val) / span - 1).contiguous()
         self._episode_state_cache = cache
 
     def _get_episode_state_trajs(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -353,14 +374,12 @@ class LatentSDEModel(nn.Module):
         self,
         x_now: Tensor,
         mu: Tensor,
-        log_sigma: Tensor,
+        sigma: Tensor,
         dt: float,
         deterministic: bool,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
-        log_sigma = log_sigma.clamp(self.config.log_sigma_min, self.config.log_sigma_max)
-        sigma = log_sigma.exp()
         mean = x_now + mu * dt
         std = sigma * (dt ** 0.5)
         if deterministic:
@@ -396,11 +415,11 @@ class LatentSDEModel(nn.Module):
                 k = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
             return self.vq.get_output_from_indices(k)
         else:
-            mu_p, log_sigma_p = self.prior(h)
+            mu_p, sigma_p = self.prior(h)
             if deterministic:
                 return mu_p
             eps = torch.randn(mu_p.shape, dtype=mu_p.dtype, device=mu_p.device, generator=generator)
-            return mu_p + log_sigma_p.exp() * eps
+            return mu_p + sigma_p * eps
 
     def step(
         self,
@@ -421,13 +440,13 @@ class LatentSDEModel(nn.Module):
                    internal `randn`; ignored when `deterministic_inference` is True.
         """
         cond = torch.cat([h, z], dim=-1) if self.use_latent_z else h
-        mu, log_sigma = self.net(x_aug, cond)
+        mu, sigma = self.net(x_aug, cond)
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         x_now = x_aug[..., -self.state_dim:]
         return self._sde_step(
             x_now,
             mu,
-            log_sigma,
+            sigma,
             dt=dt,
             deterministic=self.config.deterministic_inference,
             generator=generator,
@@ -473,7 +492,7 @@ class LatentSDEModel(nn.Module):
         action_target = batch[ACTION]                        # (B, H, action_dim)
         B, H, action_dim = action_target.shape
         n_obs = self.config.n_obs_steps
-        assert H == self.config.n_action_steps, (
+        assert self.config.n_action_steps == H, (
             f"compute_loss expects H == n_action_steps action targets; got H={H} "
             f"vs config.n_action_steps={self.config.n_action_steps}."
         )
@@ -520,14 +539,14 @@ class LatentSDEModel(nn.Module):
                 vq_commit_per_sample = (z_e - z_q.detach()).pow(2).mean(dim=-1)  # (B,)
                 # k detached on the CE: prior doesn't backprop into posterior/codebook (van den Oord §3.2).
                 vq_prior_ce_per_sample = F.cross_entropy(prior_logits, vq_indices.detach(), reduction="none")  # (B,)
-                mu_p = log_sigma_p = mu_q = log_sigma_q = None
+                mu_p = sigma_p = mu_q = sigma_q = None
             else:
-                mu_p, log_sigma_p = self.prior(h)
-                mu_q, log_sigma_q = self.posterior(*posterior_args)
+                mu_p, sigma_p = self.prior(h)
+                mu_q, sigma_q = self.posterior(*posterior_args)
                 eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
-                z_q = mu_q + log_sigma_q.exp() * eps_z
+                z_q = mu_q + sigma_q * eps_z
         else:
-            mu_p = log_sigma_p = mu_q = log_sigma_q = None
+            mu_p = sigma_p = mu_q = sigma_q = None
             z_q = None
 
         flat_x_aug = x_seq_aug.reshape(B * H, -1)
@@ -537,18 +556,14 @@ class LatentSDEModel(nn.Module):
             flat_cond = torch.cat([flat_h, flat_z], dim=-1)
         else:
             flat_cond = flat_h
-        mu_flat, log_sigma_flat = self.net(flat_x_aug, flat_cond)
+        mu_flat, sigma_flat = self.net(flat_x_aug, flat_cond)
         mu = mu_flat.reshape(B, H, action_dim)
-        log_sigma = log_sigma_flat.reshape(B, H, action_dim)
-        log_sigma = log_sigma.clamp(self.config.log_sigma_min, self.config.log_sigma_max)
+        sigma = sigma_flat.reshape(B, H, action_dim)
 
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
-        dt_t = torch.tensor(dt, device=mu.device, dtype=mu.dtype)
         mean = x_seq + mu * dt
-        log_std = log_sigma + 0.5 * torch.log(dt_t)
-        var = (2 * log_std).exp()
-
-        nll = 0.5 * ((action_target - mean) ** 2 / var + 2 * log_std)
+        var = sigma.pow(2) * dt
+        nll = 0.5 * ((action_target - mean) ** 2 / var + var.log())
         nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
 
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
@@ -564,7 +579,7 @@ class LatentSDEModel(nn.Module):
                 other_loss = (H * action_dim) * other_loss
             else:
                 kl_per_sample = _gaussian_kl_loss(
-                    mu_q, log_sigma_q, mu_p, log_sigma_p, self.config.kl_min
+                    mu_q, sigma_q, mu_p, sigma_p, self.config.kl_min
                 )  # (B,)
                 kl_loss = (kl_scale * kl_per_sample).mean()
                 other_loss = self.config.kl_weight * kl_loss
@@ -578,7 +593,7 @@ class LatentSDEModel(nn.Module):
         with torch.no_grad():
             loss_dict: dict[str, float] = {
                 "nll_loss": nll_loss.detach().item(),
-                "action_sigma_mean": log_sigma.exp().mean().item(),
+                "action_sigma_mean": sigma.mean().item(),
             }
             if self.use_latent_z:
                 if self.per_episode_z:
@@ -594,8 +609,8 @@ class LatentSDEModel(nn.Module):
                     loss_dict["vq_active_codes"] = float((counts > 0).sum().item())
                 else:
                     loss_dict["kl_loss"] = kl_loss.detach().item()
-                    loss_dict["z_sigma_q_mean"] = log_sigma_q.exp().mean().item()
-                    loss_dict["z_sigma_p_mean"] = log_sigma_p.exp().mean().item()
+                    loss_dict["z_sigma_q_mean"] = sigma_q.mean().item()
+                    loss_dict["z_sigma_p_mean"] = sigma_p.mean().item()
         return loss, loss_dict
 
 
@@ -618,23 +633,23 @@ class StandardNormalPrior(nn.Module):
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         zeros = torch.zeros(h.shape[0], self.z_dim, dtype=h.dtype, device=h.device)
-        return zeros, zeros # (μ_p, log σ_p) = (0, 0)
+        return zeros, torch.ones_like(zeros)  # (μ_p, σ_p) = (0, 1)
 
 
 class LatentPrior(nn.Module):
-    """p(z | h) — 2-layer MLP producing (μ_p, log σ_p) from the image-only conditioning h."""
+    """p(z | h) — 2-layer MLP producing (μ_p, σ_p) from the image-only conditioning h."""
 
     def __init__(
         self,
         h_dim: int,
         z_dim: int,
         hidden_dim: int,
-        log_sigma_min: float,
-        log_sigma_max: float,
+        sigma_activation: str,
+        sigma_min: float,
     ):
         super().__init__()
-        self.log_sigma_min = log_sigma_min
-        self.log_sigma_max = log_sigma_max
+        self.sigma_act = _sigma_act(sigma_activation)
+        self.sigma_min = sigma_min
         self.trunk = nn.Sequential(
             nn.Linear(h_dim, hidden_dim),
             nn.Mish(),
@@ -642,16 +657,16 @@ class LatentPrior(nn.Module):
             nn.Mish(),
         )
         self.mu_head = nn.Linear(hidden_dim, z_dim)
-        self.log_sigma_head = nn.Linear(hidden_dim, z_dim)
-        # Wide prior (σ_p ≈ 1) at init so KL doesn't over-constrain q early in training.
-        nn.init.zeros_(self.log_sigma_head.weight)
-        nn.init.zeros_(self.log_sigma_head.bias)
+        self.sigma_head = nn.Linear(hidden_dim, z_dim)
+        # Wide prior at init (σ_p ≈ 1 for exp, ≈ 0.69 for softplus) so KL doesn't over-constrain q.
+        nn.init.zeros_(self.sigma_head.weight)
+        nn.init.zeros_(self.sigma_head.bias)
 
     def forward(self, h: Tensor) -> tuple[Tensor, Tensor]:
         feat = self.trunk(h)
         mu = self.mu_head(feat)
-        log_sigma = self.log_sigma_head(feat).clamp(self.log_sigma_min, self.log_sigma_max)
-        return mu, log_sigma
+        sigma = self.sigma_act(self.sigma_head(feat)) + self.sigma_min
+        return mu, sigma
 
 
 class LatentPosterior(nn.Module):
@@ -673,12 +688,12 @@ class LatentPosterior(nn.Module):
         horizon: int,
         z_dim: int,
         hidden_dim: int,
-        log_sigma_min: float,
-        log_sigma_max: float,
+        sigma_activation: str,
+        sigma_min: float,
     ):
         super().__init__()
-        self.log_sigma_min = log_sigma_min
-        self.log_sigma_max = log_sigma_max
+        self.sigma_act = _sigma_act(sigma_activation)
+        self.sigma_min = sigma_min
         self.horizon = horizon
         traj_summary_dim = horizon * state_dim
         self.trunk = nn.Sequential(
@@ -688,13 +703,13 @@ class LatentPosterior(nn.Module):
             nn.Mish(),
         )
         self.mu_head = nn.Linear(hidden_dim, z_dim)
-        self.log_sigma_head = nn.Linear(hidden_dim, z_dim)
-        nn.init.zeros_(self.log_sigma_head.weight)
-        nn.init.zeros_(self.log_sigma_head.bias)
+        self.sigma_head = nn.Linear(hidden_dim, z_dim)
+        nn.init.zeros_(self.sigma_head.weight)
+        nn.init.zeros_(self.sigma_head.bias)
 
     def forward(self, h: Tensor, x_seq: Tensor) -> tuple[Tensor, Tensor]:
         B, H, _ = x_seq.shape
-        if H != self.horizon:
+        if self.horizon != H:
             raise ValueError(
                 f"LatentPosterior was built with horizon={self.horizon} but got x_seq with H={H}. "
                 "The flatten-based posterior is tied to a fixed horizon."
@@ -702,8 +717,8 @@ class LatentPosterior(nn.Module):
         traj_flat = x_seq.reshape(B, -1)
         feat = self.trunk(torch.cat([h, traj_flat], dim=-1))
         mu = self.mu_head(feat)
-        log_sigma = self.log_sigma_head(feat).clamp(self.log_sigma_min, self.log_sigma_max)
-        return mu, log_sigma
+        sigma = self.sigma_act(self.sigma_head(feat)) + self.sigma_min
+        return mu, sigma
 
 
 class LearnableCategoricalPrior(nn.Module):
@@ -771,7 +786,7 @@ class LatentPosteriorVQ(nn.Module):
 
     def forward(self, h: Tensor, x_seq: Tensor) -> Tensor:
         B, H, _ = x_seq.shape
-        if H != self.horizon:
+        if self.horizon != H:
             raise ValueError(
                 f"LatentPosteriorVQ built with horizon={self.horizon} but got x_seq with H={H}. "
                 "The flatten-based posterior is tied to a fixed horizon."
@@ -806,31 +821,31 @@ class _TrajStateEncoder(nn.Module):
 
 
 class LatentPosteriorTraj(nn.Module):
-    """q(z | x_{0:T}) — trajectory encoder → (μ, log σ)."""
+    """q(z | x_{0:T}) — trajectory encoder → (μ, σ)."""
 
     def __init__(
         self,
         state_dim: int,
         z_dim: int,
         hidden_dim: int,
-        log_sigma_min: float,
-        log_sigma_max: float,
+        sigma_activation: str,
+        sigma_min: float,
         n_groups: int = 8,
     ):
         super().__init__()
-        self.log_sigma_min = log_sigma_min
-        self.log_sigma_max = log_sigma_max
+        self.sigma_act = _sigma_act(sigma_activation)
+        self.sigma_min = sigma_min
         self.encoder = _TrajStateEncoder(state_dim, hidden_dim, n_groups)
         self.mu_head = nn.Linear(hidden_dim, z_dim)
-        self.log_sigma_head = nn.Linear(hidden_dim, z_dim)
-        nn.init.zeros_(self.log_sigma_head.weight)
-        nn.init.zeros_(self.log_sigma_head.bias)
+        self.sigma_head = nn.Linear(hidden_dim, z_dim)
+        nn.init.zeros_(self.sigma_head.weight)
+        nn.init.zeros_(self.sigma_head.bias)
 
     def forward(self, x_traj: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
         feat = self.encoder(x_traj, valid_mask)
         mu = self.mu_head(feat)
-        log_sigma = self.log_sigma_head(feat).clamp(self.log_sigma_min, self.log_sigma_max)
-        return mu, log_sigma
+        sigma = self.sigma_act(self.sigma_head(feat)) + self.sigma_min
+        return mu, sigma
 
 
 class LatentPosteriorTrajVQ(nn.Module):
@@ -888,7 +903,7 @@ class _MaskedGroupNorm(nn.Module):
 
 
 def _gaussian_kl_loss(
-    mu_q: Tensor, log_sigma_q: Tensor, mu_p: Tensor, log_sigma_p: Tensor, kl_min: float = 0.0
+    mu_q: Tensor, sigma_q: Tensor, mu_p: Tensor, sigma_p: Tensor, kl_min: float = 0.0
 ) -> Tensor:
     """KL[N(μ_q, diag σ_q²) || N(μ_p, diag σ_p²)] per sample, summed over latent dim.
 
@@ -900,9 +915,9 @@ def _gaussian_kl_loss(
         budget z_dim × kl_min ≈ log(N) nats covers the mode bits.
         E.g., N=2 → 0.35 (z_dim=2), 0.04 (z_dim=16). Default 0 disables.
     """
-    var_q = (2 * log_sigma_q).exp()
-    var_p = (2 * log_sigma_p).exp()
-    per_dim = (log_sigma_p - log_sigma_q) + 0.5 * (var_q + (mu_q - mu_p) ** 2) / var_p - 0.5
+    var_q = sigma_q.pow(2)
+    var_p = sigma_p.pow(2)
+    per_dim = sigma_p.log() - sigma_q.log() + 0.5 * (var_q + (mu_q - mu_p) ** 2) / var_p - 0.5
     if kl_min > 0.0:
         per_dim = per_dim.clamp_min(kl_min)
     return per_dim.sum(dim=-1)
@@ -917,8 +932,8 @@ class LatentSDEDriftDiffusionNet(nn.Module):
                                    net reads local first-differences ≈ velocity.
         cond: (B, cond_dim)      — global conditioning h (or [h, z]).
     Outputs:
-        mu:        (B, action_dim) — SDE drift.
-        log_sigma: (B, action_dim) — log of per-coordinate diagonal diffusion.
+        mu:    (B, action_dim) — SDE drift.
+        sigma: (B, action_dim) — per-coordinate diagonal diffusion; σ = act(s) + sigma_min.
 
     Width ladder mirrors DiffusionConditionalUnet1d's down_dims hourglass; the "mid" block
     keeps width at d_{L-1} (matches the two mid_modules in the U-Net).
@@ -932,7 +947,9 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         down_dims: tuple[int, ...] = (512, 1024, 2048),
         n_groups: int = 8,
         use_film_scale_modulation: bool = True,
-        log_sigma_init: float = -2.0,
+        sigma_activation: str = "exp",
+        sigma_init: float = 0.05,
+        sigma_min: float = 1e-4,
         state_independent_sigma: bool = False,
     ):
         super().__init__()
@@ -955,16 +972,19 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         self.final_norm = nn.GroupNorm(n_groups, widths[-1])
         self.final_act = nn.Mish()
 
-        # mu: default init (~0). log_sigma: zeros weight + log_sigma_init bias → σ ≈ exp(init)
-        # at the start (e.g. log_sigma_init=-2.0 → σ ≈ 0.13 in normalized action space).
+        # σ = act(raw) + sigma_min; init the head so the initial σ == sigma_init.
+        self.sigma_act = _sigma_act(sigma_activation)
+        self.sigma_min = sigma_min
+        init_raw = _inverse_sigma(sigma_activation, sigma_init - sigma_min)
+
         self.mu_head = nn.Linear(widths[-1], action_dim)
         self.state_independent_sigma = state_independent_sigma
         if state_independent_sigma:
-            self.log_sigma_param = nn.Parameter(torch.full((action_dim,), log_sigma_init))
+            self.sigma_param = nn.Parameter(torch.full((action_dim,), init_raw))
         else:
-            self.log_sigma_head = nn.Linear(widths[-1], action_dim)
-            nn.init.zeros_(self.log_sigma_head.weight)
-            nn.init.constant_(self.log_sigma_head.bias, log_sigma_init)
+            self.sigma_head = nn.Linear(widths[-1], action_dim)
+            nn.init.zeros_(self.sigma_head.weight)
+            nn.init.constant_(self.sigma_head.bias, init_raw)
 
     def forward(self, x: Tensor, cond: Tensor) -> tuple[Tensor, Tensor]:
         feat = x
@@ -972,12 +992,13 @@ class LatentSDEDriftDiffusionNet(nn.Module):
             feat = block(feat, cond)
         feat = self.final_act(self.final_norm(feat.unsqueeze(-1)).squeeze(-1))
         mu = self.mu_head(feat)
-        log_sigma = (
-            self.log_sigma_param.expand(mu.shape)
+        raw = (
+            self.sigma_param.expand(mu.shape)
             if self.state_independent_sigma
-            else self.log_sigma_head(feat)
+            else self.sigma_head(feat)
         )
-        return mu, log_sigma
+        sigma = self.sigma_act(raw) + self.sigma_min
+        return mu, sigma
 
 
 class FiLMResidualMLPBlock(nn.Module):
