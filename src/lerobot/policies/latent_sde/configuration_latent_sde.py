@@ -124,6 +124,8 @@ class LatentSDEConfig(PreTrainedConfig):
     sigma_min: float = 1e-6          # hard floor: σ = act(s) + sigma_min
     # If True, learn σ as a state-independent nn.Parameter of shape (action_dim,).
     state_independent_sigma: bool = False
+    # β-NLL (Seitzer et al. 2022). 0 → standard NLL. 0.5 / 1.0 typical.
+    beta_nll: float = 0.0
 
     # ---- Inference -----------------------------------------------------------------------------
     # If True, deploy with σ=0 (drift-only). Useful for sanity-checking the drift in
@@ -211,6 +213,8 @@ class LatentSDEConfig(PreTrainedConfig):
             raise ValueError(
                 f"Require sigma_init > sigma_min. Got {self.sigma_init} <= {self.sigma_min}."
             )
+        if self.beta_nll < 0:
+            raise ValueError(f"`beta_nll` must be >= 0. Got {self.beta_nll}.")
 
         if self.kl_weight < 0:
             raise ValueError(f"`kl_weight` must be non-negative. Got {self.kl_weight}.")

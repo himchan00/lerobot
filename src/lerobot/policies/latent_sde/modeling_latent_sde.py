@@ -567,12 +567,20 @@ class LatentSDEModel(nn.Module):
         nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
 
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
-        nll_loss = nll.sum(dim=(1, 2)).mean()
+        nll_loss = nll.sum(dim=(1, 2)).mean()  # un-weighted; logged for cross-β comparison.
+        # β-NLL (Seitzer 2022): weight per-dim NLL by var^β; scale other_loss by mean(w).
+        if self.config.beta_nll > 0:
+            w = var.detach().pow(self.config.beta_nll)
+            train_nll = (w * nll).sum(dim=(1, 2)).mean()
+            other_scale = w.mean()
+        else:
+            train_nll = nll_loss
+            other_scale = nll.new_ones(())
 
         if self.use_latent_z:
             if self.use_vq:
-                vq_commit_loss = (kl_scale * vq_commit_per_sample).mean()
-                vq_prior_ce_loss = (kl_scale * vq_prior_ce_per_sample).mean()
+                vq_commit_loss = vq_commit_per_sample.mean()
+                vq_prior_ce_loss = vq_prior_ce_per_sample.mean()
                 other_loss = self.config.vq_commit_weight * vq_commit_loss + self.config.vq_prior_weight * vq_prior_ce_loss
                 # VQ losses are means over latent_dim; scale them up so the final divide
                 # by (H * action_dim) doesn't dwarf them next to the NLL.
@@ -583,9 +591,9 @@ class LatentSDEModel(nn.Module):
                 )  # (B,)
                 kl_loss = (kl_scale * kl_per_sample).mean()
                 other_loss = self.config.kl_weight * kl_loss
-            loss = nll_loss + other_loss
+            loss = train_nll + other_scale * other_loss
         else:
-            loss = nll_loss
+            loss = train_nll
 
         # Final normalization so optimizer/lr scale is independent of H, action_dim.
         loss = loss / (H * action_dim)
@@ -594,6 +602,7 @@ class LatentSDEModel(nn.Module):
             loss_dict: dict[str, float] = {
                 "nll_loss": nll_loss.detach().item(),
                 "action_sigma_mean": sigma.mean().item(),
+                "beta_nll_w_mean": other_scale.detach().item(),
             }
             if self.use_latent_z:
                 if self.per_episode_z:
