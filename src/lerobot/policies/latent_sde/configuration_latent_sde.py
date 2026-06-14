@@ -56,10 +56,12 @@ class LatentSDEConfig(PreTrainedConfig):
     if the experiment warrants it.
 
     Drift/diffusion network output:
-        mu    — SDE drift, shape (B, action_dim).
-        sigma — per-coordinate diagonal diffusion scale; σ = act(s) + sigma_min
-                with act ∈ {exp, softplus}.
-        SDE step: x_d = x + mu·dt + diag(sigma)·√dt·ε.
+        mu — SDE drift only, shape (B, action_dim). Action σ is NOT learned.
+        SDE step (inference): x_d = x + mu·dt + σ_eff·√dt·ε, with σ_eff = √(kl_weight/2)
+        the SDE diffusion coefficient. Training loss: recon = mean‖μ − v*‖² +
+        (kl_weight/(H·action_dim·dt)) · KL[q‖p] (β-VAE form) where v* = (a − x)/dt is the
+        empirical one-step velocity; the /(H·action_dim·dt) KL scaling is ELBO-exact under
+        the SDE decoder Δx ~ N(μ·dt, σ²·dt), so kl_weight = 2·σ_eff² holds exactly.
 
     Push-T I/O (mirrors DiffusionConfig):
         - "observation.state" required.
@@ -74,11 +76,10 @@ class LatentSDEConfig(PreTrainedConfig):
                           under teacher-forced demo actions — same per-image-encode
                           supervision budget as DP's horizon-length chunk loss.
         sde_dt:           Δt for one Euler-Maruyama step. Push-T fps=10 Hz → 0.1 s.
-        sigma_init:       initial σ of the drift/diffusion σ-head. 0.05 ≈ exp(-3.0),
-                          small enough not to overwhelm the drift, non-zero to allow
-                          gradient flow.
-        sigma_activation: "exp" (current behaviour) or "softplus" (gentler near zero).
-        sigma_min:        hard positive floor σ ≥ sigma_min; keeps KL log(σ) finite.
+        sigma_activation: "exp" or "softplus"; used only by z prior/posterior σ heads.
+        kl_weight:        β on KL[q||p], divided by (H·action_dim·dt) in the loss for
+                          ELBO-exact balance: kl_weight = 2·σ_eff² exactly (σ_eff = SDE
+                          diffusion coefficient). Inference SDE noise uses σ_eff = √(kl_weight/2)
 
     Removed (no analog in single-step SDE):
         horizon, noise scheduler block, diffusion_step_embed_dim,
@@ -119,19 +120,11 @@ class LatentSDEConfig(PreTrainedConfig):
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
-    sigma_activation: str = "exp"   # "exp" | "softplus"; shared across action & z heads
-    sigma_init: float = 0.05         # initial action σ (exp(-3.0) ≈ 0.0498)
-    sigma_min: float = 1e-6          # hard floor: σ = act(s) + sigma_min
-    # If True, learn σ as a state-independent nn.Parameter of shape (action_dim,).
-    state_independent_sigma: bool = False
-    # β-NLL (Seitzer et al. 2022). 0 → standard NLL. 0.5 / 1.0 typical.
-    beta_nll: float = 0.0
+    sigma_activation: str = "exp"   # "exp" | "softplus"; used by z prior/posterior heads only
 
     # ---- Inference -----------------------------------------------------------------------------
-    # If True, deploy with σ=0 (drift-only). Useful for sanity-checking the drift in
-    # isolation. The reactivity-vs-mode-consistency claim requires σ>0 (and z) — keep False
-    # once the deterministic path works.
-    deterministic_inference: bool = False
+    # If True, drift-only inference. False → SDE noise σ_eff·√dt with σ_eff = √(kl_weight/2).
+    deterministic_inference: bool = True
 
     # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
     # use_latent_z=False recovers the no-z PoC exactly (prior/posterior not built, no KL).
@@ -146,7 +139,7 @@ class LatentSDEConfig(PreTrainedConfig):
     z_dim: int = 8
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
-    kl_weight: float = 1.0
+    kl_weight: float = 1e-3          # β on KL; also effective_sigma² · 2 at inference
     kl_min: float = 0.5 # Per-dim KL floor in nats (free bits).
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
@@ -205,16 +198,8 @@ class LatentSDEConfig(PreTrainedConfig):
             raise ValueError(
                 f"`sigma_activation` must be 'exp' or 'softplus'. Got {self.sigma_activation!r}."
             )
-        if self.sigma_min <= 0:
-            raise ValueError(f"`sigma_min` must be > 0. Got {self.sigma_min}.")
         if self.z_sigma_min <= 0:
             raise ValueError(f"`z_sigma_min` must be > 0. Got {self.z_sigma_min}.")
-        if self.sigma_init <= self.sigma_min:
-            raise ValueError(
-                f"Require sigma_init > sigma_min. Got {self.sigma_init} <= {self.sigma_min}."
-            )
-        if self.beta_nll < 0:
-            raise ValueError(f"`beta_nll` must be >= 0. Got {self.beta_nll}.")
 
         if self.kl_weight < 0:
             raise ValueError(f"`kl_weight` must be non-negative. Got {self.kl_weight}.")

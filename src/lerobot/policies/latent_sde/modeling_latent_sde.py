@@ -24,20 +24,11 @@ from .configuration_latent_sde import LatentSDEConfig
 
 
 def _sigma_act(activation: str):
-    """σ = act(s) + sigma_min; caller adds the floor."""
+    """σ = act(s) + sigma_min; caller adds the floor. Used by z prior/posterior heads."""
     if activation == "exp":
         return torch.exp
     if activation == "softplus":
         return F.softplus
-    raise ValueError(f"sigma_activation must be 'exp' or 'softplus'; got {activation!r}.")
-
-
-def _inverse_sigma(activation: str, value: float) -> float:
-    """Solve act(s) = value for s; value must be > 0."""
-    if activation == "exp":
-        return math.log(value)
-    if activation == "softplus":
-        return math.log(math.expm1(value))
     raise ValueError(f"sigma_activation must be 'exp' or 'softplus'; got {activation!r}.")
 
 
@@ -261,7 +252,8 @@ class LatentSDEModel(nn.Module):
                 self.vq = None
 
         # Net input is the augmented state (n_obs_steps frames flattened).
-        # Cond = concat([h, z]); widens by z_dim (0 if no z).
+        # Cond = concat([h, z]); widens by z_dim (0 if no z). Outputs drift μ only —
+        # action σ is not learned; inference noise uses √(kl_weight/2).
         self.net = LatentSDEDriftDiffusionNet(
             input_dim=self.state_dim * config.n_obs_steps,
             action_dim=config.action_feature.shape[0],
@@ -269,10 +261,6 @@ class LatentSDEModel(nn.Module):
             down_dims=config.down_dims,
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
-            sigma_activation=config.sigma_activation,
-            sigma_init=config.sigma_init,
-            sigma_min=config.sigma_min,
-            state_independent_sigma=config.state_independent_sigma,
         )
 
         if config.compile_model:
@@ -370,20 +358,25 @@ class LatentSDEModel(nn.Module):
         state = batch[OBS_STATE]
         return state.reshape(state.shape[0], -1)
 
+    def _effective_sigma(self) -> float:
+        """SDE diffusion coefficient σ_eff = √(kl_weight / 2). With the ELBO-exact KL scaling
+        in compute_loss (`/(H·D·dt)`), kl_weight = 2·σ_eff² holds exactly. Position noise per
+        SDE step = σ_eff·√dt."""
+        return math.sqrt(self.config.kl_weight / 2.0)
+
     def _sde_step(
         self,
         x_now: Tensor,
         mu: Tensor,
-        sigma: Tensor,
         dt: float,
         deterministic: bool,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
         mean = x_now + mu * dt
-        std = sigma * (dt ** 0.5)
         if deterministic:
             return mean
+        std = self._effective_sigma() * (dt ** 0.5)
         if noise is not None:
             if noise.shape != mean.shape:
                 raise ValueError(
@@ -440,13 +433,12 @@ class LatentSDEModel(nn.Module):
                    internal `randn`; ignored when `deterministic_inference` is True.
         """
         cond = torch.cat([h, z], dim=-1) if self.use_latent_z else h
-        mu, sigma = self.net(x_aug, cond)
+        mu = self.net(x_aug, cond)
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         x_now = x_aug[..., -self.state_dim:]
         return self._sde_step(
             x_now,
             mu,
-            sigma,
             dt=dt,
             deterministic=self.config.deterministic_inference,
             generator=generator,
@@ -471,12 +463,15 @@ class LatentSDEModel(nn.Module):
         return self.step(x_aug, h, z, noise=noise)
 
     def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
-        """Free-space Gaussian NLL on the demo action chunk + β·KL[q||p].
+        """β-VAE-style loss: recon = mean‖μ − v*‖² + (kl_weight / (H·D·dt)) · KL[q‖p],
+        with v* = (a − x)/dt the empirical one-step velocity.
 
-        For demo actions a_0..a_{H-1} starting at time t:
-            a_k ~ N(x_seq[k] + μ(x_seq_aug[k], h, z) · dt, diag(σ(...))² · dt)
-        x_seq is the measured state trajectory from the dataset (no teacher-forcing),
-        so train and inference see the same state distribution.
+        Recon is the per-element velocity MSE. The KL scale is ELBO-exact under the SDE
+        decoder Δx ~ N(μ·dt, σ²·dt), giving kl_weight = 2·σ_eff² where σ_eff = √(kl_weight/2)
+        is the SDE diffusion coefficient (also used at inference: position noise = σ_eff·√dt).
+
+        x_seq is the measured state trajectory from the dataset (no teacher-forcing), so
+        train and inference see the same state distribution.
 
         Expected `batch` (normalized + on device; LatentSDEPolicy.forward stacks images):
             "observation.state":  (B, n_obs_steps + H - 1, state_dim) — past + future
@@ -519,13 +514,10 @@ class LatentSDEModel(nn.Module):
             if self.per_episode_z:
                 # Full-episode trajectories from the RAM cache; left-aligned, padded.
                 ep_state_traj, valid_mask = self._get_episode_state_trajs(batch)
-                # Per-trajectory ELBO: window NLL is an unbiased estimator of the trajectory NLL
-                # up to T_ep/H, so scale KL by H/T_ep to match. clamp_min(H) guards degenerate eps.
+                # Per-trajectory ELBO H/T_ep factor (Gaussian KL only). clamp_min(H) guards degenerate eps.
                 ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
-                kl_scale = float(H) / ep_lengths  if not self.use_vq else 1.0  # Scaling is needed for VAE, but not for VQ-VAE
                 posterior_args = (ep_state_traj, valid_mask)
             else:
-                kl_scale = 1.0
                 posterior_args = (h, x_seq)
 
             if self.use_vq:
@@ -556,55 +548,41 @@ class LatentSDEModel(nn.Module):
             flat_cond = torch.cat([flat_h, flat_z], dim=-1)
         else:
             flat_cond = flat_h
-        mu_flat, sigma_flat = self.net(flat_x_aug, flat_cond)
+        mu_flat = self.net(flat_x_aug, flat_cond)
         mu = mu_flat.reshape(B, H, action_dim)
-        sigma = sigma_flat.reshape(B, H, action_dim)
 
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
-        mean = x_seq + mu * dt
-        var = sigma.pow(2) * dt
-        nll = 0.5 * ((action_target - mean) ** 2 / var + var.log())
-        nll = nll + 0.5 * torch.log(torch.tensor(2 * torch.pi, device=mu.device, dtype=mu.dtype))
-
+        target_velocity = (action_target - x_seq) / dt
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
-        nll_loss = nll.sum(dim=(1, 2)).mean()  # un-weighted; logged for cross-β comparison.
-        # β-NLL (Seitzer 2022): weight per-dim NLL by var^β; scale other_loss by mean(w).
-        if self.config.beta_nll > 0:
-            w = var.detach().pow(self.config.beta_nll)
-            train_nll = (w * nll).sum(dim=(1, 2)).mean()
-            other_scale = w.mean()
-        else:
-            train_nll = nll_loss
-            other_scale = nll.new_ones(())
+        recon_loss = ((mu - target_velocity) ** 2).mean()
 
         if self.use_latent_z:
             if self.use_vq:
                 vq_commit_loss = vq_commit_per_sample.mean()
                 vq_prior_ce_loss = vq_prior_ce_per_sample.mean()
                 other_loss = self.config.vq_commit_weight * vq_commit_loss + self.config.vq_prior_weight * vq_prior_ce_loss
-                # VQ losses are means over latent_dim; scale them up so the final divide
-                # by (H * action_dim) doesn't dwarf them next to the NLL.
-                other_loss = (H * action_dim) * other_loss
             else:
                 kl_per_sample = _gaussian_kl_loss(
                     mu_q, sigma_q, mu_p, sigma_p, self.config.kl_min
                 )  # (B,)
-                kl_loss = (kl_scale * kl_per_sample).mean()
-                other_loss = self.config.kl_weight * kl_loss
-            loss = train_nll + other_scale * other_loss
+                kl_loss = kl_per_sample.mean()
+                # Merged KL weight: ELBO-exact β/(H·D·dt) (so kl_weight = 2·σ_eff²) × H/T_ep
+                # per-trajectory factor when per_episode (scalar 1 otherwise). Applied per-sample.
+                kl_loss_weight = self.config.kl_weight / (H * action_dim * dt)
+                if self.per_episode_z:
+                    kl_loss_weight = kl_loss_weight * (float(H) / ep_lengths)
+                other_loss = (kl_loss_weight * kl_per_sample).mean()
+            loss = recon_loss + other_loss
         else:
-            loss = train_nll
-
-        # Final normalization so optimizer/lr scale is independent of H, action_dim.
-        loss = loss / (H * action_dim)
+            loss = recon_loss
 
         with torch.no_grad():
             loss_dict: dict[str, float] = {
-                "nll_loss": nll_loss.detach().item(),
-                "action_sigma_mean": sigma.mean().item(),
-                "beta_nll_w_mean": other_scale.detach().item(),
+                "recon_loss": recon_loss.detach().item(),
+                "effective_sigma": self._effective_sigma(),
             }
             if self.use_latent_z:
+                loss_dict["other_loss"] = other_loss.detach().item()
                 if self.per_episode_z:
                     loss_dict["ep_length_mean"] = ep_lengths.detach().mean().item()
                 if self.use_vq:
@@ -940,9 +918,9 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         x:    (B, input_dim)     — augmented state (n_obs_steps frames flattened) so the
                                    net reads local first-differences ≈ velocity.
         cond: (B, cond_dim)      — global conditioning h (or [h, z]).
-    Outputs:
-        mu:    (B, action_dim) — SDE drift.
-        sigma: (B, action_dim) — per-coordinate diagonal diffusion; σ = act(s) + sigma_min.
+    Output:
+        mu:   (B, action_dim) — SDE drift. Action σ is not learned; inference noise uses
+                                √(kl_weight/2) from the config.
 
     Width ladder mirrors DiffusionConditionalUnet1d's down_dims hourglass; the "mid" block
     keeps width at d_{L-1} (matches the two mid_modules in the U-Net).
@@ -956,10 +934,6 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         down_dims: tuple[int, ...] = (512, 1024, 2048),
         n_groups: int = 8,
         use_film_scale_modulation: bool = True,
-        sigma_activation: str = "exp",
-        sigma_init: float = 0.05,
-        sigma_min: float = 1e-4,
-        state_independent_sigma: bool = False,
     ):
         super().__init__()
         assert len(down_dims) >= 1, "`down_dims` must contain at least one width."
@@ -980,34 +954,14 @@ class LatentSDEDriftDiffusionNet(nn.Module):
 
         self.final_norm = nn.GroupNorm(n_groups, widths[-1])
         self.final_act = nn.Mish()
-
-        # σ = act(raw) + sigma_min; init the head so the initial σ == sigma_init.
-        self.sigma_act = _sigma_act(sigma_activation)
-        self.sigma_min = sigma_min
-        init_raw = _inverse_sigma(sigma_activation, sigma_init - sigma_min)
-
         self.mu_head = nn.Linear(widths[-1], action_dim)
-        self.state_independent_sigma = state_independent_sigma
-        if state_independent_sigma:
-            self.sigma_param = nn.Parameter(torch.full((action_dim,), init_raw))
-        else:
-            self.sigma_head = nn.Linear(widths[-1], action_dim)
-            nn.init.zeros_(self.sigma_head.weight)
-            nn.init.constant_(self.sigma_head.bias, init_raw)
 
-    def forward(self, x: Tensor, cond: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
         feat = x
         for block in self.blocks:
             feat = block(feat, cond)
         feat = self.final_act(self.final_norm(feat.unsqueeze(-1)).squeeze(-1))
-        mu = self.mu_head(feat)
-        raw = (
-            self.sigma_param.expand(mu.shape)
-            if self.state_independent_sigma
-            else self.sigma_head(feat)
-        )
-        sigma = self.sigma_act(raw) + self.sigma_min
-        return mu, sigma
+        return self.mu_head(feat)
 
 
 class FiLMResidualMLPBlock(nn.Module):
