@@ -80,14 +80,11 @@ class LatentSDEPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Stateless 1-step action wrapped as a length-1 "chunk" for API parity.
-
-        Returns shape (B, 1, action_dim). Bypasses the h/z cache; use `select_action`
-        for interactive rollout.
-        """
-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-        action = self.model.generate_action(batch, noise=noise)
-        return action.unsqueeze(1)
+        # Single-step SDE policy has no chunk-at-once inference path; rollout is per-tick.
+        raise NotImplementedError(
+            "LatentSDEPolicy does not support predict_action_chunk (chunked / async inference); "
+            "use select_action for per-tick rollout."
+        )
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -144,7 +141,7 @@ class LatentSDEModel(nn.Module):
         self.config = config
 
         # h is image-only by design: proprio state lives on the fast clock as the SDE
-        # input x (see `_augmented_state`); env_state is deferred (see LatentSDEConfig docstring).
+        # input x (the n_obs window is flattened in `select_action`); env_state is deferred.
         if not self.config.image_features:
             raise ValueError(
                 "LatentSDEPolicy requires at least one image feature (h = image-only "
@@ -166,14 +163,14 @@ class LatentSDEModel(nn.Module):
         self.h_dim = global_cond_dim * config.n_obs_steps # h is stacked over n_obs_steps
         self.use_latent_z = config.use_latent_z
 
-        # use_latent_z=False → no prior/posterior/vq, z_dim=0. Otherwise the three modules below
-        # branch on independent axes:
+        # use_latent_z=False → no prior/posterior/vq, z_dim=0. Otherwise:
         #   * self.prior     : (use_vq) × (config.conditional_prior)
-        #   * self.posterior : (use_vq) × (per_episode_z) — Traj* sees full episode, others H-chunk
+        #   * self.posterior : (use_vq) — trajectory encoder; conditions on h in per_chunk only
         #   * self.vq        : built iff use_vq
         self.use_vq = config.use_vq
         self.per_episode_z = (config.z_sampling_mode == "per_episode")
         self.state_dim = config.robot_state_feature.shape[0]
+        self.action_dim = config.action_feature.shape[0]
         if not self.use_latent_z:
             self.z_dim = 0
             self.prior = None
@@ -194,21 +191,12 @@ class LatentSDEModel(nn.Module):
                     if config.conditional_prior
                     else LearnableCategoricalPrior(codebook_size=config.vq_codebook_size)
                 )
-                self.posterior = (
-                    LatentPosteriorTrajVQ(
-                        state_dim=self.state_dim,
-                        z_dim=self.z_dim,
-                        hidden_dim=posterior_hidden,
-                        n_groups=config.n_groups,
-                    )
-                    if self.per_episode_z
-                    else LatentPosteriorVQ(
-                        h_dim=self.h_dim,
-                        state_dim=self.state_dim,
-                        horizon=config.n_action_steps,
-                        z_dim=self.z_dim,
-                        hidden_dim=posterior_hidden,
-                    )
+                self.posterior = LatentPosteriorTrajVQ(
+                    input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
+                    h_dim=0 if self.per_episode_z else self.h_dim,  # per_episode posterior is h-free
+                    z_dim=self.z_dim,
+                    hidden_dim=posterior_hidden,
+                    n_groups=config.n_groups,
                 )
                 from vector_quantize_pytorch import VectorQuantize
                 self.vq = VectorQuantize(
@@ -216,7 +204,12 @@ class LatentSDEModel(nn.Module):
                     codebook_size=config.vq_codebook_size,
                     decay=config.vq_decay,
                     commitment_weight=config.vq_commit_weight,
+                    rotation_trick=False,  # STE: forward z_q == raw code, so train matches inference (get_output_from_indices)
+                    kmeans_init=True,  # seed codes from data, not random Gaussian (avoids born-dead codes)
+                    threshold_ema_dead_code=2,  # revive codes whose EMA usage dies, countering codebook collapse
                 )
+                # NOTE: kmeans_init seeds K centroids from ONE batch of z_e (B vectors). If
+                # vq_codebook_size > batch_size, the surplus codes start unseeded — keep K <= batch_size.
             else:
                 self.prior = (
                     LatentPrior(
@@ -229,25 +222,14 @@ class LatentSDEModel(nn.Module):
                     if config.conditional_prior
                     else StandardNormalPrior(z_dim=self.z_dim)
                 )
-                self.posterior = (
-                    LatentPosteriorTraj(
-                        state_dim=self.state_dim,
-                        z_dim=self.z_dim,
-                        hidden_dim=posterior_hidden,
-                        sigma_activation=config.sigma_activation,
-                        sigma_min=config.z_sigma_min,
-                        n_groups=config.n_groups,
-                    )
-                    if self.per_episode_z
-                    else LatentPosterior(
-                        h_dim=self.h_dim,
-                        state_dim=self.state_dim,
-                        horizon=config.n_action_steps,
-                        z_dim=self.z_dim,
-                        hidden_dim=posterior_hidden,
-                        sigma_activation=config.sigma_activation,
-                        sigma_min=config.z_sigma_min,
-                    )
+                self.posterior = LatentPosteriorTraj(
+                    input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
+                    h_dim=0 if self.per_episode_z else self.h_dim,  # per_episode posterior is h-free
+                    z_dim=self.z_dim,
+                    hidden_dim=posterior_hidden,
+                    sigma_activation=config.sigma_activation,
+                    sigma_min=config.z_sigma_min,
+                    n_groups=config.n_groups,
                 )
                 self.vq = None
 
@@ -266,27 +248,29 @@ class LatentSDEModel(nn.Module):
         if config.compile_model:
             self.net = torch.compile(self.net, mode=config.compile_mode)
 
-        # Per-episode mode pre-caches the normalized state trajectory of every episode in RAM.
-        # Populated by `set_train_dataset()` at training start; None otherwise.
-        self._episode_state_cache: dict[int, Tensor] | None = None
+        # Per-episode mode pre-caches the normalized state+action trajectory of every episode
+        # in RAM. Populated by `set_train_dataset()` at training start; None otherwise.
+        self._episode_traj_cache: dict[int, Tensor] | None = None
 
     def set_train_dataset(self, dataset) -> None:
-        """Pre-cache normalized per-episode state trajectories. No-op outside per-episode mode.
+        """Pre-cache per-episode (state, action) trajectories for the trajectory posterior.
 
-        State is MIN_MAX-normalized to [-1, 1] using `dataset.meta.stats['observation.state']`,
-        matching the live preprocessor. Memory is negligible (PushT: ~200 KB).
+        Full episode, each of state/action MIN_MAX-normalized to [-1, 1] then concatenated on
+        the channel axis (posterior encodes concat([state, action])). Memory is negligible
+        (PushT: ~400 KB).
         """
         if not self.per_episode_z:
             return
 
-        stats = dataset.meta.stats.get("observation.state")
-        if stats is None or "min" not in stats or "max" not in stats:
-            raise ValueError(
-                "Per-episode z requires dataset.meta.stats['observation.state'] with 'min'/'max'."
-            )
-        min_val = torch.as_tensor(stats["min"], dtype=torch.float32).reshape(-1)
-        max_val = torch.as_tensor(stats["max"], dtype=torch.float32).reshape(-1)
-        span = (max_val - min_val).clamp_min(1e-8)
+        # Posterior encodes concat([state, action]); cache both, each MIN_MAX-normalized to [-1, 1].
+        norms: dict[str, tuple[Tensor, Tensor]] = {}
+        for key in (OBS_STATE, ACTION):
+            s = dataset.meta.stats.get(key)
+            if s is None or "min" not in s or "max" not in s:
+                raise ValueError(f"Per-episode z requires dataset.meta.stats[{key!r}] with 'min'/'max'.")
+            lo = torch.as_tensor(s["min"], dtype=torch.float32).reshape(-1)
+            hi = torch.as_tensor(s["max"], dtype=torch.float32).reshape(-1)
+            norms[key] = (lo, (hi - lo).clamp_min(1e-8))
 
         # When `cfg.dataset.episodes` subsets the dataset, hf_dataset rows are densified and
         # absolute episode indices must be remapped through the reader.
@@ -298,14 +282,18 @@ class LatentSDEModel(nn.Module):
             ep = dataset.meta.episodes[ep_idx]
             abs_rows = list(range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"])))
             rows = abs_rows if abs_to_rel is None else [abs_to_rel[i] for i in abs_rows]
-            states = torch.stack(dataset.hf_dataset[rows]["observation.state"]).to(torch.float32)
-            cache[ep_idx] = (2 * (states - min_val) / span - 1).contiguous()
-        self._episode_state_cache = cache
+            cols = []
+            for key in (OBS_STATE, ACTION):
+                v = torch.stack(dataset.hf_dataset[rows][key]).to(torch.float32)
+                lo, span = norms[key]
+                cols.append(2 * (v - lo) / span - 1)
+            cache[ep_idx] = torch.cat(cols, dim=-1).contiguous()  # (T_ep, state_dim + action_dim)
+        self._episode_traj_cache = cache
 
-    def _get_episode_state_trajs(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    def _get_episode_trajs(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         """Look up cached trajectories for `batch["episode_index"]`; return left-aligned
         `padded` (B, T_max, D) and `valid_mask` (True at in-episode frames)."""
-        if self._episode_state_cache is None:
+        if self._episode_traj_cache is None:
             raise RuntimeError(
                 "Per-episode z mode requires set_train_dataset(dataset) before training."
             )
@@ -313,7 +301,7 @@ class LatentSDEModel(nn.Module):
             raise KeyError("Per-episode z mode requires 'episode_index' in the batch.")
         ep_indices = batch["episode_index"]
         device = ep_indices.device
-        trajs = [self._episode_state_cache[int(i)] for i in ep_indices.reshape(-1).tolist()]
+        trajs = [self._episode_traj_cache[int(i)] for i in ep_indices.reshape(-1).tolist()]
         lengths = torch.tensor([t.shape[0] for t in trajs], dtype=torch.long, device=device)
         padded = nn.utils.rnn.pad_sequence(trajs, batch_first=True).to(device)
         valid_mask = torch.arange(padded.shape[1], device=device)[None, :] < lengths[:, None]
@@ -347,16 +335,6 @@ class LatentSDEModel(nn.Module):
             )
 
         return img_features.flatten(start_dim=1)
-
-    def _augmented_state(self, batch: dict[str, Tensor]) -> Tensor:
-        """Flatten the n_obs_steps proprio window into (B, n_obs_steps * state_dim).
-
-        Used on the deployment path (`batch[OBS_STATE]` is the bare n_obs_steps window).
-        `compute_loss` builds its own per-tick windows via `unfold` because its
-        `batch[OBS_STATE]` covers n_obs_steps + H - 1 frames.
-        """
-        state = batch[OBS_STATE]
-        return state.reshape(state.shape[0], -1)
 
     def _effective_sigma(self) -> float:
         """SDE diffusion coefficient σ_eff = √(kl_weight / 2). With the ELBO-exact KL scaling
@@ -445,23 +423,6 @@ class LatentSDEModel(nn.Module):
             noise=noise,
         )
 
-    def generate_action(
-        self, batch: dict[str, Tensor], noise: Tensor | None = None
-    ) -> Tensor:
-        """Single-step action from a self-contained batch; encodes h and samples z fresh.
-
-        The h/z caches live on `LatentSDEPolicy`; this model-layer path stays stateless so
-        it's safe for offline eval, mixed-episode batches, and the first tick of a rollout.
-
-        `noise`, when provided, is used as the Euler-Maruyama Brownian increment of the SDE
-        step (mirrors `DiffusionModel.generate_actions(noise=...)`). It is *not* used to
-        seed the prior z sample — z's stochasticity is governed by the model's RNG.
-        """
-        h = self.encode_observations(batch)
-        z = self.sample_z_from_prior(h)
-        x_aug = self._augmented_state(batch)
-        return self.step(x_aug, h, z, noise=noise)
-
     def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
         """β-VAE-style loss: recon = mean‖μ − v*‖² + (kl_weight / (H·D·dt)) · KL[q‖p],
         with v* = (a − x)/dt the empirical one-step velocity.
@@ -512,16 +473,20 @@ class LatentSDEModel(nn.Module):
 
         if self.use_latent_z:
             if self.per_episode_z:
-                # Full-episode trajectories from the RAM cache; left-aligned, padded.
-                ep_state_traj, valid_mask = self._get_episode_state_trajs(batch)
+                # Full-episode concat([state, action]) trajectories from the RAM cache; padded.
+                traj, valid_mask = self._get_episode_trajs(batch)
                 # Per-trajectory ELBO H/T_ep factor (Gaussian KL only). clamp_min(H) guards degenerate eps.
                 ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
-                posterior_args = (ep_state_traj, valid_mask)
+                posterior_args = (traj, valid_mask)  # per_episode posterior is h-free
             else:
-                posterior_args = (h, x_seq)
+                # Chunks are padding-free (drop_n_last_frames), so the mask is all-True.
+                traj = torch.cat([x_seq, action_target], dim=-1)  # (B, H, state_dim + action_dim)
+                valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
+                posterior_args = (traj, valid_mask, h)
 
             if self.use_vq:
-                prior_logits = self.prior(h)
+                # 2-stage VQ-VAE spirit: prior is a pure observer of h — don't let its CE shape the encoder.
+                prior_logits = self.prior(h.detach())
                 z_e = self.posterior(*posterior_args)
                 z_q_quant, idx_q, _vq_lib_commit_loss = self.vq(z_e.unsqueeze(1))
                 z_q = z_q_quant.squeeze(1)
@@ -548,6 +513,7 @@ class LatentSDEModel(nn.Module):
             flat_cond = torch.cat([flat_h, flat_z], dim=-1)
         else:
             flat_cond = flat_h
+
         mu_flat = self.net(flat_x_aug, flat_cond)
         mu = mu_flat.reshape(B, H, action_dim)
 
@@ -594,6 +560,15 @@ class LatentSDEModel(nn.Module):
                     entropy = -(probs * (probs.clamp_min(1e-12)).log()).sum()
                     loss_dict["vq_perplexity"] = entropy.exp().item()
                     loss_dict["vq_active_codes"] = float((counts > 0).sum().item())
+                    # Prior-side diversity: inference samples z ~ p(k|h), so a collapsed
+                    # categorical prior is invisible in the posterior histogram above.
+                    prior_marginal = F.softmax(prior_logits, dim=-1).mean(dim=0)
+                    prior_entropy = -(prior_marginal * prior_marginal.clamp_min(1e-12).log()).sum()
+                    loss_dict["vq_prior_perplexity"] = prior_entropy.exp().item()
+                    prior_counts = torch.bincount(
+                        prior_logits.argmax(dim=-1), minlength=self.config.vq_codebook_size
+                    )
+                    loss_dict["vq_prior_active_codes"] = float((prior_counts > 0).sum().item())
                 else:
                     loss_dict["kl_loss"] = kl_loss.detach().item()
                     loss_dict["z_sigma_q_mean"] = sigma_q.mean().item()
@@ -601,7 +576,7 @@ class LatentSDEModel(nn.Module):
         return loss, loss_dict
 
 
-# Per-episode latent z — prior p(z|h) and amortized posterior q(z|h, x_seq).
+# Per-episode latent z — prior p(z|h) and amortized posterior q(z|h, x_seq, a_seq).
 # CVAE-style: train z ~ q via reparam, KL[q||p] regularizes the prior. At deployment z is
 # resampled from p(z|h) in lock-step with every h refresh, committing each chunk to one mode.
 # Conditioning into the drift/diffusion net is cond = concat([h, z], -1).
@@ -656,58 +631,6 @@ class LatentPrior(nn.Module):
         return mu, sigma
 
 
-class LatentPosterior(nn.Module):
-    """q(z | h, x_seq) — MLP over [h, flatten(x_seq)].
-
-    Flatten (not pool) over x_seq keeps every step's signal but ties the first Linear's
-    in_features to H — the posterior must be rebuilt if `n_action_steps` changes.
-
-    a_seq is deliberately NOT given to q: feeding the target action chunk would let z
-    encode it directly, turning the model into a memoriser of demo actions. Restricting
-    q to (h, x_seq) forces z to commit a *mode* expressible from the same per-tick
-    state + image conditioning the deployed policy sees.
-    """
-
-    def __init__(
-        self,
-        h_dim: int,
-        state_dim: int,
-        horizon: int,
-        z_dim: int,
-        hidden_dim: int,
-        sigma_activation: str,
-        sigma_min: float,
-    ):
-        super().__init__()
-        self.sigma_act = _sigma_act(sigma_activation)
-        self.sigma_min = sigma_min
-        self.horizon = horizon
-        traj_summary_dim = horizon * state_dim
-        self.trunk = nn.Sequential(
-            nn.Linear(h_dim + traj_summary_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
-        )
-        self.mu_head = nn.Linear(hidden_dim, z_dim)
-        self.sigma_head = nn.Linear(hidden_dim, z_dim)
-        nn.init.zeros_(self.sigma_head.weight)
-        nn.init.zeros_(self.sigma_head.bias)
-
-    def forward(self, h: Tensor, x_seq: Tensor) -> tuple[Tensor, Tensor]:
-        B, H, _ = x_seq.shape
-        if self.horizon != H:
-            raise ValueError(
-                f"LatentPosterior was built with horizon={self.horizon} but got x_seq with H={H}. "
-                "The flatten-based posterior is tied to a fixed horizon."
-            )
-        traj_flat = x_seq.reshape(B, -1)
-        feat = self.trunk(torch.cat([h, traj_flat], dim=-1))
-        mu = self.mu_head(feat)
-        sigma = self.sigma_act(self.sigma_head(feat)) + self.sigma_min
-        return mu, sigma
-
-
 class LearnableCategoricalPrior(nn.Module):
     """Unconditional learnable prior over codebook indices: trainable logits θ ∈ ℝ^K.
 
@@ -745,74 +668,43 @@ class LatentPriorVQ(nn.Module):
         return self.head(self.trunk(h))
 
 
-class LatentPosteriorVQ(nn.Module):
-    """Deterministic posterior for the VQ path: (h, x_seq) → z_e ∈ ℝ^{z_dim}.
-
-    Mirrors LatentPosterior's trunk with a single linear head (no σ); the quantizer downstream
-    snaps z_e to the nearest codebook entry. Horizon-tied via flattened x_seq.
-    """
-
-    def __init__(
-        self,
-        h_dim: int,
-        state_dim: int,
-        horizon: int,
-        z_dim: int,
-        hidden_dim: int,
-    ):
-        super().__init__()
-        self.horizon = horizon
-        traj_summary_dim = horizon * state_dim
-        self.trunk = nn.Sequential(
-            nn.Linear(h_dim + traj_summary_dim, hidden_dim),
-            nn.Mish(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Mish(),
-        )
-        self.head = nn.Linear(hidden_dim, z_dim)
-
-    def forward(self, h: Tensor, x_seq: Tensor) -> Tensor:
-        B, H, _ = x_seq.shape
-        if self.horizon != H:
-            raise ValueError(
-                f"LatentPosteriorVQ built with horizon={self.horizon} but got x_seq with H={H}. "
-                "The flatten-based posterior is tied to a fixed horizon."
-            )
-        feat = self.trunk(torch.cat([h, x_seq.reshape(B, -1)], dim=-1))
-        return self.head(feat)
-
-
-# ---- Per-episode latent z (config.z_sampling_mode='per_episode') ------------------------------
-# Variable-length encoder over the full episode state trajectory. Conv1d + masked GroupNorm +
-# masked mean-pool: output at valid positions is bit-equivalent to running on each episode's
-# exact-length tensor (pads are zeroed before each Conv1d so kernel-3 doesn't leak across).
-class _TrajStateEncoder(nn.Module):
+# ---- Trajectory-encoder posterior (shared by per_chunk and per_episode) ------------------------
+# Variable-length encoder over the input concat([state, action]) trajectory. Conv1d + masked
+# GroupNorm + masked mean-pool: output at valid positions is bit-equivalent to running on each
+# sample's exact-length tensor (pads are zeroed before each Conv1d so kernel-3 doesn't leak across).
+# per_chunk passes the H-step chunk with an all-True mask; per_episode passes the padded
+# full-episode trajectory with the corresponding valid_mask.
+class _TrajEncoder(nn.Module):
     """Two-layer masked Conv1d encoder + masked mean-pool, returning (B, hidden_dim)."""
 
-    def __init__(self, state_dim: int, hidden_dim: int, n_groups: int = 8):
+    def __init__(self, input_dim: int, hidden_dim: int, n_groups: int = 8):
         super().__init__()
-        self.conv1 = nn.Conv1d(state_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
         self.norm1 = _MaskedGroupNorm(n_groups, hidden_dim)
         self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
         self.norm2 = _MaskedGroupNorm(n_groups, hidden_dim)
         self.act = nn.Mish()
         self.post_pool = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Mish())
 
-    def forward(self, x_traj: Tensor, valid_mask: Tensor) -> Tensor:
-        # x_traj: (B, T, state_dim); valid_mask: (B, T) bool.
-        m = valid_mask.to(x_traj.dtype).unsqueeze(1)
-        h = x_traj.transpose(1, 2) * m                     # zero pads (kernel-3 leak)
+    def forward(self, traj: Tensor, valid_mask: Tensor) -> Tensor:
+        # traj: (B, T, state_dim + action_dim); valid_mask: (B, T) bool.
+        m = valid_mask.to(traj.dtype).unsqueeze(1)
+        h = traj.transpose(1, 2) * m                       # zero pads (kernel-3 leak)
         h = self.act(self.norm1(self.conv1(h), valid_mask)) * m
         h = self.act(self.norm2(self.conv2(h), valid_mask))
         return self.post_pool(_masked_mean_pool(h, valid_mask))
 
 
 class LatentPosteriorTraj(nn.Module):
-    """q(z | x_{0:T}) — trajectory encoder → (μ, σ)."""
+    """q(z | x_{0:T}, a_{0:T}, [h]) — (state, action)-traj encoder pooled feats (concat h iff h_dim>0) → (μ, σ).
+
+    per_chunk concats the chunk h (h_dim>0); per_episode builds with h_dim=0 → trajectory-only.
+    """
 
     def __init__(
         self,
-        state_dim: int,
+        input_dim: int,
+        h_dim: int,
         z_dim: int,
         hidden_dim: int,
         sigma_activation: str,
@@ -822,29 +714,35 @@ class LatentPosteriorTraj(nn.Module):
         super().__init__()
         self.sigma_act = _sigma_act(sigma_activation)
         self.sigma_min = sigma_min
-        self.encoder = _TrajStateEncoder(state_dim, hidden_dim, n_groups)
-        self.mu_head = nn.Linear(hidden_dim, z_dim)
-        self.sigma_head = nn.Linear(hidden_dim, z_dim)
+        self.encoder = _TrajEncoder(input_dim, hidden_dim, n_groups)
+        head_in = hidden_dim + h_dim
+        self.mu_head = nn.Linear(head_in, z_dim)
+        self.sigma_head = nn.Linear(head_in, z_dim)
         nn.init.zeros_(self.sigma_head.weight)
         nn.init.zeros_(self.sigma_head.bias)
 
-    def forward(self, x_traj: Tensor, valid_mask: Tensor) -> tuple[Tensor, Tensor]:
-        feat = self.encoder(x_traj, valid_mask)
+    def forward(self, traj: Tensor, valid_mask: Tensor, h: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        feat = self.encoder(traj, valid_mask)
+        if h is not None:
+            feat = torch.cat([feat, h], dim=-1)
         mu = self.mu_head(feat)
         sigma = self.sigma_act(self.sigma_head(feat)) + self.sigma_min
         return mu, sigma
 
 
 class LatentPosteriorTrajVQ(nn.Module):
-    """Deterministic per-episode posterior — trajectory encoder → z_e."""
+    """Deterministic VQ posterior — (state, action)-traj encoder pooled feats (concat h iff h_dim>0) → z_e."""
 
-    def __init__(self, state_dim: int, z_dim: int, hidden_dim: int, n_groups: int = 8):
+    def __init__(self, input_dim: int, h_dim: int, z_dim: int, hidden_dim: int, n_groups: int = 8):
         super().__init__()
-        self.encoder = _TrajStateEncoder(state_dim, hidden_dim, n_groups)
-        self.head = nn.Linear(hidden_dim, z_dim)
+        self.encoder = _TrajEncoder(input_dim, hidden_dim, n_groups)
+        self.head = nn.Linear(hidden_dim + h_dim, z_dim)
 
-    def forward(self, x_traj: Tensor, valid_mask: Tensor) -> Tensor:
-        return self.head(self.encoder(x_traj, valid_mask))
+    def forward(self, traj: Tensor, valid_mask: Tensor, h: Tensor | None = None) -> Tensor:
+        feat = self.encoder(traj, valid_mask)
+        if h is not None:
+            feat = torch.cat([feat, h], dim=-1)
+        return self.head(feat)
 
 
 def _masked_mean_pool(h: Tensor, valid_mask: Tensor) -> Tensor:

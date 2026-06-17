@@ -4,7 +4,7 @@
 # "Latent-SDE Policies for Hierarchical Robot Manipulation" (research_brief.md v7).
 #
 # PoC scope:
-#   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|h, x_seq);
+#   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|h, x_seq, a_seq);
 #     drift/diffusion conditioned on cond = concat([h, z], -1);
 #   * free-space Euler-Maruyama log-likelihood (research_brief.md §3.7) + KL[q||p] (β-VAE).
 #
@@ -47,7 +47,7 @@ class LatentSDEConfig(PreTrainedConfig):
         z  — per-episode latent strategy. CVAE-style: prior p(z|h) is re-sampled at
              deployment **in lock-step with every h refresh** ("episode" =
              one h-refresh window), committing each chunk to one mode. At training,
-             posterior q(z|h, x_seq) provides chunk-level mode signal; loss = NLL +
+             posterior q(z|h, x_seq, a_seq) provides chunk-level mode signal; loss = NLL +
              kl_weight · KL[q||p]. Conditioning is cond = concat([h, z], -1); the
              drift/diffusion block structure is unchanged.
 
@@ -88,7 +88,7 @@ class LatentSDEConfig(PreTrainedConfig):
 
     # ---- Inputs / output structure ------------------------------------------------------------
     n_obs_steps: int = 2
-    n_action_steps: int = 8
+    n_action_steps: int = 32
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -111,9 +111,9 @@ class LatentSDEConfig(PreTrainedConfig):
 
     # ---- Drift / diffusion network ------------------------------------------------------------
     # down_dims reused from DiffusionConfig for per-layer capacity parity with the U-Net's
-    # residual blocks. Point-wise FiLM-ResNet hourglass: state → 512 → 1024 → 2048 →
-    # 2048 → 1024 → 512 → heads. (Horizon axis absent ⇒ kernel_size=1 == Linear.)
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
+    # residual blocks. Point-wise FiLM-ResNet hourglass: state → 256 → 512 → 512 → 256 → heads. 
+    # (Horizon axis absent ⇒ kernel_size=1 == Linear.) DP uses (512, 1024, 2048), but we scale down for the SDE's single-step output.
+    down_dims: tuple[int, ...] = (256, 512)
     n_groups: int = 8
     use_film_scale_modulation: bool = True
 
@@ -140,10 +140,10 @@ class LatentSDEConfig(PreTrainedConfig):
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
     kl_weight: float = 1e-3          # β on KL; also effective_sigma² · 2 at inference
-    kl_min: float = 0.5 # Per-dim KL floor in nats (free bits).
+    kl_min: float = 0.0 # Per-dim KL floor in nats (free bits).
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
-    conditional_prior: bool = False
+    conditional_prior: bool = True
 
     # z_sampling_mode: "per_chunk" → z resampled with h every n_action_steps (chunk-local posterior).
     #                  "per_episode" → z sampled once per episode (full-trajectory posterior).
