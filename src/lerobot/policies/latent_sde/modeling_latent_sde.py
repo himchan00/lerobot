@@ -172,10 +172,10 @@ class LatentSDEModel(nn.Module):
         self.state_dim = config.robot_state_feature.shape[0]
         self.action_dim = config.action_feature.shape[0]
 
-        # conditional_prior gates h into the z prior (h-conditioned MLP vs. h-free); the posterior
-        # follows the prior (per_chunk only — the per_episode posterior is h-free by construction).
-        self.prior_uses_h = config.use_latent_z and config.conditional_prior
-        self.posterior_uses_h = self.prior_uses_h and not self.per_episode_z
+        # conditional_prior gates the image features h into the *entire* z subsystem: True → the
+        # prior is an h-conditioned MLP and the posterior takes h as input; False → both are h-free.
+        # (per_episode forces conditional_prior=False in __post_init__, so z is h-free there.)
+        self.z_uses_h = config.use_latent_z and config.conditional_prior
         if not self.use_latent_z:
             self.z_dim = 0
             self.prior = None
@@ -186,6 +186,9 @@ class LatentSDEModel(nn.Module):
             posterior_hidden = config.z_posterior_hidden_dim or self.h_dim
             prior_hidden = config.z_prior_hidden_dim or self.h_dim
 
+            # TCN posterior depth by mode → RF ≈ 128 (per_episode) / 32 (per_chunk), kernel 3.
+            tcn_levels = 5 if self.per_episode_z else 3
+
             if self.use_vq:
                 self.prior = (
                     LatentPriorVQ(
@@ -193,14 +196,15 @@ class LatentSDEModel(nn.Module):
                         codebook_size=config.vq_codebook_size,
                         hidden_dim=prior_hidden,
                     )
-                    if self.prior_uses_h
+                    if self.z_uses_h
                     else LearnableCategoricalPrior(codebook_size=config.vq_codebook_size)
                 )
                 self.posterior = LatentPosteriorTrajVQ(
                     input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
-                    h_dim=self.h_dim if self.posterior_uses_h else 0,  # 0 → h-free posterior
+                    h_dim=self.h_dim if self.z_uses_h else 0,  # 0 → h-free posterior
                     z_dim=self.z_dim,
                     hidden_dim=posterior_hidden,
+                    num_levels=tcn_levels,
                     n_groups=config.n_groups,
                 )
                 from vector_quantize_pytorch import VectorQuantize
@@ -224,16 +228,17 @@ class LatentSDEModel(nn.Module):
                         sigma_activation=config.sigma_activation,
                         sigma_min=config.z_sigma_min,
                     )
-                    if self.prior_uses_h
+                    if self.z_uses_h
                     else StandardNormalPrior(z_dim=self.z_dim)
                 )
                 self.posterior = LatentPosteriorTraj(
                     input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
-                    h_dim=self.h_dim if self.posterior_uses_h else 0,  # 0 → h-free posterior
+                    h_dim=self.h_dim if self.z_uses_h else 0,  # 0 → h-free posterior
                     z_dim=self.z_dim,
                     hidden_dim=posterior_hidden,
                     sigma_activation=config.sigma_activation,
                     sigma_min=config.z_sigma_min,
+                    num_levels=tcn_levels,
                     n_groups=config.n_groups,
                 )
                 self.vq = None
@@ -497,8 +502,8 @@ class LatentSDEModel(nn.Module):
                 # Chunks are padding-free (drop_n_last_frames), so the mask is all-True.
                 traj = torch.cat([x_seq, action_target], dim=-1)  # (B, H, state_dim + action_dim)
                 valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
-                # pass h to the posterior only when posterior_uses_h.
-                posterior_args = (traj, valid_mask, h) if self.posterior_uses_h else (traj, valid_mask)
+                # pass h to the posterior only when z_uses_h.
+                posterior_args = (traj, valid_mask, h) if self.z_uses_h else (traj, valid_mask)
 
             if self.use_vq:
                 # 2-stage VQ-VAE spirit: prior is a pure observer of h — don't let its CE shape the encoder.
@@ -705,30 +710,45 @@ class LatentPriorVQ(nn.Module):
         return self.head(self.trunk(h))
 
 
-# ---- Trajectory-encoder posterior (shared by per_chunk and per_episode) ------------------------
-# Variable-length encoder over the input concat([state, action]) trajectory. Conv1d + masked
-# GroupNorm + masked mean-pool: output at valid positions is bit-equivalent to running on each
-# sample's exact-length tensor (pads are zeroed before each Conv1d so kernel-5 doesn't leak across).
-# per_chunk passes the H-step chunk with an all-True mask; per_episode passes the padded
-# full-episode trajectory with the corresponding valid_mask.
-class _TrajEncoder(nn.Module):
-    """Two-layer masked Conv1d encoder + masked mean-pool, returning (B, hidden_dim)."""
+# Trajectory-encoder posterior (per_chunk + per_episode): a dilated TCN (Bai et al. 2018) over
+# concat([state, action]) — 1×1 lift + kernel-3 dilated residual blocks + masked mean-pool. Pads
+# are zeroed before every conv and GroupNorm is masked, so eval outputs are bit-equivalent to
+# exact-length (no cross-pad leak). RF = 1 + 4·(2^num_levels − 1).
+class _TCNResidualBlock(nn.Module):
+    """(DilatedConv3 → masked GroupNorm → Mish) × 2 + identity skip; centered padding."""
 
-    def __init__(self, input_dim: int, hidden_dim: int, n_groups: int = 8):
+    def __init__(self, channels: int, dilation: int, n_groups: int):
         super().__init__()
-        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2)
-        self.norm1 = _MaskedGroupNorm(n_groups, hidden_dim)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2)
-        self.norm2 = _MaskedGroupNorm(n_groups, hidden_dim)
+        self.conv1 = nn.Conv1d(channels, channels, 3, padding=dilation, dilation=dilation)
+        self.norm1 = _MaskedGroupNorm(n_groups, channels)
+        self.conv2 = nn.Conv1d(channels, channels, 3, padding=dilation, dilation=dilation)
+        self.norm2 = _MaskedGroupNorm(n_groups, channels)
         self.act = nn.Mish()
+
+    def forward(self, h: Tensor, valid_mask: Tensor, m: Tensor) -> Tensor:
+        # Zero pads before each conv so the dilated kernel never reads leaked pad values.
+        out = self.act(self.norm1(self.conv1(h * m), valid_mask)) * m
+        out = self.act(self.norm2(self.conv2(out), valid_mask)) * m
+        return out + h
+
+
+class _TrajEncoder(nn.Module):
+    """Dilated-TCN encoder + masked mean-pool → (B, hidden_dim). Kernel 3; depth = num_levels."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, num_levels: int, n_groups: int = 8):
+        super().__init__()
+        self.input_proj = nn.Conv1d(input_dim, hidden_dim, kernel_size=1)  # pointwise channel lift
+        self.blocks = nn.ModuleList(
+            [_TCNResidualBlock(hidden_dim, dilation=2 ** level, n_groups=n_groups) for level in range(num_levels)]
+        )
         self.post_pool = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Mish())
 
     def forward(self, traj: Tensor, valid_mask: Tensor) -> Tensor:
         # traj: (B, T, state_dim + action_dim); valid_mask: (B, T) bool.
         m = valid_mask.to(traj.dtype).unsqueeze(1)
-        h = traj.transpose(1, 2) * m                       # zero pads (kernel-5 leak)
-        h = self.act(self.norm1(self.conv1(h), valid_mask)) * m
-        h = self.act(self.norm2(self.conv2(h), valid_mask))
+        h = self.input_proj(traj.transpose(1, 2) * m)
+        for block in self.blocks:
+            h = block(h, valid_mask, m)
         return self.post_pool(_masked_mean_pool(h, valid_mask))
 
 
@@ -746,12 +766,13 @@ class LatentPosteriorTraj(nn.Module):
         hidden_dim: int,
         sigma_activation: str,
         sigma_min: float,
+        num_levels: int,
         n_groups: int = 8,
     ):
         super().__init__()
         self.sigma_act = _sigma_act(sigma_activation)
         self.sigma_min = sigma_min
-        self.encoder = _TrajEncoder(input_dim, hidden_dim, n_groups)
+        self.encoder = _TrajEncoder(input_dim, hidden_dim, num_levels, n_groups)
         head_in = hidden_dim + h_dim
         self.mu_head = nn.Linear(head_in, z_dim)
         self.sigma_head = nn.Linear(head_in, z_dim)
@@ -770,9 +791,17 @@ class LatentPosteriorTraj(nn.Module):
 class LatentPosteriorTrajVQ(nn.Module):
     """Deterministic VQ posterior — (state, action)-traj encoder pooled feats (concat h iff h_dim>0) → z_e."""
 
-    def __init__(self, input_dim: int, h_dim: int, z_dim: int, hidden_dim: int, n_groups: int = 8):
+    def __init__(
+        self,
+        input_dim: int,
+        h_dim: int,
+        z_dim: int,
+        hidden_dim: int,
+        num_levels: int,
+        n_groups: int = 8,
+    ):
         super().__init__()
-        self.encoder = _TrajEncoder(input_dim, hidden_dim, n_groups)
+        self.encoder = _TrajEncoder(input_dim, hidden_dim, num_levels, n_groups)
         self.head = nn.Linear(hidden_dim + h_dim, z_dim)
 
     def forward(self, traj: Tensor, valid_mask: Tensor, h: Tensor | None = None) -> Tensor:
