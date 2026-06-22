@@ -41,11 +41,11 @@ action's one-step velocity, regularized by `KL[q‖p]` on a per-episode latent s
 
 `use_latent_z=False` recovers the no-z PoC exactly (no prior/posterior, no KL, `z_dim=0`).
 
-**Prior `p(z|h)`** (inference + KL target). `conditional_prior=True` → MLP `LatentPrior`; `False` → `StandardNormalPrior` (`N(0,I)`). VQ swaps in `LatentPriorVQ` / `LearnableCategoricalPrior`.
+**Prior `p(z|h)`** (inference + KL target). `conditional_prior=True` → MLP `LatentPrior`; `False` → `StandardNormalPrior` (`N(0,I)`). VQ swaps in `LatentPriorVQ` / `LearnableCategoricalPrior`. **The posterior follows the prior**: it takes `h` as input iff `conditional_prior=True` — `prior_uses_h = conditional_prior`, `posterior_uses_h = prior_uses_h ∧ ¬per_episode`.
 
 **Posterior `q(z | (x,a)_{0:T}, [h])`** (training only). Encodes the **(state, action)
 trajectory** concatenated on the channel axis — `_TrajEncoder` input channels = `state_dim + action_dim`.
-- `per_chunk`: trajectory = `cat([x_seq, action_target])` `(B, H, state_dim + action_dim)`, all-True mask; pooled feats concat the chunk `h`.
+- `per_chunk`: trajectory = `cat([x_seq, action_target])` `(B, H, state_dim + action_dim)`, all-True mask; pooled feats concat the chunk `h` iff `conditional_prior=True` (else h-free).
 - `per_episode`: trajectory = **full-episode** (state, action) traj from a RAM cache (left-aligned, padded + `valid_mask`); h-free (posterior built with `h_dim=0`).
 
 **Sampling.** Gaussian: reparam `z = μ_q + σ_q·ε`. VQ (van den Oord 1711.00937): deterministic
@@ -71,6 +71,8 @@ loss  = recon + KL   (or recon + VQ commit + prior-CE)
 `x_seq` (measured state, no teacher-forcing) still drives the recon target and the drift input;
 only the **posterior's** input was switched to actions.
 
+- **Train-only augmentations (default off).** `state_noise_std>0` perturbs the drift's state window by `std·√dt` per frame and recomputes the recon anchor from the *noised* window → corrective drift (off-manifold stability). `h_dropout_prob>0` replaces `h` with the learnable `null_h` per sample at source (prior/posterior/drift all see it). Both gate on `self.training`; inference and validation are unaffected.
+
 ## Invariants & gotchas
 
 - **`action_dim == state_dim` is assumed** — recon is `(action − state)/dt` (kinematic imitation `x_d ≈ x`, exact for PushT where action = next EE-pose target). Swapping the posterior to actions is therefore dimensionally a no-op but semantically correct.
@@ -92,7 +94,8 @@ Factory wiring: `policies/factory.py` (`get_policy_class` / `make_policy_config`
 ## Config cheat-sheet (`LatentSDEConfig`)
 
 `n_obs_steps`, `n_action_steps` (= SDE chunk length & h-refresh period) · `sde_dt` (None → 1/fps) ·
-`use_latent_z`, `z_dim`, `z_sampling_mode` (`per_chunk`|`per_episode`), `conditional_prior` ·
+`use_latent_z`, `z_dim`, `z_sampling_mode` (`per_chunk`|`per_episode`), `conditional_prior` (gates h into prior **and** posterior) ·
 `kl_weight`, `kl_min`, `sigma_activation` (`exp`|`softplus`), `z_sigma_min` ·
 `use_vq`, `vq_codebook_size`, `vq_commit_weight`, `vq_decay`, `vq_prior_weight` ·
+`state_noise_std` (train-only drift-input noise; corrective target), `h_dropout_prob` (train-only h→null_h dropout) ·
 `deterministic_inference`, `deterministic_z_inference` · vision/optim knobs copied verbatim from `DiffusionConfig` for fairness.

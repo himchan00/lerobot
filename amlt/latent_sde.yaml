@@ -1,0 +1,130 @@
+description: >
+  Push-T benchmark + Latent-SDE policy sweep on Singularity.
+  4-run grid over z_dim ∈ {2, 4} × kl_weight ∈ {1e-2, 1e-3}; default config otherwise.
+  Preemption-safe via lerobot-train --resume + persistent output_dir on /mnt storage.
+  Job 1 registers &common_env / &common_command; jobs 2-4 only override EXTRA_CONFIGS.
+
+target:
+  service: sing
+  workspace_name: wsgcrrbt
+  name: msrresrchbasicvc
+
+env_defaults:
+  BASE_DIR: /mnt/v-hihwang/projects/lerobot
+
+storage:
+  my_storage:
+    storage_account_name: azsussc
+    container_name: v-hihwang
+    mount_dir: /mnt/v-hihwang
+
+environment:
+  image: amlt-sing/acpt-torch2.7.1-py3.10-cuda12.6-ubuntu22.04
+  setup:
+    - conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main || true
+    # lerobot requires Python >= 3.12
+    - conda create -y -n lerobot python=3.12
+    - conda run --name lerobot conda install -y -c conda-forge libstdcxx-ng
+    # CUDA torch matched to the cu126 base image; lerobot pyproject allows torch>=2.7,<2.12
+    - conda run --name lerobot pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu126
+    # Editable install of the lerobot repo with extras needed for Push-T + Latent-SDE
+    - conda run --name lerobot pip install -e '.[pusht,diffusion,training]'
+    # FIPS-incompatibility workaround (msrresrchbasicvc H100 cluster enforces FIPS).
+    # The pip wheel of `av` (PyAV) bundles its own FIPS-incompatible OpenSSL that
+    # aborts python at import time. Replace with conda-forge's build (links against
+    # conda's OpenSSL 3.x). Mirrors CompVLA/amlt/submit_compvla_speed.yaml.
+    - conda run --name lerobot pip uninstall -y av || true
+    - conda run --name lerobot conda install -y -c conda-forge av
+
+code:
+  local_dir: $CONFIG_DIR/..
+
+jobs:
+  # ----- Job 1: registers &common_env and &common_command (z_dim=2, kl_weight=1e-2) -----
+  - name: latent_sde_z2_kl1e-2
+    sku: 1x80G1-A100
+    process_count_per_node: 1
+    sla_tier: Standard
+    execution_mode: basic
+    submit_args:
+      env: &common_env
+        AMLT_DOCKERFILE_TEMPLATE: default
+        SHARED_MEMORY_PERCENT: 0.5
+        WANDB_API_KEY: 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
+        PYTHONUNBUFFERED: "1"
+        # ----- persistent on /mnt (survive preemption) -----
+        HF_HOME: /mnt/v-hihwang/projects/lerobot/hf_cache
+        HF_HUB_CACHE: /mnt/v-hihwang/projects/lerobot/hf_cache/hub
+        # HF_LEROBOT_HOME defaults to $HF_HOME/lerobot, so it's also on /mnt automatically
+        # ----- ephemeral on local SSD (only datasets-lib builder staging) -----
+        HF_DATASETS_CACHE: /scratch/hf_datasets_cache
+        # ----- per-run sweep overrides: jobs below override ONLY this line -----
+        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-2"
+    command: &common_command
+      - "export LD_LIBRARY_PATH=/home/aiscuser/.conda/envs/lerobot/lib:$$LD_LIBRARY_PATH; mkdir -p /scratch/hf_datasets_cache"
+      - |
+        # OUTPUT_DIR keyed on AMLT_JOB_NAME (unique per sweep point, stable across preemption)
+        # under the experiment, so only EXTRA_CONFIGS differs between jobs.
+        OUTPUT_DIR=${BASE_DIR}/PushT/$$AMLT_EXPERIMENT_NAME/$$AMLT_JOB_NAME
+        CKPT_CFG=$$OUTPUT_DIR/checkpoints/last/pretrained_model/train_config.json
+        if [ -f "$$CKPT_CFG" ]; then
+          echo "[INFO] Resuming from $$CKPT_CFG"
+          RESUME_FLAGS="--resume=true --config_path=$$CKPT_CFG"
+        else
+          # Stale dir without a checkpoint would trip lerobot's FileExistsError guard
+          if [ -d "$$OUTPUT_DIR" ]; then
+            echo "[INFO] Stale output dir without checkpoint, wiping: $$OUTPUT_DIR"
+            rm -rf "$$OUTPUT_DIR"
+          fi
+          echo "[INFO] Fresh scratch run -> $$OUTPUT_DIR"
+          RESUME_FLAGS=""
+        fi
+        conda run --no-capture-output --name lerobot \
+          python -m lerobot.scripts.lerobot_train \
+            --policy.type=latent_sde \
+            --policy.push_to_hub=false \
+            --dataset.repo_id=lerobot/pusht \
+            --env.type=pusht \
+            --output_dir=$$OUTPUT_DIR \
+            --job_name=$$AMLT_JOB_NAME \
+            --batch_size=64 \
+            --seed=0 \
+            --eval.use_async_envs=false \
+            --wandb.enable=true \
+            --wandb.project=lerobot_pusht \
+            $$EXTRA_CONFIGS \
+            $$RESUME_FLAGS
+
+  # ----- Jobs 2-4: reuse &common_env / &common_command, override only EXTRA_CONFIGS -----
+  - name: latent_sde_z2_kl1e-3
+    sku: 1x80G1-A100
+    process_count_per_node: 1
+    sla_tier: Standard
+    execution_mode: basic
+    submit_args:
+      env:
+        <<: *common_env
+        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-3"
+    command: *common_command
+
+  - name: latent_sde_z4_kl1e-2
+    sku: 1x80G1-A100
+    process_count_per_node: 1
+    sla_tier: Standard
+    execution_mode: basic
+    submit_args:
+      env:
+        <<: *common_env
+        EXTRA_CONFIGS: "--policy.z_dim=4 --policy.kl_weight=1e-2"
+    command: *common_command
+
+  - name: latent_sde_z4_kl1e-3
+    sku: 1x80G1-A100
+    process_count_per_node: 1
+    sla_tier: Standard
+    execution_mode: basic
+    submit_args:
+      env:
+        <<: *common_env
+        EXTRA_CONFIGS: "--policy.z_dim=4 --policy.kl_weight=1e-3"
+    command: *common_command

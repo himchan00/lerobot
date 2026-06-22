@@ -171,6 +171,11 @@ class LatentSDEModel(nn.Module):
         self.per_episode_z = (config.z_sampling_mode == "per_episode")
         self.state_dim = config.robot_state_feature.shape[0]
         self.action_dim = config.action_feature.shape[0]
+
+        # conditional_prior gates h into the z prior (h-conditioned MLP vs. h-free); the posterior
+        # follows the prior (per_chunk only — the per_episode posterior is h-free by construction).
+        self.prior_uses_h = config.use_latent_z and config.conditional_prior
+        self.posterior_uses_h = self.prior_uses_h and not self.per_episode_z
         if not self.use_latent_z:
             self.z_dim = 0
             self.prior = None
@@ -188,12 +193,12 @@ class LatentSDEModel(nn.Module):
                         codebook_size=config.vq_codebook_size,
                         hidden_dim=prior_hidden,
                     )
-                    if config.conditional_prior
+                    if self.prior_uses_h
                     else LearnableCategoricalPrior(codebook_size=config.vq_codebook_size)
                 )
                 self.posterior = LatentPosteriorTrajVQ(
                     input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
-                    h_dim=0 if self.per_episode_z else self.h_dim,  # per_episode posterior is h-free
+                    h_dim=self.h_dim if self.posterior_uses_h else 0,  # 0 → h-free posterior
                     z_dim=self.z_dim,
                     hidden_dim=posterior_hidden,
                     n_groups=config.n_groups,
@@ -219,12 +224,12 @@ class LatentSDEModel(nn.Module):
                         sigma_activation=config.sigma_activation,
                         sigma_min=config.z_sigma_min,
                     )
-                    if config.conditional_prior
+                    if self.prior_uses_h
                     else StandardNormalPrior(z_dim=self.z_dim)
                 )
                 self.posterior = LatentPosteriorTraj(
                     input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
-                    h_dim=0 if self.per_episode_z else self.h_dim,  # per_episode posterior is h-free
+                    h_dim=self.h_dim if self.posterior_uses_h else 0,  # 0 → h-free posterior
                     z_dim=self.z_dim,
                     hidden_dim=posterior_hidden,
                     sigma_activation=config.sigma_activation,
@@ -244,6 +249,10 @@ class LatentSDEModel(nn.Module):
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
         )
+
+        # Learnable null embedding for h conditioning-dropout (created unconditionally so the
+        # state_dict is config-invariant; unused when h_dropout_prob == 0).
+        self.null_h = nn.Parameter(torch.zeros(self.h_dim))
 
         if config.compile_model:
             self.net = torch.compile(self.net, mode=config.compile_mode)
@@ -471,6 +480,12 @@ class LatentSDEModel(nn.Module):
 
         h = self.encode_observations(batch)                  # (B, cond_dim)
 
+        # h conditioning-dropout (train-only): per-sample replace h by the learnable null embedding.
+        h_drop_mask = None
+        if self.training and self.config.h_dropout_prob > 0:
+            h_drop_mask = torch.rand(B, 1, device=h.device) < self.config.h_dropout_prob
+            h = torch.where(h_drop_mask, self.null_h.to(h.dtype), h)
+
         if self.use_latent_z:
             if self.per_episode_z:
                 # Full-episode concat([state, action]) trajectories from the RAM cache; padded.
@@ -482,7 +497,8 @@ class LatentSDEModel(nn.Module):
                 # Chunks are padding-free (drop_n_last_frames), so the mask is all-True.
                 traj = torch.cat([x_seq, action_target], dim=-1)  # (B, H, state_dim + action_dim)
                 valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
-                posterior_args = (traj, valid_mask, h)
+                # pass h to the posterior only when posterior_uses_h.
+                posterior_args = (traj, valid_mask, h) if self.posterior_uses_h else (traj, valid_mask)
 
             if self.use_vq:
                 # 2-stage VQ-VAE spirit: prior is a pure observer of h — don't let its CE shape the encoder.
@@ -506,6 +522,11 @@ class LatentSDEModel(nn.Module):
             mu_p = sigma_p = mu_q = sigma_q = None
             z_q = None
 
+        dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
+        # State-noise augmentation (train-only): perturb each frame by std·√dt (corrective target below).
+        if self.training and self.config.state_noise_std > 0:
+            x_seq_aug = x_seq_aug + self.config.state_noise_std * dt**0.5 * torch.randn_like(x_seq_aug)
+
         flat_x_aug = x_seq_aug.reshape(B * H, -1)
         flat_h = h.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
         if self.use_latent_z:
@@ -517,8 +538,8 @@ class LatentSDEModel(nn.Module):
         mu_flat = self.net(flat_x_aug, flat_cond)
         mu = mu_flat.reshape(B, H, action_dim)
 
-        dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
-        target_velocity = (action_target - x_seq) / dt
+        # Corrective target: anchor from the (possibly noised) window — equals x_seq when std=0.
+        target_velocity = (action_target - x_seq_aug[..., -self.state_dim :]) / dt
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
         recon_loss = ((mu - target_velocity) ** 2).mean()
 
@@ -547,8 +568,24 @@ class LatentSDEModel(nn.Module):
                 "recon_loss": recon_loss.detach().item(),
                 "effective_sigma": self._effective_sigma(),
             }
+            # recon on h-kept samples only (dropped ones see null_h → inflate the plain recon).
+            if h_drop_mask is not None:
+                keep = ~h_drop_mask.squeeze(-1)  # (B,)
+                per_sample_recon = ((mu - target_velocity) ** 2).mean(dim=(1, 2))  # (B,)
+                loss_dict["recon_loss_clean"] = (
+                    per_sample_recon[keep].mean().item() if keep.any() else float("nan")
+                )
+            else:
+                loss_dict["recon_loss_clean"] = recon_loss.detach().item()
             if self.use_latent_z:
                 loss_dict["other_loss"] = other_loss.detach().item()
+                # z_usage_gap: extra recon error from a batch-rolled (mismatched) z. ~0 ⇒ z ignored.
+                flat_z_rolled = (
+                    torch.roll(z_q, shifts=1, dims=0).unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
+                )
+                mu_rolled = self.net(flat_x_aug, torch.cat([flat_h, flat_z_rolled], dim=-1))
+                recon_loss_rolled = ((mu_rolled.reshape(B, H, action_dim) - target_velocity) ** 2).mean()
+                loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
                 if self.per_episode_z:
                     loss_dict["ep_length_mean"] = ep_lengths.detach().mean().item()
                 if self.use_vq:
@@ -671,7 +708,7 @@ class LatentPriorVQ(nn.Module):
 # ---- Trajectory-encoder posterior (shared by per_chunk and per_episode) ------------------------
 # Variable-length encoder over the input concat([state, action]) trajectory. Conv1d + masked
 # GroupNorm + masked mean-pool: output at valid positions is bit-equivalent to running on each
-# sample's exact-length tensor (pads are zeroed before each Conv1d so kernel-3 doesn't leak across).
+# sample's exact-length tensor (pads are zeroed before each Conv1d so kernel-5 doesn't leak across).
 # per_chunk passes the H-step chunk with an all-True mask; per_episode passes the padded
 # full-episode trajectory with the corresponding valid_mask.
 class _TrajEncoder(nn.Module):
@@ -679,9 +716,9 @@ class _TrajEncoder(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int, n_groups: int = 8):
         super().__init__()
-        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=5, padding=2)
         self.norm1 = _MaskedGroupNorm(n_groups, hidden_dim)
-        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=5, padding=2)
         self.norm2 = _MaskedGroupNorm(n_groups, hidden_dim)
         self.act = nn.Mish()
         self.post_pool = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.Mish())
@@ -689,7 +726,7 @@ class _TrajEncoder(nn.Module):
     def forward(self, traj: Tensor, valid_mask: Tensor) -> Tensor:
         # traj: (B, T, state_dim + action_dim); valid_mask: (B, T) bool.
         m = valid_mask.to(traj.dtype).unsqueeze(1)
-        h = traj.transpose(1, 2) * m                       # zero pads (kernel-3 leak)
+        h = traj.transpose(1, 2) * m                       # zero pads (kernel-5 leak)
         h = self.act(self.norm1(self.conv1(h), valid_mask)) * m
         h = self.act(self.norm2(self.conv2(h), valid_mask))
         return self.post_pool(_masked_mean_pool(h, valid_mask))

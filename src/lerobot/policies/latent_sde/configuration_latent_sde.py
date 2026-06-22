@@ -122,6 +122,10 @@ class LatentSDEConfig(PreTrainedConfig):
     sde_dt: float | None = 0.1
     sigma_activation: str = "exp"   # "exp" | "softplus"; used by z prior/posterior heads only
 
+    # Train-only state-noise augmentation. >0 perturbs the drift's state window by std·√dt per frame
+    # and recomputes the recon target from the perturbed anchor → corrective drift. 0.0 = legacy.
+    state_noise_std: float = 0.1
+
     # ---- Inference -----------------------------------------------------------------------------
     # If True, drift-only inference. False → SDE noise σ_eff·√dt with σ_eff = √(kl_weight/2).
     deterministic_inference: bool = True
@@ -133,7 +137,8 @@ class LatentSDEConfig(PreTrainedConfig):
     #   Too low → q ignores prior (deployment z uninformed). 1e-2 .. 1.0 worth sweeping.
     # z_prior_hidden_dim / z_posterior_hidden_dim: hidden width of the (μ,σ) MLPs. None → h_dim.
     # deterministic_z_inference: use μ_p instead of sampling z at deploy. Debug/ablation only.
-    # conditional_prior: True → p(z|h) (2-layer MLP, current default). False → p(z) = N(0, I)
+    # conditional_prior: True → p(z|h) (2-layer MLP, current default) and the posterior also takes
+    #   h as input. False → p(z) = N(0, I) and the posterior is h-free (trajectory-only).
 
     use_latent_z: bool = True
     z_dim: int = 8
@@ -144,6 +149,10 @@ class LatentSDEConfig(PreTrainedConfig):
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
     conditional_prior: bool = True
+
+    # Train-only h conditioning-dropout: with this prob, replace h by a learnable null embedding
+    # (at source, so prior/posterior/drift all see it). Inference always uses real h. 0.0 = off.
+    h_dropout_prob: float = 0.1
 
     # z_sampling_mode: "per_chunk" → z resampled with h every n_action_steps (chunk-local posterior).
     #                  "per_episode" → z sampled once per episode (full-trajectory posterior).
@@ -203,6 +212,11 @@ class LatentSDEConfig(PreTrainedConfig):
 
         if self.kl_weight < 0:
             raise ValueError(f"`kl_weight` must be non-negative. Got {self.kl_weight}.")
+
+        if self.state_noise_std < 0:
+            raise ValueError(f"`state_noise_std` must be non-negative. Got {self.state_noise_std}.")
+        if not (0.0 <= self.h_dropout_prob <= 1.0):
+            raise ValueError(f"`h_dropout_prob` must be in [0, 1]. Got {self.h_dropout_prob}.")
 
         if self.z_dim <= 0:
             raise ValueError(f"`z_dim` must be positive. Got {self.z_dim}.")
