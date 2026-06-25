@@ -152,7 +152,7 @@ class LatentSDEConfig(PreTrainedConfig):
 
     # Train-only h conditioning-dropout: with this prob, replace h by a learnable null embedding
     # (at source, so prior/posterior/drift all see it). Inference always uses real h. 0.0 = off.
-    h_dropout_prob: float = 0.1
+    h_dropout_prob: float = 0.0
 
     # z_sampling_mode: "per_chunk" → z resampled with h every n_action_steps (chunk-local posterior).
     #                  "per_episode" → z sampled once per episode (full-trajectory posterior).
@@ -164,9 +164,9 @@ class LatentSDEConfig(PreTrainedConfig):
     # Requires extras `lerobot[latent_sde]`.
     use_vq: bool = False
     vq_codebook_size: int = 8
-    vq_commit_weight: float = 1.0 # matches VectorQuantize default
+    vq_commit_weight: float = 10.0 # matches VectorQuantize default
     vq_decay: float = 0.8 # matches VectorQuantize default
-    vq_prior_weight: float = 1.0
+    vq_prior_weight: float = 1e-3
 
     # ---- Optimization --------------------------------------------------------------------------
     compile_model: bool = False

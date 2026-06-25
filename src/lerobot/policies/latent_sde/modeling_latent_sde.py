@@ -476,12 +476,23 @@ class LatentSDEModel(nn.Module):
                 f"Expected batch[OBS_STATE] T={expected_T} (n_obs_steps + H - 1); "
                 f"got T={state_full.shape[1]}. Check observation_delta_indices_per_key."
             )
-        x_seq = state_full[:, n_obs - 1 :]  # (B, H, state_dim)
-        x_seq_aug = (
-            state_full.unfold(dimension=1, size=n_obs, step=1)  # (B, H, D, n_obs)
-            .permute(0, 1, 3, 2)                                 # (B, H, n_obs, D)
-            .reshape(B, H, n_obs * self.state_dim)
-        )
+        dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
+        noise = self.training and self.config.state_noise_std > 0
+        std = self.config.state_noise_std * dt**0.5
+
+        # Drift target (train-only state-noise): noise the chunk window and relabel each noised anchor to
+        # the action of its nearest CLEAN chunk anchor (corrective funnel). Only the drift sees noise —
+        # the posterior gets the raw, noise-free input (below).
+        x_seq_clean = state_full[:, n_obs - 1 :]  # (B, H, state_dim) clean anchors
+        if noise:
+            state_win = state_full + std * torch.randn_like(state_full)
+            d2 = ((state_win[:, n_obs - 1 :].unsqueeze(2) - x_seq_clean.unsqueeze(1)) ** 2).sum(-1)  # (B,H,H)
+            action_endpoint = torch.gather(action_target, 1, d2.argmin(2).unsqueeze(-1).expand(-1, -1, action_dim))
+        else:
+            state_win, action_endpoint = state_full, action_target
+
+        x_seq = state_win[:, n_obs - 1 :]  # (B, H, state_dim) — possibly noised anchor (drift input)
+        x_seq_aug = state_win.unfold(1, n_obs, 1).permute(0, 1, 3, 2).reshape(B, H, n_obs * self.state_dim)
 
         h = self.encode_observations(batch)                  # (B, cond_dim)
 
@@ -493,14 +504,13 @@ class LatentSDEModel(nn.Module):
 
         if self.use_latent_z:
             if self.per_episode_z:
-                # Full-episode concat([state, action]) trajectories from the RAM cache; padded.
+                # Posterior over the RAW full-episode (state, action) trajectory (no noise/relabel).
                 traj, valid_mask = self._get_episode_trajs(batch)
-                # Per-trajectory ELBO H/T_ep factor (Gaussian KL only). clamp_min(H) guards degenerate eps.
                 ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
-                posterior_args = (traj, valid_mask)  # per_episode posterior is h-free
+                posterior_args = (traj, valid_mask)
             else:
-                # Chunks are padding-free (drop_n_last_frames), so the mask is all-True.
-                traj = torch.cat([x_seq, action_target], dim=-1)  # (B, H, state_dim + action_dim)
+                # Posterior over the RAW chunk: clean state + time-aligned action (padding-free chunk).
+                traj = torch.cat([x_seq_clean, action_target], dim=-1)
                 valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
                 # pass h to the posterior only when z_uses_h.
                 posterior_args = (traj, valid_mask, h) if self.z_uses_h else (traj, valid_mask)
@@ -527,11 +537,6 @@ class LatentSDEModel(nn.Module):
             mu_p = sigma_p = mu_q = sigma_q = None
             z_q = None
 
-        dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
-        # State-noise augmentation (train-only): perturb each frame by std·√dt (corrective target below).
-        if self.training and self.config.state_noise_std > 0:
-            x_seq_aug = x_seq_aug + self.config.state_noise_std * dt**0.5 * torch.randn_like(x_seq_aug)
-
         flat_x_aug = x_seq_aug.reshape(B * H, -1)
         flat_h = h.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
         if self.use_latent_z:
@@ -543,8 +548,9 @@ class LatentSDEModel(nn.Module):
         mu_flat = self.net(flat_x_aug, flat_cond)
         mu = mu_flat.reshape(B, H, action_dim)
 
-        # Corrective target: anchor from the (possibly noised) window — equals x_seq when std=0.
-        target_velocity = (action_target - x_seq_aug[..., -self.state_dim :]) / dt
+        # Corrective target: drift from the (noised) anchor toward action_endpoint — the nearest-
+        # original relabel under state-noise, else the time-aligned action.
+        target_velocity = (action_endpoint - x_seq) / dt
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
         recon_loss = ((mu - target_velocity) ** 2).mean()
 
