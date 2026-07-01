@@ -32,14 +32,16 @@ environment:
     # aborts python at import time. Replace with conda-forge's build (links against
     # conda's OpenSSL 3.x). Mirrors CompVLA/amlt/submit_compvla_speed.yaml.
     - conda run --name lerobot pip uninstall -y av || true
-    - conda run --name lerobot conda install -y -c conda-forge av
+    - conda run --name lerobot conda install -y -c conda-forge "av>=15,<16"
+    # Fail the build early if av lacks the top-level `av.option` lerobot needs (PyAV >= 15).
+    - conda run --name lerobot python -c "import av, av.option; print(av.__version__)"
 
 code:
   local_dir: $CONFIG_DIR/..
 
 jobs:
-  - name: diffusion_pusht_s0
-    sku: 1x80G1-H100
+  - name: diffusion_pusht
+    sku: 1x80G1-A100
     process_count_per_node: 1
     sla_tier: Standard
     execution_mode: basic
@@ -58,7 +60,7 @@ jobs:
     command:
       - &setup_cmd "export LD_LIBRARY_PATH=/home/aiscuser/.conda/envs/lerobot/lib:$$LD_LIBRARY_PATH; mkdir -p /scratch/hf_datasets_cache"
       - |
-        OUTPUT_DIR=${BASE_DIR}/PushT/diffusion_pusht_s0_$$AMLT_EXPERIMENT_NAME
+        OUTPUT_DIR=${BASE_DIR}/PushT/$$AMLT_EXPERIMENT_NAME/$$AMLT_JOB_NAME
         CKPT_CFG=$$OUTPUT_DIR/checkpoints/last/pretrained_model/train_config.json
         if [ -f "$$CKPT_CFG" ]; then
           echo "[INFO] Resuming from $$CKPT_CFG"
@@ -79,7 +81,7 @@ jobs:
             --dataset.repo_id=lerobot/pusht \
             --env.type=pusht \
             --output_dir=$$OUTPUT_DIR \
-            --job_name=diffusion_pusht_s0 \
+            --job_name=$$AMLT_JOB_NAME \
             --batch_size=64 \
             --seed=0 \
             --eval.use_async_envs=false \

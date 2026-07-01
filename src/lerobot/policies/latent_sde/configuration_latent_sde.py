@@ -5,7 +5,7 @@
 #
 # PoC scope:
 #   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|h, x_seq, a_seq);
-#     drift/diffusion conditioned on cond = concat([h, z], -1);
+#     drift/diffusion net reads z in its INPUT (net_in = concat([x_aug, z])); FiLM cond is h only;
 #   * free-space Euler-Maruyama log-likelihood (research_brief.md §3.7) + KL[q||p] (β-VAE).
 #
 # Deferred: controller-pushforward objective and (M, K) compliance heads (Tier 3).
@@ -48,7 +48,7 @@ class LatentSDEConfig(PreTrainedConfig):
              deployment **in lock-step with every h refresh** ("episode" =
              one h-refresh window), committing each chunk to one mode. At training,
              posterior q(z|h, x_seq, a_seq) provides chunk-level mode signal; loss = NLL +
-             kl_weight · KL[q||p]. Conditioning is cond = concat([h, z], -1); the
+             kl_weight · KL[q||p]. z enters the drift-net input (FiLM cond is h only); the
              drift/diffusion block structure is unchanged.
 
     `observation.environment_state` (e.g. Push-T's 16-D T-block pose) is currently ignored
@@ -158,15 +158,13 @@ class LatentSDEConfig(PreTrainedConfig):
     #                  "per_episode" → z sampled once per episode (full-trajectory posterior).
     z_sampling_mode: str = "per_chunk"
 
-    # ---- VQ-VAE variant (mutually exclusive with the Gaussian CVAE) ---------------------------
-    # Discrete latent (van den Oord et al. 1711.00937): deterministic posterior + vector
-    # quantizer, categorical prior p(k|h) trained with CE on the posterior's index.
-    # Requires extras `lerobot[latent_sde]`.
+    # ---- FSQ variant (mutually exclusive with the Gaussian CVAE) ------------------------------
+    # Discrete latent via FSQ (finite scalar quantization, Mentzer et al. 2309.15505):
+    # deterministic posterior → bounded scalar grid + straight-through rounding, categorical
+    # prior p(k|h) trained with CE on the posterior's index. Requires extras `lerobot[latent_sde]`.
     use_vq: bool = False
-    vq_codebook_size: int = 8
-    vq_commit_weight: float = 10.0 # matches VectorQuantize default
-    vq_decay: float = 0.8 # matches VectorQuantize default
-    vq_prior_weight: float = 1e-3
+    fsq_levels: tuple[int, ...] = (8, 5, 5)  # per-dim levels; #codes = prod(levels), z_dim = len(levels)
+    fsq_prior_weight: float = 1e-3           # weight on prior-CE p(k|h); FSQ needs no commitment loss
 
     # ---- Optimization --------------------------------------------------------------------------
     compile_model: bool = False
@@ -233,14 +231,13 @@ class LatentSDEConfig(PreTrainedConfig):
         if self.use_vq:
             if not self.use_latent_z:
                 raise ValueError("`use_vq=True` requires `use_latent_z=True`.")
-            if self.vq_codebook_size < 2:
+            self.z_dim = len(self.fsq_levels)  # FSQ latent dim == number of levels
+            if len(self.fsq_levels) < 1 or any(lvl < 2 for lvl in self.fsq_levels):
                 raise ValueError(
-                    f"`vq_codebook_size` must be >= 2. Got {self.vq_codebook_size}."
+                    f"`fsq_levels` must be a non-empty tuple of ints >= 2. Got {self.fsq_levels}."
                 )
-            if not (0.0 < self.vq_decay <= 1.0):
-                raise ValueError(f"`vq_decay` must be in (0, 1]. Got {self.vq_decay}.")
-            if self.vq_commit_weight < 0 or self.vq_prior_weight < 0:
-                raise ValueError("`vq_commit_weight` and `vq_prior_weight` must be non-negative.")
+            if self.fsq_prior_weight < 0:
+                raise ValueError(f"`fsq_prior_weight` must be non-negative. Got {self.fsq_prior_weight}.")
 
         if self.z_sampling_mode not in ("per_chunk", "per_episode"):
             raise ValueError(
