@@ -290,10 +290,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
 
-    # Optional policy hook for dataset-dependent pre-caching (e.g. LatentSDE per-episode z).
-    if hasattr(policy, "set_train_dataset"):
-        policy.set_train_dataset(dataset)
-
     active_cfg = cfg.trainable_config
     processor_pretrained_path = active_cfg.pretrained_path
 

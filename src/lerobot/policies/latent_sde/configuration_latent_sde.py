@@ -15,7 +15,6 @@
 # Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the SDE
 # is integrated one step at a time on the measured state x.
 
-import logging
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
@@ -161,10 +160,6 @@ class LatentSDEConfig(PreTrainedConfig):
     # (at source, so prior/posterior/drift all see it). Inference always uses real h. 0.0 = off.
     h_dropout_prob: float = 0.0
 
-    # z_sampling_mode: "per_chunk" → z resampled with h every n_action_steps (chunk-local posterior).
-    #                  "per_episode" → z sampled once per episode (full-trajectory posterior).
-    z_sampling_mode: str = "per_chunk"
-
     # ---- FSQ variant (mutually exclusive with the Gaussian CVAE) ------------------------------
     # Discrete latent via FSQ (finite scalar quantization, Mentzer et al. 2309.15505):
     # deterministic posterior → bounded scalar grid + straight-through rounding, categorical
@@ -249,16 +244,6 @@ class LatentSDEConfig(PreTrainedConfig):
             if self.fsq_prior_weight < 0:
                 raise ValueError(f"`fsq_prior_weight` must be non-negative. Got {self.fsq_prior_weight}.")
 
-        if self.z_sampling_mode not in ("per_chunk", "per_episode"):
-            raise ValueError(
-                f"`z_sampling_mode` must be 'per_chunk' or 'per_episode'. Got {self.z_sampling_mode}."
-            )
-        if self.z_sampling_mode == "per_episode" and self.conditional_prior:
-            logging.warning(
-                "z_sampling_mode='per_episode' is incompatible with conditional_prior=True "
-                "falling back to conditional_prior=False."
-            )
-            self.conditional_prior = False
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
@@ -321,9 +306,7 @@ class LatentSDEConfig(PreTrainedConfig):
     @property
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
         # State: past n_obs_steps + next H-1 frames, so compute_loss sees the actual demo
-        # state trajectory instead of teacher-forcing from demo actions. per_episode mode
-        # keeps this same narrow window — the full episode trajectory is served via an
-        # in-RAM cache populated by `set_train_dataset()` at training start.
+        # state trajectory instead of teacher-forcing from demo actions.
         return {OBS_STATE: list(range(1 - self.n_obs_steps, self.n_action_steps))}
 
     @property

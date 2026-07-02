@@ -63,10 +63,6 @@ class LatentSDEPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.model.parameters()
 
-    def set_train_dataset(self, dataset) -> None:
-        """Forward to the model (trainer calls this once after dataset construction)."""
-        self.model.set_train_dataset(dataset)
-
     def reset(self):
         """Clear observation queue and the cached image conditioning. Call on `env.reset()`."""
         self._queues = {
@@ -90,8 +86,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """One SDE step per tick with per-tick state-feedback.
 
-        Refresh h every `n_action_steps` ticks. per_chunk re-samples z alongside h;
-        per_episode samples z once per reset() and holds it for the whole rollout.
+        Refresh h every `n_action_steps` ticks and re-sample z alongside it (chunk-local hold).
         """
         if ACTION in batch:
             batch.pop(ACTION)
@@ -101,13 +96,11 @@ class LatentSDEPolicy(PreTrainedPolicy):
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
         self._queues = populate_queues(self._queues, batch)
 
-        # Slow path: re-encode h every n_action_steps ticks. per_chunk re-samples z with h;
-        # per_episode samples once (held until reset() clears _cached_z).
+        # Slow path: re-encode h and re-sample z every n_action_steps ticks.
         if self._cached_h is None or self._steps_until_h_refresh == 0:
             stacked_images = torch.stack(list(self._queues[OBS_IMAGES]), dim=1)
             self._cached_h = self.model.encode_observations({OBS_IMAGES: stacked_images})
-            if not self.model.per_episode_z or self._cached_z is None:
-                self._cached_z = self.model.sample_z_from_prior(self._cached_h)
+            self._cached_z = self.model.sample_z_from_prior(self._cached_h)
             self._steps_until_h_refresh = self.config.n_action_steps
 
         # Fast path: flatten the n_obs_steps state window into x_aug so the drift can read
@@ -167,16 +160,14 @@ class LatentSDEModel(nn.Module):
 
         # use_latent_z=False → no prior/posterior/vq, z_dim=0. Otherwise:
         #   * self.prior     : (use_vq) × (config.conditional_prior)
-        #   * self.posterior : (use_vq) — trajectory encoder; conditions on h in per_chunk only
+        #   * self.posterior : (use_vq) — trajectory encoder; conditions on h iff z_uses_h
         #   * self.vq        : built iff use_vq
         self.use_vq = config.use_vq
-        self.per_episode_z = (config.z_sampling_mode == "per_episode")
         self.state_dim = config.robot_state_feature.shape[0]
         self.action_dim = config.action_feature.shape[0]
 
         # conditional_prior gates the image features h into the *entire* z subsystem: True → the
         # prior is an h-conditioned MLP and the posterior takes h as input; False → both are h-free.
-        # (per_episode forces conditional_prior=False in __post_init__, so z is h-free there.)
         self.z_uses_h = config.use_latent_z and config.conditional_prior
         if not self.use_latent_z:
             self.z_dim = 0
@@ -188,8 +179,8 @@ class LatentSDEModel(nn.Module):
             posterior_hidden = config.z_posterior_hidden_dim or self.h_dim
             prior_hidden = config.z_prior_hidden_dim or self.h_dim
 
-            # TCN posterior depth by mode → RF ≈ 128 (per_episode) / 32 (per_chunk), kernel 3.
-            tcn_levels = 5 if self.per_episode_z else 3
+            # TCN posterior depth: 3 levels → RF ≈ 32 (per_chunk chunk length), kernel 3.
+            tcn_levels = 3
 
             if self.use_vq:
                 # FSQ index space = prod(levels); the categorical prior/CE/perplexity size to this.
@@ -259,65 +250,6 @@ class LatentSDEModel(nn.Module):
 
         if config.compile_model:
             self.net = torch.compile(self.net, mode=config.compile_mode)
-
-        # Per-episode mode pre-caches the normalized state+action trajectory of every episode
-        # in RAM. Populated by `set_train_dataset()` at training start; None otherwise.
-        self._episode_traj_cache: dict[int, Tensor] | None = None
-
-    def set_train_dataset(self, dataset) -> None:
-        """Pre-cache per-episode (state, action) trajectories for the trajectory posterior.
-
-        Full episode, each of state/action MIN_MAX-normalized to [-1, 1] then concatenated on
-        the channel axis (posterior encodes concat([state, action])). Memory is negligible
-        (PushT: ~400 KB).
-        """
-        if not self.per_episode_z:
-            return
-
-        # Posterior encodes concat([state, action]); cache both, each MIN_MAX-normalized to [-1, 1].
-        norms: dict[str, tuple[Tensor, Tensor]] = {}
-        for key in (OBS_STATE, ACTION):
-            s = dataset.meta.stats.get(key)
-            if s is None or "min" not in s or "max" not in s:
-                raise ValueError(f"Per-episode z requires dataset.meta.stats[{key!r}] with 'min'/'max'.")
-            lo = torch.as_tensor(s["min"], dtype=torch.float32).reshape(-1)
-            hi = torch.as_tensor(s["max"], dtype=torch.float32).reshape(-1)
-            norms[key] = (lo, (hi - lo).clamp_min(1e-8))
-
-        # When `cfg.dataset.episodes` subsets the dataset, hf_dataset rows are densified and
-        # absolute episode indices must be remapped through the reader.
-        ep_indices = dataset.episodes if dataset.episodes is not None else range(dataset.meta.total_episodes)
-        abs_to_rel = getattr(getattr(dataset, "reader", None), "_absolute_to_relative_idx", None)
-
-        cache: dict[int, Tensor] = {}
-        for ep_idx in ep_indices:
-            ep = dataset.meta.episodes[ep_idx]
-            abs_rows = list(range(int(ep["dataset_from_index"]), int(ep["dataset_to_index"])))
-            rows = abs_rows if abs_to_rel is None else [abs_to_rel[i] for i in abs_rows]
-            cols = []
-            for key in (OBS_STATE, ACTION):
-                v = torch.stack(dataset.hf_dataset[rows][key]).to(torch.float32)
-                lo, span = norms[key]
-                cols.append(2 * (v - lo) / span - 1)
-            cache[ep_idx] = torch.cat(cols, dim=-1).contiguous()  # (T_ep, state_dim + action_dim)
-        self._episode_traj_cache = cache
-
-    def _get_episode_trajs(self, batch: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
-        """Look up cached trajectories for `batch["episode_index"]`; return left-aligned
-        `padded` (B, T_max, D) and `valid_mask` (True at in-episode frames)."""
-        if self._episode_traj_cache is None:
-            raise RuntimeError(
-                "Per-episode z mode requires set_train_dataset(dataset) before training."
-            )
-        if "episode_index" not in batch:
-            raise KeyError("Per-episode z mode requires 'episode_index' in the batch.")
-        ep_indices = batch["episode_index"]
-        device = ep_indices.device
-        trajs = [self._episode_traj_cache[int(i)] for i in ep_indices.reshape(-1).tolist()]
-        lengths = torch.tensor([t.shape[0] for t in trajs], dtype=torch.long, device=device)
-        padded = nn.utils.rnn.pad_sequence(trajs, batch_first=True).to(device)
-        valid_mask = torch.arange(padded.shape[1], device=device)[None, :] < lengths[:, None]
-        return padded, valid_mask
 
     def encode_observations(self, batch: dict[str, Tensor]) -> Tensor:
         """Compute h, the image-only global conditioning vector.
@@ -504,22 +436,12 @@ class LatentSDEModel(nn.Module):
             h = torch.where(h_drop_mask, self.null_h.to(h.dtype), h)
 
         if self.use_latent_z:
-            if self.per_episode_z:
-                # Posterior over the full-episode (state, action) traj. Noise the states to match the
-                # noised drift input (consistency); independent draw, time-aligned actions kept.
-                traj, valid_mask = self._get_episode_trajs(batch)
-                if noise:
-                    s = traj[..., : self.state_dim] + std * torch.randn_like(traj[..., : self.state_dim])
-                    traj = torch.cat([s, traj[..., self.state_dim :]], dim=-1)
-                ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
-                posterior_args = (traj, valid_mask)
-            else:
-                # Posterior over the chunk: noised state + time-aligned (original) action — the same
-                # (state, action) pairs the drift target uses.
-                traj = torch.cat([x_seq, action_target], dim=-1)
-                valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
-                # pass h to the posterior only when z_uses_h.
-                posterior_args = (traj, valid_mask, h) if self.z_uses_h else (traj, valid_mask)
+            # Posterior over the chunk: noised state + time-aligned (original) action — the same
+            # (state, action) pairs the drift target uses.
+            traj = torch.cat([x_seq, action_target], dim=-1)
+            valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
+            # pass h to the posterior only when z_uses_h.
+            posterior_args = (traj, valid_mask, h) if self.z_uses_h else (traj, valid_mask)
 
             if self.use_vq:
                 # 2-stage VQ-VAE spirit: prior is a pure observer of h — don't let its CE shape the encoder.
@@ -573,11 +495,8 @@ class LatentSDEModel(nn.Module):
                     mu_q, sigma_q, mu_p, sigma_p, self.config.kl_min
                 )  # (B,)
                 kl_loss = kl_per_sample.mean()
-                # Merged KL weight: ELBO-exact β/(H·D·dt) (so kl_weight = 2·σ_eff²) × H/T_ep
-                # per-trajectory factor when per_episode (scalar 1 otherwise). Applied per-sample.
+                # Merged KL weight: ELBO-exact β/(H·D·dt), so kl_weight = 2·σ_eff². Applied per-sample.
                 kl_loss_weight = self.config.kl_weight / (H * action_dim * dt)
-                if self.per_episode_z:
-                    kl_loss_weight = kl_loss_weight * (float(H) / ep_lengths)
                 other_loss = (kl_loss_weight * kl_per_sample).mean()
             loss = recon_loss + other_loss
         else:
@@ -606,8 +525,6 @@ class LatentSDEModel(nn.Module):
                 mu_rolled = self.net(torch.cat([flat_x_aug, flat_z_rolled], dim=-1), flat_h, flat_step)
                 recon_loss_rolled = ((mu_rolled.reshape(B, H, action_dim) - target_velocity) ** 2).mean()
                 loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
-                if self.per_episode_z:
-                    loss_dict["ep_length_mean"] = ep_lengths.detach().mean().item()
                 if self.use_vq:
                     loss_dict["vq_prior_ce_loss"] = vq_prior_ce_loss.detach().item()
                     # Posterior code usage over the FSQ index space (num_codes = prod(levels)).
@@ -741,7 +658,7 @@ class LatentPriorVQ(nn.Module):
         return self.head(self.trunk(h))
 
 
-# Trajectory-encoder posterior (per_chunk + per_episode): a dilated TCN (Bai et al. 2018) over
+# Trajectory-encoder posterior (per_chunk): a dilated TCN (Bai et al. 2018) over
 # concat([state, action]) — 1×1 lift + kernel-3 dilated residual blocks + masked mean-pool. Pads
 # are zeroed before every conv and GroupNorm is masked, so eval outputs are bit-equivalent to
 # exact-length (no cross-pad leak). RF = 1 + 4·(2^num_levels − 1).
@@ -786,7 +703,7 @@ class _TrajEncoder(nn.Module):
 class LatentPosteriorTraj(nn.Module):
     """q(z | x_{0:T}, a_{0:T}, [h]) — (state, action)-traj encoder pooled feats (concat h iff h_dim>0) → (μ, σ).
 
-    per_chunk concats the chunk h (h_dim>0); per_episode builds with h_dim=0 → trajectory-only.
+    Concats the chunk h when h_dim>0 (z_uses_h); h_dim=0 → trajectory-only.
     """
 
     def __init__(
