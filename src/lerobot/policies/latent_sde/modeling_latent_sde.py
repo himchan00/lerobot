@@ -17,7 +17,7 @@ from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-from ..diffusion.modeling_diffusion import DiffusionRgbEncoder
+from ..diffusion.modeling_diffusion import DiffusionRgbEncoder, DiffusionSinusoidalPosEmb
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
 from .configuration_latent_sde import LatentSDEConfig
@@ -114,7 +114,9 @@ class LatentSDEPolicy(PreTrainedPolicy):
         # local first-differences ≈ velocity (mirrors DP's state branch in the global cond).
         stacked_state = torch.stack(list(self._queues[OBS_STATE]), dim=1)  # (B, n_obs, D)
         x_aug = stacked_state.reshape(stacked_state.shape[0], -1)           # (B, n_obs * D)
-        action = self.model.step(x_aug, self._cached_h, self._cached_z, noise=noise)
+        # Ticks since the last h refresh (0 = refresh tick .. n_action_steps-1); the drift's PE index.
+        step_idx = self.config.n_action_steps - self._steps_until_h_refresh
+        action = self.model.step(x_aug, self._cached_h, self._cached_z, noise=noise, step_idx=step_idx)
         self._steps_until_h_refresh -= 1
         return action
 
@@ -247,6 +249,8 @@ class LatentSDEModel(nn.Module):
             down_dims=config.down_dims,
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
+            use_pe=config.use_pe,
+            pe_dim=config.pe_dim,
         )
 
         # Learnable null embedding for h conditioning-dropout (created unconditionally so the
@@ -407,6 +411,7 @@ class LatentSDEModel(nn.Module):
         z: Tensor | None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
+        step_idx: int = 0,
     ) -> Tensor:
         """One Euler-Maruyama step from pre-computed h (and optional z).
 
@@ -417,9 +422,15 @@ class LatentSDEModel(nn.Module):
             noise: (B, action_dim) optional pre-sampled Brownian increment. Mirrors
                    `DiffusionModel.conditional_sample(noise=...)`: when given, replaces the
                    internal `randn`; ignored when `deterministic_inference` is True.
+            step_idx: ticks since the current h refresh (0..n_action_steps-1); the PE index when use_pe.
         """
         net_input = torch.cat([x_aug, z], dim=-1) if self.use_latent_z else x_aug
-        mu = self.net(net_input, h)
+        step = (
+            torch.full((x_aug.shape[0],), float(step_idx), dtype=x_aug.dtype, device=x_aug.device)
+            if self.config.use_pe
+            else None
+        )
+        mu = self.net(net_input, h, step)
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         x_now = x_aug[..., -self.state_dim:]
         return self._sde_step(
@@ -476,16 +487,10 @@ class LatentSDEModel(nn.Module):
         noise = self.training and self.config.state_noise_std > 0
         std = self.config.state_noise_std * dt**0.5
 
-        # Drift target (train-only state-noise): noise the chunk window and relabel each noised anchor to
-        # the action of its nearest CLEAN chunk anchor (corrective funnel). The posterior also sees the
-        # noised state (below) for consistency with the drift input.
-        x_seq_clean = state_full[:, n_obs - 1 :]  # (B, H, state_dim) clean anchors
-        if noise:
-            state_win = state_full + std * torch.randn_like(state_full)
-            d2 = ((state_win[:, n_obs - 1 :].unsqueeze(2) - x_seq_clean.unsqueeze(1)) ** 2).sum(-1)  # (B,H,H)
-            action_endpoint = torch.gather(action_target, 1, d2.argmin(2).unsqueeze(-1).expand(-1, -1, action_dim))
-        else:
-            state_win, action_endpoint = state_full, action_target
+        # Drift input (train-only state-noise): perturb the whole state window by std·√dt per frame.
+        # The drift target keeps the time-aligned (original) action — the noised anchor is regressed
+        # toward action_target (corrective drift). The posterior sees the same noised state (below).
+        state_win = state_full + std * torch.randn_like(state_full) if noise else state_full
 
         x_seq = state_win[:, n_obs - 1 :]  # (B, H, state_dim) — possibly noised anchor (drift input)
         x_seq_aug = state_win.unfold(1, n_obs, 1).permute(0, 1, 3, 2).reshape(B, H, n_obs * self.state_dim)
@@ -509,9 +514,9 @@ class LatentSDEModel(nn.Module):
                 ep_lengths = valid_mask.sum(dim=1).to(torch.float32).clamp_min(float(H))
                 posterior_args = (traj, valid_mask)
             else:
-                # Posterior over the chunk: noised state + its relabeled action — the same (state, action)
-                # pairs the drift target uses.
-                traj = torch.cat([x_seq, action_endpoint], dim=-1)
+                # Posterior over the chunk: noised state + time-aligned (original) action — the same
+                # (state, action) pairs the drift target uses.
+                traj = torch.cat([x_seq, action_target], dim=-1)
                 valid_mask = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
                 # pass h to the posterior only when z_uses_h.
                 posterior_args = (traj, valid_mask, h) if self.z_uses_h else (traj, valid_mask)
@@ -538,18 +543,24 @@ class LatentSDEModel(nn.Module):
 
         flat_x_aug = x_seq_aug.reshape(B * H, -1)
         flat_h = h.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
+        # Per-tick step-distance k=0..H-1 (row b*H+k ↦ k, matching the flatten above); None if use_pe off.
+        flat_step = (
+            torch.arange(H, dtype=h.dtype, device=h.device).unsqueeze(0).expand(B, H).reshape(B * H)
+            if self.config.use_pe
+            else None
+        )
         if self.use_latent_z:
             flat_z = z_q.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
             flat_net_input = torch.cat([flat_x_aug, flat_z], dim=-1)
         else:
             flat_net_input = flat_x_aug
 
-        mu_flat = self.net(flat_net_input, flat_h)
+        mu_flat = self.net(flat_net_input, flat_h, flat_step)
         mu = mu_flat.reshape(B, H, action_dim)
 
-        # Corrective target: drift from the (noised) anchor toward action_endpoint — the nearest-
-        # original relabel under state-noise, else the time-aligned action.
-        target_velocity = (action_endpoint - x_seq) / dt
+        # Corrective target: drift from the (noised) anchor toward the time-aligned (original) action —
+        # equals (action_target − clean anchor)/dt when state_noise_std==0.
+        target_velocity = (action_target - x_seq) / dt
         # Chunks are padding-free via drop_n_last_frames, so a plain mean over batch is correct.
         recon_loss = ((mu - target_velocity) ** 2).mean()
 
@@ -592,7 +603,7 @@ class LatentSDEModel(nn.Module):
                 flat_z_rolled = (
                     torch.roll(z_q, shifts=1, dims=0).unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
                 )
-                mu_rolled = self.net(torch.cat([flat_x_aug, flat_z_rolled], dim=-1), flat_h)
+                mu_rolled = self.net(torch.cat([flat_x_aug, flat_z_rolled], dim=-1), flat_h, flat_step)
                 recon_loss_rolled = ((mu_rolled.reshape(B, H, action_dim) - target_velocity) ** 2).mean()
                 loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
                 if self.per_episode_z:
@@ -902,6 +913,7 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         x:    (B, input_dim)     — concat([augmented state (n_obs_steps frames flattened), z]);
                                    the net reads local first-differences ≈ velocity.
         cond: (B, cond_dim)      — global conditioning h (FiLM).
+        step: (B,) | None        — step-distance from h; sinusoidally embedded onto the cond when use_pe.
     Output:
         mu:   (B, action_dim) — SDE drift. Action σ is not learned; inference noise uses
                                 √(kl_weight/2) from the config.
@@ -918,9 +930,23 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         down_dims: tuple[int, ...] = (512, 1024, 2048),
         n_groups: int = 8,
         use_film_scale_modulation: bool = True,
+        use_pe: bool = False,
+        pe_dim: int = 64,
     ):
         super().__init__()
         assert len(down_dims) >= 1, "`down_dims` must contain at least one width."
+
+        # Step-distance encoder (DP's diffusion_step_encoder): sinusoidal embed → MLP, concatenated
+        # onto the FiLM cond. Widens cond_dim by pe_dim.
+        self.use_pe = use_pe
+        if use_pe:
+            self.step_encoder = nn.Sequential(
+                DiffusionSinusoidalPosEmb(pe_dim),
+                nn.Linear(pe_dim, pe_dim * 4),
+                nn.Mish(),
+                nn.Linear(pe_dim * 4, pe_dim),
+            )
+            cond_dim = cond_dim + pe_dim
 
         widths = [input_dim, *down_dims, down_dims[-1], *reversed(down_dims[:-1])]
         self.blocks = nn.ModuleList(
@@ -940,7 +966,9 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         self.final_act = nn.Mish()
         self.mu_head = nn.Linear(widths[-1], action_dim)
 
-    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cond: Tensor, step: Tensor | None = None) -> Tensor:
+        if self.use_pe:
+            cond = torch.cat([self.step_encoder(step), cond], dim=-1)  # cat([step_embed, h]), as in DP
         feat = x
         for block in self.blocks:
             feat = block(feat, cond)

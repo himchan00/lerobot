@@ -117,6 +117,13 @@ class LatentSDEConfig(PreTrainedConfig):
     n_groups: int = 8
     use_film_scale_modulation: bool = True
 
+    # ---- Step-distance positional embedding ---------------------------------------------------
+    # use_pe: embed each state's step-distance k (0..H-1) from its image-embedding timestep
+    #   (DiffusionPolicy's DiffusionSinusoidalPosEmb) and concat it onto the FiLM cond alongside h.
+    # pe_dim: width of that embedding; must be even and >= 4.
+    use_pe: bool = False
+    pe_dim: int = 64
+
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
@@ -215,6 +222,9 @@ class LatentSDEConfig(PreTrainedConfig):
             raise ValueError(f"`state_noise_std` must be non-negative. Got {self.state_noise_std}.")
         if not (0.0 <= self.h_dropout_prob <= 1.0):
             raise ValueError(f"`h_dropout_prob` must be in [0, 1]. Got {self.h_dropout_prob}.")
+
+        if self.use_pe and (self.pe_dim < 4 or self.pe_dim % 2 != 0):
+            raise ValueError(f"`pe_dim` must be an even int >= 4 when `use_pe=True`. Got {self.pe_dim}.")
 
         if self.z_dim <= 0:
             raise ValueError(f"`z_dim` must be positive. Got {self.z_dim}.")

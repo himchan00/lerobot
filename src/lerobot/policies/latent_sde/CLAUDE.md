@@ -45,8 +45,8 @@ action's one-step velocity, regularized by `KL[q‖p]` on a per-episode latent s
 
 **Posterior `q(z | (x,a)_{0:T}, [h])`** (training only). Encodes the **(state, action)
 trajectory** concatenated on the channel axis — `_TrajEncoder` input channels = `state_dim + action_dim`.
-- `per_chunk`: trajectory = `cat([x_seq, action_endpoint])` `(B, H, state_dim + action_dim)`, all-True mask; pooled feats concat the chunk `h` iff `conditional_prior=True` (else h-free). Both channels match the drift target's pairs: `x_seq` is the **noised** chunk anchor and `action_endpoint` its **nearest-clean relabel** (`= action_target` when `state_noise_std==0`).
-- `per_episode`: trajectory = **full-episode** (state, action) traj from a RAM cache (left-aligned, padded + `valid_mask`); h-free (posterior built with `h_dim=0`). Under `state_noise_std>0` the **state channels are noised** (independent draw, same std as the chunk) for consistency with the drift; actions stay **time-aligned** (no episode-level relabel — kept simple).
+- `per_chunk`: trajectory = `cat([x_seq, action_target])` `(B, H, state_dim + action_dim)`, all-True mask; pooled feats concat the chunk `h` iff `conditional_prior=True` (else h-free). Both channels match the drift target's pairs: `x_seq` is the **noised** chunk anchor and `action_target` its **time-aligned** action.
+- `per_episode`: trajectory = **full-episode** (state, action) traj from a RAM cache (left-aligned, padded + `valid_mask`); h-free (posterior built with `h_dim=0`). Under `state_noise_std>0` the **state channels are noised** (independent draw, same std as the chunk) for consistency with the drift; actions stay **time-aligned**.
 
 **Sampling.** Gaussian: reparam `z = μ_q + σ_q·ε`. FSQ (Mentzer 2309.15505; `use_vq=True`):
 deterministic `z_e` → bounded scalar grid + straight-through rounding → `z_q` (no learnable
@@ -69,16 +69,15 @@ loss  = recon + KL   (or recon + prior-CE; FSQ has no commit loss)
 - `kl_weight = 2·σ_eff²` exactly, where `σ_eff = √(kl_weight/2)` is the SDE diffusion coeff (also the inference noise scale). So tuning `kl_weight` sets both the KL strength and the rollout stochasticity.
 - `per_episode` adds a per-sample `×H/T_ep` factor (per-trajectory ELBO).
 - `kl_min` = per-dim free bits (clamp each dim's KL ≥ `kl_min` before summing) to fight posterior collapse.
-- **`action_is_pad` masking** (for `horizon > n_action_steps`, when the chunk tail overflows the episode end): `action_is_pad` (B, H; only the trailing overflow, since the action window starts at the anchor) is masked out of the **recon**, the **per_chunk posterior** (TCN `valid_mask`), and the **state-noise relabel** (padded anchors excluded as candidates). Recon divides by the **nominal** H·D (`.mean()`, padded→0), *not* the valid count — so each real step keeps weight 1/(H·D), matching the KL's 1/(H·D·dt). Boundary chunks thus contribute proportionally less recon; non-overflowing chunks → all-True mask → legacy plain mean.
+- **`action_is_pad` masking** (for `horizon > n_action_steps`, when the chunk tail overflows the episode end): `action_is_pad` (B, H; only the trailing overflow, since the action window starts at the anchor) is masked out of the **recon** and the **per_chunk posterior** (TCN `valid_mask`). Recon divides by the **nominal** H·D (`.mean()`, padded→0), *not* the valid count — so each real step keeps weight 1/(H·D), matching the KL's 1/(H·D·dt). Boundary chunks thus contribute proportionally less recon; non-overflowing chunks → all-True mask → legacy plain mean.
 
 
 
 `x_seq` (measured state, no teacher-forcing) drives the recon target and the drift input; the
 posterior encodes `concat([state, action])`, with the **state noised to match the drift input**
-when `state_noise_std>0`. per_chunk also pairs it with the drift's relabeled `action_endpoint`;
-per_episode keeps time-aligned actions (kept simple).
+when `state_noise_std>0`. Both per_chunk and per_episode keep **time-aligned actions**.
 
-- **Train-only augmentations (default off).** `state_noise_std>0` perturbs the chunk's measured-state window by `std·√dt` per frame (giving the noised drift input `x_seq`/`x_seq_aug`) and sets the drift recon target by **nearest-original relabeling** — each noised anchor is regressed toward the action of its nearest *clean* in-chunk anchor (`argmin_s‖x_s − x̃_t‖`), a funnel target rather than the time-aligned action → corrective drift (off-manifold stability). The **posterior also sees the noised state** (per_chunk: the same `x_seq`; per_episode: episode states noised by an independent draw of the same std) for consistency with the drift input. Its action: per_chunk uses the drift's relabeled `action_endpoint` (same pairs as the recon target); per_episode keeps the time-aligned action (no episode-level relabel — kept simple). `h_dropout_prob>0` replaces `h` with the learnable `null_h` per sample at source (prior/posterior/drift all see it). Both gate on `self.training`; inference and validation are unaffected.
+- **Train-only augmentations (default off).** `state_noise_std>0` perturbs the chunk's measured-state window by `std·√dt` per frame (giving the noised drift input `x_seq`/`x_seq_aug`); the drift recon target keeps the **time-aligned (original) action** — each noised anchor is regressed toward `action_target` (`= (action − noised anchor)/dt`), a corrective drift toward the demo action (off-manifold stability). The **posterior also sees the noised state** (per_chunk: the same `x_seq`; per_episode: episode states noised by an independent draw of the same std) for consistency with the drift input; its action stays time-aligned in both modes. `h_dropout_prob>0` replaces `h` with the learnable `null_h` per sample at source (prior/posterior/drift all see it). Both gate on `self.training`; inference and validation are unaffected.
 
 ## Invariants & gotchas
 
