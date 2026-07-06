@@ -1,9 +1,10 @@
 description: >
-  Push-T benchmark + Latent-SDE policy sweep on Singularity.
-  4-run grid over z_dim ∈ {2, 4} × kl_weight ∈ {1e-2, 1e-3} + 1 vanilla baseline
-  (use_latent_z=false); default config otherwise.
+  Push-T benchmark + FSQ-Latent-ODE policy sweep on Singularity.
+  3-run sweep over fsq_levels ∈ {[8,5], [8,5,5], [8,5,5,5]}
+  (#codes = prod(levels) ∈ {40, 200, 1000}), per_chunk z sampling, use_vq=true.
+  FSQ has no commitment loss; only the prior-CE (fsq_prior_weight, default 1e-3) is trained.
   Preemption-safe via lerobot-train --resume + persistent output_dir on /mnt storage.
-  Job 1 registers &common_env / &common_command; jobs 2-5 only override EXTRA_CONFIGS.
+  Job 1 registers &common_env / &common_command; other jobs only override EXTRA_CONFIGS.
 
 target:
   service: sing
@@ -28,14 +29,17 @@ environment:
     - conda run --name lerobot conda install -y -c conda-forge libstdcxx-ng
     # CUDA torch matched to the cu126 base image; lerobot pyproject allows torch>=2.7,<2.12
     - conda run --name lerobot pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu126
-    # Editable install of the lerobot repo with extras needed for Push-T + Latent-SDE
-    - conda run --name lerobot pip install -e '.[pusht,diffusion,training,latent_sde]'
+    # Editable install of the lerobot repo with extras needed for Push-T + Latent-ODE
+    - conda run --name lerobot pip install -e '.[pusht,diffusion,training,latent_ode]'
     # FIPS-incompatibility workaround (msrresrchbasicvc H100 cluster enforces FIPS).
     # The pip wheel of `av` (PyAV) bundles its own FIPS-incompatible OpenSSL that
     # aborts python at import time. Replace with conda-forge's build (links against
     # conda's OpenSSL 3.x). Mirrors CompVLA/amlt/submit_compvla_speed.yaml.
     - conda run --name lerobot pip uninstall -y av || true
-    - conda run --name lerobot conda install -y -c conda-forge "av>=15,<16"
+    # Install av + ffmpeg from conda-forge, PINNING libjxl to the soname the ffmpeg build links
+    # (libjxl.so.0.11). Unpinned, conda pulls the newest libjxl (0.12 → .so.0.12) while ffmpeg is
+    # built against 0.11 → `import av` fails with "libjxl.so.0.11: cannot open shared object file".
+    - conda run --name lerobot conda install -y --override-channels -c conda-forge "av>=15,<16" ffmpeg "libjxl=0.11"
     # Fail the build early if av lacks the top-level `av.option` lerobot needs (PyAV >= 15).
     - conda run --name lerobot python -c "import av, av.option; print(av.__version__)"
 
@@ -43,8 +47,8 @@ code:
   local_dir: $CONFIG_DIR/..
 
 jobs:
-  # ----- Job 1: registers &common_env and &common_command (z_dim=1, kl_weight=1e-1, per_chunk) -----
-  - name: latent_sde_z1_kl1e-1_per_chunk
+  # ----- Job 1: registers &common_env and &common_command (fsq_levels=[8,5]) -----
+  - name: fsq_latent_ode_8_5
     sku: 1x80G1-A100
     process_count_per_node: 1
     sla_tier: Standard
@@ -62,7 +66,7 @@ jobs:
         # ----- ephemeral on local SSD (only datasets-lib builder staging) -----
         HF_DATASETS_CACHE: /scratch/hf_datasets_cache
         # ----- per-run sweep overrides: jobs below override ONLY this line -----
-        EXTRA_CONFIGS: "--policy.z_dim=1 --policy.kl_weight=1e-1 --policy.z_sampling_mode=per_chunk"
+        EXTRA_CONFIGS: "--policy.use_vq=true --policy.fsq_levels=[8,5]"
     command: &common_command
       - "export LD_LIBRARY_PATH=/home/aiscuser/.conda/envs/lerobot/lib:$$LD_LIBRARY_PATH; mkdir -p /scratch/hf_datasets_cache"
       - |
@@ -84,7 +88,7 @@ jobs:
         fi
         conda run --no-capture-output --name lerobot \
           python -m lerobot.scripts.lerobot_train \
-            --policy.type=latent_sde \
+            --policy.type=latent_ode \
             --policy.push_to_hub=false \
             --dataset.repo_id=lerobot/pusht \
             --env.type=pusht \
@@ -98,9 +102,8 @@ jobs:
             $$EXTRA_CONFIGS \
             $$RESUME_FLAGS
 
-  # ----- Jobs 2-12: reuse &common_env / &common_command, override only EXTRA_CONFIGS -----
-  # NOTE: z_sampling_mode=per_episode auto-forces conditional_prior=false.
-  - name: latent_sde_z1_kl1e-2_per_chunk
+  # ----- Jobs 2-3: reuse &common_env / &common_command, override only EXTRA_CONFIGS -----
+  - name: fsq_latent_ode_8_5_5
     sku: 1x80G1-A100
     process_count_per_node: 1
     sla_tier: Standard
@@ -108,10 +111,10 @@ jobs:
     submit_args:
       env:
         <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=1 --policy.kl_weight=1e-2 --policy.z_sampling_mode=per_chunk"
+        EXTRA_CONFIGS: "--policy.use_vq=true --policy.fsq_levels=[8,5,5]"
     command: *common_command
 
-  - name: latent_sde_z1_kl1e-3_per_chunk
+  - name: fsq_latent_ode_8_5_5_5
     sku: 1x80G1-A100
     process_count_per_node: 1
     sla_tier: Standard
@@ -119,104 +122,5 @@ jobs:
     submit_args:
       env:
         <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=1 --policy.kl_weight=1e-3 --policy.z_sampling_mode=per_chunk"
-    command: *common_command
-
-  - name: latent_sde_z2_kl1e-1_per_chunk
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-1 --policy.z_sampling_mode=per_chunk"
-    command: *common_command
-
-  - name: latent_sde_z2_kl1e-2_per_chunk
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-2 --policy.z_sampling_mode=per_chunk"
-    command: *common_command
-
-  - name: latent_sde_z2_kl1e-3_per_chunk
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-3 --policy.z_sampling_mode=per_chunk"
-    command: *common_command
-
-  - name: latent_sde_z1_kl1e-1_per_episode
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=1 --policy.kl_weight=1e-1 --policy.z_sampling_mode=per_episode"
-    command: *common_command
-
-  - name: latent_sde_z1_kl1e-2_per_episode
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=1 --policy.kl_weight=1e-2 --policy.z_sampling_mode=per_episode"
-    command: *common_command
-
-  - name: latent_sde_z1_kl1e-3_per_episode
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=1 --policy.kl_weight=1e-3 --policy.z_sampling_mode=per_episode"
-    command: *common_command
-
-  - name: latent_sde_z2_kl1e-1_per_episode
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-1 --policy.z_sampling_mode=per_episode"
-    command: *common_command
-
-  - name: latent_sde_z2_kl1e-2_per_episode
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-2 --policy.z_sampling_mode=per_episode"
-    command: *common_command
-
-  - name: latent_sde_z2_kl1e-3_per_episode
-    sku: 1x80G1-A100
-    process_count_per_node: 1
-    sla_tier: Standard
-    execution_mode: basic
-    submit_args:
-      env:
-        <<: *common_env
-        EXTRA_CONFIGS: "--policy.z_dim=2 --policy.kl_weight=1e-3 --policy.z_sampling_mode=per_episode"
+        EXTRA_CONFIGS: "--policy.use_vq=true --policy.fsq_levels=[8,5,5,5]"
     command: *common_command

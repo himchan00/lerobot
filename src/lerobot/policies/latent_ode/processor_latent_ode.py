@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 #
-# Pre/post processors for LatentSDEPolicy — mirrors `processor_diffusion.py`. Same
+# Pre/post processors for LatentODEPolicy — mirrors `processor_diffusion.py`. Same
 # input/output features (normalized state + image, normalized action) so the pipeline
-# is identical to DP's. Kept as its own factory function so that future LatentSDE-
+# is identical to DP's. Kept as its own factory function so that future LatentODE-
 # specific steps (e.g. wrench input scaling for the §4 controller-pushforward objective)
 # have an obvious home.
 
@@ -23,17 +23,17 @@ from lerobot.processor import (
 )
 from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
-from .configuration_latent_sde import LatentSDEConfig
+from .configuration_latent_ode import LatentODEConfig
 
 
-def make_latent_sde_pre_post_processors(
-    config: LatentSDEConfig,
+def make_latent_ode_pre_post_processors(
+    config: LatentODEConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
-    """Build pre- and post-processor pipelines for the latent-SDE policy.
+    """Build pre- and post-processor pipelines for the latent-ODE policy.
 
     Pre: rename obs (no-op) → add batch dim → move to device → normalize state/image/action.
     Post: unnormalize action → move to CPU.

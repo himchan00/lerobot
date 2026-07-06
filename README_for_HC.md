@@ -7,7 +7,7 @@ LeRobot 레포에서 Push-T 벤치마크 + Diffusion Policy 학습용 셋업 기
 레포 루트(`/home/v-hihwang/lerobot`)에서:
 
 ```bash
-pip install -e '.[pusht,diffusion,training]'
+pip install -e '.[pusht,diffusion,latent_ode,training]'
 ```
 
 각 extra가 가져오는 핵심 패키지:
@@ -16,13 +16,15 @@ pip install -e '.[pusht,diffusion,training]'
 |---|---|---|
 | `pusht` | `gym-pusht`, `pymunk` | Push-T 시뮬레이션 환경 |
 | `diffusion` | `diffusers` | Diffusion Policy의 noise scheduler / UNet 빌딩 블록 |
+| `latent_ode` | `vector-quantize-pytorch` | Latent SDE Policy의 VQ 코드북 (`use_vq=True`일 때 필요) |
 | `training` | `accelerate`, `wandb` | 학습 루프 |
 
+> `latent_ode` extra를 빠뜨리면 `use_vq=True`인 `latent_ode` 정책 학습 시 `ModuleNotFoundError: No module named 'vector_quantize_pytorch'`가 발생함. (Diffusion Policy만 돌릴 거면 생략 가능.)
 
 설치 확인:
 
 ```bash
-python -c "import gym_pusht, pymunk, diffusers, accelerate, wandb; print('ok')"
+python -c "import gym_pusht, pymunk, diffusers, vector_quantize_pytorch, accelerate, wandb; print('ok')"
 ```
 
 ## 2. 학습 커맨드 (Push-T + Diffusion Policy)

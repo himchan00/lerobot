@@ -1,18 +1,19 @@
 #!/usr/bin/env python
 #
-# LatentSDE Policy — configuration for
-# "Latent-SDE Policies for Hierarchical Robot Manipulation" (research_brief.md v7).
+# LatentODE Policy — configuration for
+# "Latent-ODE Policies for Hierarchical Robot Manipulation" (research_brief.md v7).
 #
 # PoC scope:
 #   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|h, x_seq, a_seq);
-#     drift/diffusion net reads z in its INPUT (net_in = concat([x_aug, z])); FiLM cond is h only;
-#   * free-space Euler-Maruyama log-likelihood (research_brief.md §3.7) + KL[q||p] (β-VAE).
+#     drift net reads z as FiLM cond alongside h (cond = concat([h, z])); net input is x_aug only;
+#   * free-running-rollout reconstruction (drift integrated through the env's exact agent dynamics,
+#     matched to the demo state path) + KL[q||p] (β-VAE). Inference is deterministic (drift-only).
 #
 # Deferred: controller-pushforward objective and (M, K) compliance heads (Tier 3).
 #
 # Fairness vs. DiffusionPolicy on Push-T: same vision backbone (DiffusionRgbEncoder),
 # same FiLM-with-scale conditioning, same GroupNorm n_groups, same down_dims width ladder.
-# Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the SDE
+# Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the ODE
 # is integrated one step at a time on the measured state x.
 
 from dataclasses import dataclass, field
@@ -22,19 +23,19 @@ from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
 from lerobot.utils.constants import OBS_STATE
 
 
-@PreTrainedConfig.register_subclass("latent_sde")
+@PreTrainedConfig.register_subclass("latent_ode")
 @dataclass
-class LatentSDEConfig(PreTrainedConfig):
-    """Configuration class for LatentSDEPolicy.
+class LatentODEConfig(PreTrainedConfig):
+    """Configuration class for LatentODEPolicy.
 
     Defaults are tuned for Push-T (proprio + single camera) and mirror DiffusionPolicy
     so this PoC is a like-for-like replacement of the denoising U-Net.
 
-    SDE roles (research_brief.md §1.2, §3):
+    ODE roles (research_brief.md §1.2, §3):
         x  — measured robot state (proprio). Push-T: 2-D `observation.state` (agent_pos).
-             The drift/diffusion net reads **all n_obs_steps frames flattened** (augmented
+             The drift net reads **all n_obs_steps frames flattened** (augmented
              input, mirrors DP's state branch) so it has access to first-differences ≈
-             velocity; the Euler-Maruyama residual is still anchored to the most recent
+             velocity; the drift residual is still anchored to the most recent
              frame (`mean = s_t + μ·dt`). Fed at every Tier-2 tick. At training time the
              chunk's x_seq is sampled directly from the dataset (see
              `observation_delta_indices_per_key`), matching the deployment-time stream.
@@ -46,21 +47,22 @@ class LatentSDEConfig(PreTrainedConfig):
         z  — per-episode latent strategy. CVAE-style: prior p(z|h) is re-sampled at
              deployment **in lock-step with every h refresh** ("episode" =
              one h-refresh window), committing each chunk to one mode. At training,
-             posterior q(z|h, x_seq, a_seq) provides chunk-level mode signal; loss = NLL +
-             kl_weight · KL[q||p]. z enters the drift-net input (FiLM cond is h only); the
-             drift/diffusion block structure is unchanged.
+             posterior q(z|h, x_seq, a_seq) provides chunk-level mode signal; loss =
+             rollout-recon + kl_weight · KL[q||p]. z enters the drift-net input (FiLM cond
+             is h only); the drift block structure is unchanged.
 
     `observation.environment_state` (e.g. Push-T's 16-D T-block pose) is currently ignored
     to keep the h-is-image-only contract clean. Add a concat-into-x or concat-into-h route
     if the experiment warrants it.
 
-    Drift/diffusion network output:
-        mu — SDE drift only, shape (B, action_dim). Action σ is NOT learned.
-        SDE step (inference): x_d = x + mu·dt + σ_eff·√dt·ε, with σ_eff = √(kl_weight/2)
-        the SDE diffusion coefficient. Training loss: recon = mean‖μ − v*‖² +
-        (kl_weight/(H·action_dim·dt)) · KL[q‖p] (β-VAE form) where v* = (a − x)/dt is the
-        empirical one-step velocity; the /(H·action_dim·dt) KL scaling is ELBO-exact under
-        the SDE decoder Δx ~ N(μ·dt, σ²·dt), so kl_weight = 2·σ_eff² holds exactly.
+    Drift network output:
+        mu — drift only, shape (B, action_dim). Action σ is NOT learned; inference is always
+        deterministic (x_d = x + mu·dt, no diffusion noise). Training loss (see
+        `LatentODEModel.compute_loss`): recon is the FREE-RUNNING ROLLOUT error — the drift's
+        own predictions are integrated through the env's exact agent dynamics (`_pd_rollout`)
+        and matched to the demo state path — plus (kl_weight/(H·action_dim)) · KL[q‖p] (β-VAE
+        form). The generative model is a Gaussian observation N(x̂(z), σ_obs²) on each state, so
+        the KL scaling is ELBO-exact and kl_weight = 2·σ_obs² (σ_obs = trajectory observation std).
 
     Push-T I/O (mirrors DiffusionConfig):
         - "observation.state" required.
@@ -69,25 +71,33 @@ class LatentSDEConfig(PreTrainedConfig):
           making the kinematic-imitation assumption x_d ≈ x exact in form.
 
     New / different args vs. DiffusionConfig:
-        n_action_steps:   image-conditioning refresh period at deployment (same semantics
-                          as DP). Also the SDE chunk length at training time: per sample,
-                          h is encoded once and the SDE is unrolled H=n_action_steps steps
-                          under teacher-forced demo actions — same per-image-encode
-                          supervision budget as DP's horizon-length chunk loss.
-        sde_dt:           Δt for one Euler-Maruyama step. Push-T fps=10 Hz → 0.1 s.
+        horizon:          training PREDICTION / rollout chunk length. Per sample, h is encoded once and
+                          the drift is rolled out horizon-1 steps free-running, matched to the demo state
+                          path over the horizon (as DP predicts a horizon-length chunk).
+        n_action_steps:   actions EXECUTED per replan at deployment (h & z refresh period). Mirrors DP:
+                          predict `horizon`, execute the first `n_action_steps`, then re-encode h and
+                          re-sample z. Requires 1 <= n_action_steps <= horizon.
+        do_mask_loss_for_padding: mask copy-padded chunk ticks (episode ends) in the recon + posterior.
+        dt:           Δt for one drift/integration step. Push-T fps=10 Hz → 0.1 s.
         sigma_activation: "exp" or "softplus"; used only by z prior/posterior σ heads.
-        kl_weight:        β on KL[q||p], divided by (H·action_dim·dt) in the loss for
-                          ELBO-exact balance: kl_weight = 2·σ_eff² exactly (σ_eff = SDE
-                          diffusion coefficient). Inference SDE noise uses σ_eff = √(kl_weight/2)
+        kl_weight:        β on KL[q||p]; scaled by 1/(horizon·action_dim) in the loss for ELBO-exact
+                          balance (= 2·σ_obs²). See "Drift network output" above.
 
-    Removed (no analog in single-step SDE):
-        horizon, noise scheduler block, diffusion_step_embed_dim,
+    Removed (no analog in single-step ODE):
+        noise scheduler block, diffusion_step_embed_dim,
         num_inference_steps, kernel_size, clip_sample*.
     """
 
     # ---- Inputs / output structure ------------------------------------------------------------
+    # horizon:        training PREDICTION / rollout chunk length. The drift is rolled horizon-1 steps
+    #                 free-running, the posterior encodes the horizon-length demo chunk, and the recon
+    #                 matches the horizon state path (DP predicts a horizon-length chunk).
+    # n_action_steps: actions EXECUTED per replan at deployment (h & z refresh period). Mirrors DP:
+    #                 predict `horizon`, execute the first `n_action_steps`, then re-encode h / re-sample
+    #                 z. Requires 1 <= n_action_steps <= horizon. Default 16/8 = DP's Push-T train-16/act-8.
     n_obs_steps: int = 2
-    n_action_steps: int = 32
+    horizon: int = 16
+    n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -108,10 +118,10 @@ class LatentSDEConfig(PreTrainedConfig):
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = True
 
-    # ---- Drift / diffusion network ------------------------------------------------------------
+    # ---- Drift network ------------------------------------------------------------
     # down_dims reused from DiffusionConfig for per-layer capacity parity with the U-Net's
     # residual blocks. Point-wise FiLM-ResNet hourglass: state → 256 → 512 → 512 → 256 → heads. 
-    # (Horizon axis absent ⇒ kernel_size=1 == Linear.) DP uses (512, 1024, 2048), but we scale down for the SDE's single-step output.
+    # (Horizon axis absent ⇒ kernel_size=1 == Linear.) DP uses (512, 1024, 2048), but we scale down for the ODE's single-step output.
     down_dims: tuple[int, ...] = (256, 512)
     n_groups: int = 8
     use_film_scale_modulation: bool = True
@@ -123,20 +133,26 @@ class LatentSDEConfig(PreTrainedConfig):
     use_pe: bool = False
     pe_dim: int = 64
 
-    # ---- SDE specifics ------------------------------------------------------------------------
-    # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
-    sde_dt: float | None = 0.1
+    # ---- ODE specifics ------------------------------------------------------------------------
+    # If dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
+    dt: float | None = 0.1
     sigma_activation: str = "exp"   # "exp" | "softplus"; used by z prior/posterior heads only
 
-    # Train-only state-noise augmentation. >0 perturbs the drift's state window by std·√dt per frame
-    # and recomputes the recon target from the perturbed anchor → corrective drift. 0.0 = legacy.
-    state_noise_std: float = 0.1
+    # Train-only initial-state perturbation (DART-style). >0 shifts the rollout's START position by a
+    # per-sample Gaussian offset ~N(0, state_noise_std²) in normalized state units (velocity preserved),
+    # then rolls out deterministically and matches the CLEAN demo path — trains recovery back onto the
+    # demo from an off-manifold start. Recon targets stay clean. 0.0 = no perturbation.
+    state_noise_std: float = 0.03
 
-    # ---- Inference -----------------------------------------------------------------------------
-    # If True, drift-only inference. False → SDE noise σ_eff·√dt with σ_eff = √(kl_weight/2).
-    deterministic_inference: bool = True
+    # ---- PD-rollout dynamics (env-specific; the rollout integrates the drift through these) -----
+    # PushT's pusher is a KINEMATIC body (contact-force-free), so its dynamics is EXACTLY a PD position
+    # controller (pusht.py: k_p=100, k_v=20); one tick = pd_n_substeps physics substeps of dt/pd_n_substeps.
+    # Override for other position-controlled envs. Requires action_dim == state_dim.
+    pd_k_p: float = 100.0
+    pd_k_v: float = 20.0
+    pd_n_substeps: int = 10
 
-    # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
+    # ---- Per-"chunk" latent z (research_brief.md §1.2) ---------------------------------------
     # use_latent_z=False recovers the no-z PoC exactly (prior/posterior not built, no KL).
     # z_dim=8: Picked by analogy with ACT's CVAE (latent_dim=32, hidden_dim=512 → z/h = 1/16);
     # kl_weight: β on KL[q||p]. Too high → posterior collapse (q≡p, z carries no chunk info).
@@ -150,30 +166,31 @@ class LatentSDEConfig(PreTrainedConfig):
     z_dim: int = 8
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
-    kl_weight: float = 1e-3          # β on KL; also effective_sigma² · 2 at inference
+    kl_weight: float = 1e-3          # β on KL; ELBO-exact KL scale = 2·σ_obs² (trajectory obs std)
     kl_min: float = 0.0 # Per-dim KL floor in nats (free bits).
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
     conditional_prior: bool = True
 
-    # Train-only h conditioning-dropout: with this prob, replace h by a learnable null embedding
-    # (at source, so prior/posterior/drift all see it). Inference always uses real h. 0.0 = off.
-    h_dropout_prob: float = 0.0
-
     # ---- FSQ variant (mutually exclusive with the Gaussian CVAE) ------------------------------
     # Discrete latent via FSQ (finite scalar quantization, Mentzer et al. 2309.15505):
     # deterministic posterior → bounded scalar grid + straight-through rounding, categorical
-    # prior p(k|h) trained with CE on the posterior's index. Requires extras `lerobot[latent_sde]`.
+    # prior p(k|h) trained with CE on the posterior's index. Requires extras `lerobot[latent_ode]`.
     use_vq: bool = False
     fsq_levels: tuple[int, ...] = (8, 5, 5)  # per-dim levels; #codes = prod(levels), z_dim = len(levels)
-    fsq_prior_weight: float = 1e-3           # weight on prior-CE p(k|h); FSQ needs no commitment loss
+    fsq_prior_weight: float = 1e-5           # weight on prior-CE p(k|h); FSQ needs no commitment loss
 
     # ---- Optimization --------------------------------------------------------------------------
+    # The rollout net is always torch.compiled (see LatentODEModel.__init__); compile_model opts into
+    # ALSO compiling the inference net in place (off → eager inference, clean checkpoint keys).
     compile_model: bool = False
     compile_mode: str = "reduce-overhead"
 
-    # Skip the last `drop_n_last_frames` anchors of each episode at sampling time so chunks
-    # never extend past episode end. None → auto = `n_action_steps - 1` (no padded actions).
+    # Loss computation
+    do_mask_loss_for_padding: bool = False
+
+    # Skip the last `drop_n_last_frames` anchors of each episode at sampling time. None → auto =
+    # `horizon - n_action_steps - n_obs_steps + 1`
     drop_n_last_frames: int | None = None
 
     # ---- Training presets (copied verbatim from DiffusionConfig for fairness) ----------------
@@ -188,7 +205,7 @@ class LatentSDEConfig(PreTrainedConfig):
         super().__post_init__()
 
         if self.drop_n_last_frames is None:
-            self.drop_n_last_frames = self.n_action_steps - 1
+            self.drop_n_last_frames = max(0, self.horizon - self.n_action_steps - self.n_obs_steps + 1)
         if self.drop_n_last_frames < 0:
             raise ValueError(f"`drop_n_last_frames` must be >= 0. Got {self.drop_n_last_frames}.")
 
@@ -197,11 +214,16 @@ class LatentSDEConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
-        if self.n_action_steps < 1:
-            raise ValueError(f"`n_action_steps` must be >= 1. Got {self.n_action_steps}.")
+        if self.horizon < 1:
+            raise ValueError(f"`horizon` must be >= 1. Got {self.horizon}.")
+        if not (1 <= self.n_action_steps <= self.horizon):
+            raise ValueError(
+                f"`n_action_steps` must satisfy 1 <= n_action_steps <= horizon. "
+                f"Got n_action_steps={self.n_action_steps}, horizon={self.horizon}."
+            )
 
-        if self.sde_dt is not None and self.sde_dt <= 0:
-            raise ValueError(f"`sde_dt` must be positive (or None). Got {self.sde_dt}.")
+        if self.dt is not None and self.dt <= 0:
+            raise ValueError(f"`dt` must be positive (or None). Got {self.dt}.")
 
         if self.sigma_activation not in ("exp", "softplus"):
             raise ValueError(
@@ -215,8 +237,8 @@ class LatentSDEConfig(PreTrainedConfig):
 
         if self.state_noise_std < 0:
             raise ValueError(f"`state_noise_std` must be non-negative. Got {self.state_noise_std}.")
-        if not (0.0 <= self.h_dropout_prob <= 1.0):
-            raise ValueError(f"`h_dropout_prob` must be in [0, 1]. Got {self.h_dropout_prob}.")
+        if self.pd_n_substeps < 1:
+            raise ValueError(f"`pd_n_substeps` must be >= 1. Got {self.pd_n_substeps}.")
 
         if self.use_pe and (self.pe_dim < 4 or self.pe_dim % 2 != 0):
             raise ValueError(f"`pe_dim` must be an even int >= 4 when `use_pe=True`. Got {self.pe_dim}.")
@@ -305,17 +327,16 @@ class LatentSDEConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
-        # State: past n_obs_steps + next H-1 frames, so compute_loss sees the actual demo
-        # state trajectory instead of teacher-forcing from demo actions.
-        return {OBS_STATE: list(range(1 - self.n_obs_steps, self.n_action_steps))}
+        # State: past n_obs_steps + next horizon-1 frames, so compute_loss sees the actual demo
+        # state trajectory over the whole prediction horizon (not teacher-forced from demo actions).
+        return {OBS_STATE: list(range(1 - self.n_obs_steps, self.horizon))}
 
     @property
     def action_delta_indices(self) -> list:
-        # H = n_action_steps consecutive action targets per sample, anchored at "now"
-        # (not shifted by n_obs_steps like DP). The SDE integrates forward from x_now;
-        # DP's chunk overlaps the obs window because the U-Net denoises a chunk that
-        # *includes* the observed timesteps. See modeling_latent_sde.compute_loss.
-        return list(range(0, self.n_action_steps))
+        # `horizon` consecutive action targets per sample, anchored at "now" (deltas 0..horizon-1).
+        # The ODE integrates forward from x_now; unlike DP the chunk does NOT overlap the obs window.
+        # At deploy only the first `n_action_steps` are executed before h/z refresh.
+        return list(range(0, self.horizon))
 
     @property
     def reward_delta_indices(self) -> None:

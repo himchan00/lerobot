@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .configuration_latent_sde import LatentSDEConfig
-from .modeling_latent_sde import LatentSDEPolicy
-from .processor_latent_sde import make_latent_sde_pre_post_processors
+from .configuration_latent_ode import LatentODEConfig
+from .modeling_latent_ode import LatentODEPolicy
+from .processor_latent_ode import make_latent_ode_pre_post_processors
 
-__all__ = ["LatentSDEConfig", "LatentSDEPolicy", "make_latent_sde_pre_post_processors"]
+__all__ = ["LatentODEConfig", "LatentODEPolicy", "make_latent_ode_pre_post_processors"]
