@@ -47,7 +47,7 @@ class LatentSDEConfig(PreTrainedConfig):
              deployment **in lock-step with every h refresh** ("episode" =
              one h-refresh window), committing each chunk to one mode. At training,
              posterior q(z|h, x_seq, a_seq) provides chunk-level mode signal; loss = NLL +
-             kl_weight · KL[q||p]. z conditions the drift net via FiLM alongside h
+             beta · KL[q||p]. z conditions the drift net via FiLM alongside h
              (cond = concat([h, z])); the drift/diffusion block structure is unchanged.
 
     `observation.environment_state` (e.g. Push-T's 16-D T-block pose) is currently ignored
@@ -55,12 +55,11 @@ class LatentSDEConfig(PreTrainedConfig):
     if the experiment warrants it.
 
     Drift/diffusion network output:
-        mu — SDE drift only, shape (B, action_dim). Action σ is NOT learned.
-        SDE step (inference): x_d = x + mu·dt + σ_eff·√dt·ε, with σ_eff = √(kl_weight/2)
-        the SDE diffusion coefficient. Training loss: recon = mean‖μ − v*‖² +
-        (kl_weight/(H·action_dim·dt)) · KL[q‖p] (β-VAE form) where v* = (a − x)/dt is the
-        empirical one-step velocity; the /(H·action_dim·dt) KL scaling is ELBO-exact under
-        the SDE decoder Δx ~ N(μ·dt, σ²·dt), so kl_weight = 2·σ_eff² holds exactly.
+        mu — SDE drift only, shape (B, action_dim). Inference step: x_d = x + mu·dt + σ·√dt·ε.
+        Training loss (Gaussian path): nll + beta·KL[q‖p], nll the Gaussian NLL of Δx ~ N(μ·dt, σ²·dt)
+        over the H·action_dim deltas (v* = (a−x)/dt), nll and KL both /(H·action_dim). σ² (SDE diffusion
+        coeff²) is NOT gradient-trained — an EMA of the per-batch MLE dt·mean‖v*−μ‖² (σ-VAE); beta is
+        the β-VAE coefficient on KL. (VQ/FSQ keep an MSE recon + commitment/prior-CE.)
 
     Push-T I/O (mirrors DiffusionConfig):
         - "observation.state" required.
@@ -78,9 +77,10 @@ class LatentSDEConfig(PreTrainedConfig):
         do_mask_loss_for_padding: mask copy-padded chunk ticks (episode ends) in the recon + posterior.
         sde_dt:           Δt for one Euler-Maruyama step. Push-T fps=10 Hz → 0.1 s.
         sigma_activation: "exp" or "softplus"; used only by z prior/posterior σ heads.
-        kl_weight:        β on KL[q||p], divided by (H·action_dim·dt) in the loss for
-                          ELBO-exact balance: kl_weight = 2·σ_eff² exactly (σ_eff = SDE
-                          diffusion coefficient). Inference SDE noise uses σ_eff = √(kl_weight/2)
+        beta:             β-VAE coefficient on KL[q||p] in the ELBO loss = nll + beta·KL. The
+                          action-decoder σ² is calibrated by EMA to the analytic MLE (σ-VAE),
+                          not gradient-trained (see sigma_ema_decay). Inference SDE noise
+                          per step = σ·√dt.
 
     Removed (no analog in single-step SDE):
         noise scheduler block, diffusion_step_embed_dim,
@@ -113,14 +113,14 @@ class LatentSDEConfig(PreTrainedConfig):
     crop_is_random: bool = True
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     use_group_norm: bool = False
-    spatial_softmax_num_keypoints: int = 32
+    spatial_softmax_num_keypoints: int = 64
     use_separate_rgb_encoder_per_camera: bool = True
 
     # ---- Drift / diffusion network ------------------------------------------------------------
     # down_dims reused from DiffusionConfig for per-layer capacity parity with the U-Net's
     # residual blocks. Point-wise FiLM-ResNet hourglass: state → 256 → 512 → 512 → 256 → heads. 
     # (Horizon axis absent ⇒ kernel_size=1 == Linear.) DP uses (512, 1024, 2048), but we scale down for the SDE's single-step output.
-    down_dims: tuple[int, ...] = (256, 512)
+    down_dims: tuple[int, ...] = (512, 1024)
     n_groups: int = 8
     use_film_scale_modulation: bool = True
 
@@ -131,19 +131,29 @@ class LatentSDEConfig(PreTrainedConfig):
     use_pe: bool = False
     pe_dim: int = 64
 
-    # z_mode: how the latent z enters the drift net (no effect when use_latent_z=False).
-    #   "cond"  — concat onto the FiLM cond alongside h (cond = [h, z]); net input = x_aug (legacy).
-    #   "input" — concat onto the net input (input = [x_aug, z]); cond = h.
+    # z_mode: where the latent z enters the drift net (no effect when use_latent_z=False):
+    #   "cond"  — concat z onto the FiLM cond.
+    #   "input" — concat z onto the net input instead.
     z_mode: str = "cond"  # "cond" | "input"
+
+    # drift_uses_h: is h in the drift net's FiLM cond? True → h ∈ cond. False → h is dropped from the
+    #   drift and reaches the field only via the prior p(z|h)/posterior (z is an h→z→field bottleneck);
+    #   the cond is then whatever z_mode leaves (z for "cond", or empty → plain MLP for "input").
+    #   Requires use_latent_z=True. Acts independently of z_mode.
+    drift_uses_h: bool = False
 
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
     sigma_activation: str = "exp"   # "exp" | "softplus"; used by z prior/posterior heads only
 
+    # Action-decoder σ² (SDE diffusion coeff²) is NOT gradient-trained: it's EMA'd toward the analytic
+    # per-batch MLE dt·mean‖v*−μ‖² (calibrated σ-VAE, arXiv:2006.13202). sigma_ema_decay = EMA decay.
+    sigma_ema_decay: float = 0.99
+
     # Train-only state-noise augmentation. >0 perturbs the drift's state window by std·√dt per frame
     # and recomputes the recon target from the perturbed anchor → corrective drift. 0.0 = legacy.
-    state_noise_std: float = 0.3
+    state_noise_std: float = 0.1
 
     # state_noise_schedule: how the per-frame std varies across the chunk.
     #   "uniform" — same std·√dt on every frame (legacy).
@@ -165,28 +175,32 @@ class LatentSDEConfig(PreTrainedConfig):
     posterior_state: str = "clean"  # "clean" | "noisy"
 
     # ---- Inference -----------------------------------------------------------------------------
-    # If True, drift-only inference. False → SDE noise σ_eff·√dt with σ_eff = √(kl_weight/2).
+    # If True, drift-only inference. False → SDE noise σ·√dt with σ the learned action-decoder scalar.
     deterministic_inference: bool = True
 
     # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
     # use_latent_z=False recovers the no-z PoC exactly (prior/posterior not built, no KL).
     # z_dim=8: Picked by analogy with ACT's CVAE (latent_dim=32, hidden_dim=512 → z/h = 1/16);
-    # kl_weight: β on KL[q||p]. Too high → posterior collapse (q≡p, z carries no chunk info).
+    # beta: β-VAE coefficient on KL[q||p]. Too high → posterior collapse (q≡p, z carries no chunk info).
     #   Too low → q ignores prior (deployment z uninformed). 1e-2 .. 1.0 worth sweeping.
     # z_prior_hidden_dim / z_posterior_hidden_dim: hidden width of the (μ,σ) MLPs. None → h_dim.
     # deterministic_z_inference: use μ_p instead of sampling z at deploy. Debug/ablation only.
-    # conditional_prior: True → p(z|h) (2-layer MLP, current default) and the posterior also takes
-    #   h as input. False → p(z) = N(0, I) and the posterior is h-free (trajectory-only).
 
     use_latent_z: bool = True
     z_dim: int = 8
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
-    kl_weight: float = 1e-3          # β on KL; also effective_sigma² · 2 at inference
+    beta: float = 1.0                # β-VAE coefficient on KL[q‖p] in the ELBO (loss = nll + beta·KL)
     kl_min: float = 0.0 # Per-dim KL floor in nats (free bits).
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
-    conditional_prior: bool = True
+
+    # posterior_uses_h: does the POSTERIOR encoder read h in addition to the trajectory?
+    #   True  (default) — q(z | traj, h): legacy CVAE posterior.
+    #   False — q(z | traj): trajectory-only encoder (the prior still predicts z from h). The canonical
+    #           latent-plan/skill-VAE view (play-LMP, OPAL); a valid ELBO, near-tight when the
+    #           trajectory determines z (it already carries the scene, so h is redundant to q).
+    posterior_uses_h: bool = True
 
     # ---- Discrete-latent variant (mutually exclusive with the Gaussian CVAE) ------------------
     # use_vq=True swaps the Gaussian CVAE for a discrete latent: deterministic posterior → quantizer
@@ -223,7 +237,7 @@ class LatentSDEConfig(PreTrainedConfig):
     drop_n_last_frames: int | None = None
 
     # ---- Training presets (copied verbatim from DiffusionConfig for fairness) ----------------
-    optimizer_lr: float = 1e-4
+    optimizer_lr: float = 1e-3
     optimizer_betas: tuple = (0.95, 0.999)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 1e-6
@@ -261,8 +275,10 @@ class LatentSDEConfig(PreTrainedConfig):
         if self.z_sigma_min <= 0:
             raise ValueError(f"`z_sigma_min` must be > 0. Got {self.z_sigma_min}.")
 
-        if self.kl_weight < 0:
-            raise ValueError(f"`kl_weight` must be non-negative. Got {self.kl_weight}.")
+        if self.beta < 0:
+            raise ValueError(f"`beta` must be non-negative. Got {self.beta}.")
+        if not (0.0 < self.sigma_ema_decay < 1.0):
+            raise ValueError(f"`sigma_ema_decay` must be in (0, 1). Got {self.sigma_ema_decay}.")
 
         if self.state_noise_std < 0:
             raise ValueError(f"`state_noise_std` must be non-negative. Got {self.state_noise_std}.")
@@ -375,9 +391,9 @@ class LatentSDEConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
-        # State: past n_obs_steps + next horizon-1 frames, so compute_loss sees the actual demo
-        # state trajectory over the whole prediction horizon (not teacher-forcing from demo actions).
-        return {OBS_STATE: list(range(1 - self.n_obs_steps, self.horizon))}
+        # State: current + next horizon-1 frames (deltas 0..horizon-1), so compute_loss sees the demo
+        # state trajectory over the whole horizon. Velocity-blind drift → no past frames (motion ∈ h).
+        return {OBS_STATE: list(range(self.horizon))}
 
     @property
     def action_delta_indices(self) -> list:
