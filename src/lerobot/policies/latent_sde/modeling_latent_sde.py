@@ -17,7 +17,7 @@ from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-from ..diffusion.modeling_diffusion import DiffusionRgbEncoder, DiffusionSinusoidalPosEmb
+from ..diffusion.modeling_diffusion import DiffusionRgbEncoder
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
 from .configuration_latent_sde import LatentSDEConfig
@@ -107,9 +107,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
             self._cached_z = self.model.sample_z_from_prior(self._cached_h)
             self._steps_until_h_refresh = self.config.n_action_steps
 
-        # Ticks since the last h refresh (0 = refresh tick .. n_action_steps-1); the drift's PE index.
-        step_idx = self.config.n_action_steps - self._steps_until_h_refresh
-        action = self.model.step(x_now, self._cached_h, self._cached_z, noise=noise, step_idx=step_idx)
+        action = self.model.step(x_now, self._cached_h, self._cached_z, noise=noise)
         self._steps_until_h_refresh -= 1
         return action
 
@@ -167,6 +165,8 @@ class LatentSDEModel(nn.Module):
         # The prior is always p(z|h) (h-conditioned). posterior_uses_h → q(z|traj,h), else q(z|traj)
         # (trajectory-only; the canonical latent-plan VAE — the prior still predicts z from h).
         self.posterior_uses_h = config.use_latent_z and config.posterior_uses_h
+        # posterior_uses_state → the traj encoder reads concat([state, action]); else the actions alone.
+        self.posterior_uses_state = config.posterior_uses_state
         if not self.use_latent_z:
             self.z_dim = 0
             self.prior = None
@@ -181,6 +181,9 @@ class LatentSDEModel(nn.Module):
             # length (horizon), kernel 3. E.g. horizon 8→1, 16→2, 32→3, 64→4.
             tcn_levels = max(1, round(math.log2(config.horizon / 4)))
 
+            # posterior_uses_state → the traj encoder reads concat([state, action]); else actions only.
+            posterior_input_dim = (self.state_dim if self.posterior_uses_state else 0) + self.action_dim
+
             if self.use_vq:
                 # Discrete latent (config.quantizer): FSQ or VQ. num_codes = size of the flat index
                 # space the categorical prior/CE/perplexity operate over.
@@ -194,7 +197,7 @@ class LatentSDEModel(nn.Module):
                     hidden_dim=prior_hidden,
                 )
                 self.posterior = LatentPosteriorTrajVQ(
-                    input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
+                    input_dim=posterior_input_dim,  # concat([state, action]) or action-only (posterior_uses_state)
                     h_dim=self.h_dim if self.posterior_uses_h else 0,  # 0 → h-free posterior
                     z_dim=self.z_dim,
                     hidden_dim=posterior_hidden,
@@ -229,7 +232,7 @@ class LatentSDEModel(nn.Module):
                     sigma_min=config.z_sigma_min,
                 )
                 self.posterior = LatentPosteriorTraj(
-                    input_dim=self.state_dim + self.action_dim,  # encodes concat([state, action])
+                    input_dim=posterior_input_dim,  # concat([state, action]) or action-only (posterior_uses_state)
                     h_dim=self.h_dim if self.posterior_uses_h else 0,  # 0 → h-free posterior
                     z_dim=self.z_dim,
                     hidden_dim=posterior_hidden,
@@ -258,8 +261,6 @@ class LatentSDEModel(nn.Module):
             down_dims=config.down_dims,
             n_groups=config.n_groups,
             use_film_scale_modulation=config.use_film_scale_modulation,
-            use_pe=config.use_pe,
-            pe_dim=config.pe_dim,
         )
 
         # Action-decoder variance σ² (SDE diffusion coeff²): a buffer, NOT gradient-trained — EMA'd
@@ -380,7 +381,6 @@ class LatentSDEModel(nn.Module):
         z: Tensor | None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
-        step_idx: int = 0,
     ) -> Tensor:
         """One Euler-Maruyama step from pre-computed h (and optional z).
 
@@ -390,15 +390,9 @@ class LatentSDEModel(nn.Module):
             noise: (B, action_dim) optional pre-sampled Brownian increment. Mirrors
                    `DiffusionModel.conditional_sample(noise=...)`: when given, replaces the
                    internal `randn`; ignored when `deterministic_inference` is True.
-            step_idx: ticks since the current h refresh (0..n_action_steps-1); the PE index when use_pe.
         """
         net_in, cond = self._drift_inputs(x_now, h, z)
-        step = (
-            torch.full((x_now.shape[0],), float(step_idx), dtype=x_now.dtype, device=x_now.device)
-            if self.config.use_pe
-            else None
-        )
-        mu = self.net(net_in, cond, step)
+        mu = self.net(net_in, cond)
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         return self._sde_step(
             x_now,
@@ -495,7 +489,12 @@ class LatentSDEModel(nn.Module):
             # action is always the clean demo action). "clean" ⇒ same demo → same z regardless of the
             # train-time state-noise; "noisy" ⇒ legacy (the same noised state the drift reads).
             post_state = x_seq_clean if self.config.posterior_state == "clean" else x_seq
-            traj = torch.cat([post_state, action_target], dim=-1)
+            # posterior_uses_state → encode concat([state, action]); else the action trajectory alone.
+            traj = (
+                torch.cat([post_state, action_target], dim=-1)
+                if self.posterior_uses_state
+                else action_target
+            )
             valid_mask = valid                               # (B, H); ~action_is_pad when masking
             # pass h to the posterior only when posterior_uses_h (else q(z | traj) — trajectory-only).
             posterior_args = (traj, valid_mask, h) if self.posterior_uses_h else (traj, valid_mask)
@@ -528,18 +527,12 @@ class LatentSDEModel(nn.Module):
 
         flat_x = x_seq.reshape(B * H, self.state_dim)        # current frame per tick (velocity-blind)
         flat_h = h.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
-        # Per-tick step-distance k=0..H-1 (row b*H+k ↦ k, matching the flatten above); None if use_pe off.
-        flat_step = (
-            torch.arange(H, dtype=h.dtype, device=h.device).unsqueeze(0).expand(B, H).reshape(B * H)
-            if self.config.use_pe
-            else None
-        )
         flat_z = None
         if self.use_latent_z:
             flat_z = z_q.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
         flat_net_in, flat_cond = self._drift_inputs(flat_x, flat_h, flat_z)
 
-        mu_flat = self.net(flat_net_in, flat_cond, flat_step)
+        mu_flat = self.net(flat_net_in, flat_cond)
         mu = mu_flat.reshape(B, H, action_dim)
 
         # Recon target v* = (a_anchor − x̃)/dt: one-step full return to a demo action from the noised
@@ -593,7 +586,7 @@ class LatentSDEModel(nn.Module):
             norm = H * action_dim
             nll_loss = nll_elem.sum(dim=(1, 2)).mean() / norm
             if self.use_latent_z:
-                kl_per_sample = _gaussian_kl_loss(mu_q, sigma_q, mu_p, sigma_p, self.config.kl_min)  # (B,)
+                kl_per_sample = _gaussian_kl_loss(mu_q, sigma_q, mu_p, sigma_p)  # (B,)
                 kl_loss = kl_per_sample.mean() / norm
                 loss = nll_loss + self.config.beta * kl_loss  # β-VAE ELBO
             else:
@@ -612,7 +605,7 @@ class LatentSDEModel(nn.Module):
                     torch.roll(z_q, shifts=1, dims=0).unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
                 )
                 net_in_rolled, cond_rolled = self._drift_inputs(flat_x, flat_h, flat_z_rolled)
-                mu_rolled = self.net(net_in_rolled, cond_rolled, flat_step)
+                mu_rolled = self.net(net_in_rolled, cond_rolled)
                 rolled_se = (mu_rolled.reshape(B, H, action_dim) - target_velocity) ** 2
                 if self.config.do_mask_loss_for_padding:
                     rolled_se = rolled_se * valid.unsqueeze(-1)
@@ -625,7 +618,7 @@ class LatentSDEModel(nn.Module):
                 z_prior = self.sample_z_from_prior(h)  # (B, z_dim), deploy prior distribution
                 flat_z_prior = z_prior.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
                 net_in_p, cond_p = self._drift_inputs(flat_x, flat_h, flat_z_prior)
-                mu_prior = self.net(net_in_p, cond_p, flat_step).reshape(B, H, action_dim)
+                mu_prior = self.net(net_in_p, cond_p).reshape(B, H, action_dim)
                 prior_se = (mu_prior - target_velocity) ** 2
                 if self.config.do_mask_loss_for_padding:
                     prior_se = prior_se * valid.unsqueeze(-1)
@@ -882,24 +875,11 @@ class _MaskedGroupNorm(nn.Module):
         return x_norm * self.weight.view(1, C, 1) + self.bias.view(1, C, 1)
 
 
-def _gaussian_kl_loss(
-    mu_q: Tensor, sigma_q: Tensor, mu_p: Tensor, sigma_p: Tensor, kl_min: float = 0.0
-) -> Tensor:
-    """KL[N(μ_q, diag σ_q²) || N(μ_p, diag σ_p²)] per sample, summed over latent dim.
-
-    kl_min: Per-dim KL floor in nats (free bits). Each dim's KL is clamped to
-        max(kl, kl_min) before summing, so the model uses up to kl_min nats
-        per dim without KL penalty, preventing posterior collapse.
-
-        For a task with N modes, set kl_min ≈ log(N) / z_dim so the total
-        budget z_dim × kl_min ≈ log(N) nats covers the mode bits.
-        E.g., N=2 → 0.35 (z_dim=2), 0.04 (z_dim=16). Default 0 disables.
-    """
+def _gaussian_kl_loss(mu_q: Tensor, sigma_q: Tensor, mu_p: Tensor, sigma_p: Tensor) -> Tensor:
+    """KL[N(μ_q, diag σ_q²) || N(μ_p, diag σ_p²)] per sample, summed over latent dim."""
     var_q = sigma_q.pow(2)
     var_p = sigma_p.pow(2)
     per_dim = sigma_p.log() - sigma_q.log() + 0.5 * (var_q + (mu_q - mu_p) ** 2) / var_p - 0.5
-    if kl_min > 0.0:
-        per_dim = per_dim.clamp_min(kl_min)
     return per_dim.sum(dim=-1)
 
 
@@ -911,7 +891,6 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         x:    (B, input_dim)     — augmented state (n_obs_steps frames flattened);
                                    the net reads local first-differences ≈ velocity.
         cond: (B, cond_dim)      — global conditioning concat([h, z]) (FiLM); z omitted when no latent.
-        step: (B,) | None        — step-distance from h; sinusoidally embedded onto the cond when use_pe.
     Output:
         mu:   (B, action_dim) — SDE drift. The action-decoder σ is a calibrated EMA buffer on
                                 LatentSDEModel (action_var = σ²); inference noise = σ·√dt.
@@ -928,23 +907,9 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         down_dims: tuple[int, ...] = (512, 1024, 2048),
         n_groups: int = 8,
         use_film_scale_modulation: bool = True,
-        use_pe: bool = False,
-        pe_dim: int = 64,
     ):
         super().__init__()
         assert len(down_dims) >= 1, "`down_dims` must contain at least one width."
-
-        # Step-distance encoder (DP's diffusion_step_encoder): sinusoidal embed → MLP, concatenated
-        # onto the FiLM cond. Widens cond_dim by pe_dim.
-        self.use_pe = use_pe
-        if use_pe:
-            self.step_encoder = nn.Sequential(
-                DiffusionSinusoidalPosEmb(pe_dim),
-                nn.Linear(pe_dim, pe_dim * 4),
-                nn.Mish(),
-                nn.Linear(pe_dim * 4, pe_dim),
-            )
-            cond_dim = cond_dim + pe_dim
 
         widths = [input_dim, *down_dims, down_dims[-1], *reversed(down_dims[:-1])]
         self.blocks = nn.ModuleList(
@@ -964,9 +929,7 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         self.final_act = nn.Mish()
         self.mu_head = nn.Linear(widths[-1], action_dim)
 
-    def forward(self, x: Tensor, cond: Tensor, step: Tensor | None = None) -> Tensor:
-        if self.use_pe:
-            cond = torch.cat([self.step_encoder(step), cond], dim=-1)  # cat([step_embed, h]), as in DP
+    def forward(self, x: Tensor, cond: Tensor) -> Tensor:
         feat = x
         for block in self.blocks:
             feat = block(feat, cond)

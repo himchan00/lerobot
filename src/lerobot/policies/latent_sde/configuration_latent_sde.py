@@ -124,13 +124,6 @@ class LatentSDEConfig(PreTrainedConfig):
     n_groups: int = 8
     use_film_scale_modulation: bool = True
 
-    # ---- Step-distance positional embedding ---------------------------------------------------
-    # use_pe: embed each state's step-distance k (0..H-1) from its image-embedding timestep
-    #   (DiffusionPolicy's DiffusionSinusoidalPosEmb) and concat it onto the FiLM cond alongside h.
-    # pe_dim: width of that embedding; must be even and >= 4.
-    use_pe: bool = False
-    pe_dim: int = 64
-
     # z_mode: where the latent z enters the drift net (no effect when use_latent_z=False):
     #   "cond"  — concat z onto the FiLM cond.
     #   "input" — concat z onto the net input instead.
@@ -191,7 +184,6 @@ class LatentSDEConfig(PreTrainedConfig):
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
     beta: float = 1.0                # β-VAE coefficient on KL[q‖p] in the ELBO (loss = nll + beta·KL)
-    kl_min: float = 0.0 # Per-dim KL floor in nats (free bits).
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
 
@@ -201,6 +193,13 @@ class LatentSDEConfig(PreTrainedConfig):
     #           latent-plan/skill-VAE view (play-LMP, OPAL); a valid ELBO, near-tight when the
     #           trajectory determines z (it already carries the scene, so h is redundant to q).
     posterior_uses_h: bool = True
+
+    # posterior_uses_state: does the POSTERIOR trajectory encoder read the state path, or actions only?
+    #   True  (default) — traj = concat([state, action]) over the chunk (_TrajEncoder in = state+action).
+    #   False — traj = the action trajectory alone (state channels dropped; _TrajEncoder in = action_dim);
+    #           z then summarizes the demonstrated action sequence without the states it visits.
+    #   Independent of posterior_uses_h (which controls the pooled-h concat, not the traj channels).
+    posterior_uses_state: bool = True
 
     # ---- Discrete-latent variant (mutually exclusive with the Gaussian CVAE) ------------------
     # use_vq=True swaps the Gaussian CVAE for a discrete latent: deterministic posterior → quantizer
@@ -293,9 +292,6 @@ class LatentSDEConfig(PreTrainedConfig):
             raise ValueError(f"`posterior_state` must be 'clean' or 'noisy'. Got {self.posterior_state!r}.")
         if self.z_mode not in ("cond", "input"):
             raise ValueError(f"`z_mode` must be 'cond' or 'input'. Got {self.z_mode!r}.")
-
-        if self.use_pe and (self.pe_dim < 4 or self.pe_dim % 2 != 0):
-            raise ValueError(f"`pe_dim` must be an even int >= 4 when `use_pe=True`. Got {self.pe_dim}.")
 
         if self.z_dim <= 0:
             raise ValueError(f"`z_dim` must be positive. Got {self.z_dim}.")

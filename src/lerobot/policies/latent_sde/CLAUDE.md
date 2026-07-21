@@ -48,7 +48,7 @@ drift through the env's PD dynamics (free-running). Inference is shared across b
 
 **Posterior `q(z | (x,a)_{0:H}, [h])`** (training only). Encodes the **(state, action)
 trajectory** concatenated on the channel axis — `_TrajEncoder` input channels = `state_dim + action_dim`.
-Trajectory = `cat([x_seq, action_target])` `(B, H, state_dim + action_dim)`, all-True mask; pooled feats concat the chunk `h` iff `posterior_uses_h` (else trajectory-only). Both channels match the drift target's pairs: `x_seq` is the **noised** chunk anchor and `action_target` its **time-aligned** action.
+Trajectory = `cat([x_seq, action_target])` `(B, H, state_dim + action_dim)`, all-True mask; pooled feats concat the chunk `h` iff `posterior_uses_h` (else trajectory-only). Both channels match the drift target's pairs: `x_seq` is the **noised** chunk anchor and `action_target` its **time-aligned** action. `posterior_uses_state=False` drops the state channels (`_TrajEncoder` input = `action_dim`, traj = `action_target` alone) — orthogonal to `posterior_uses_h`.
 
 **Sampling.** Gaussian: reparam `z = μ_q + σ_q·ε`. Discrete (`use_vq=True`, flavor set by
 `config.quantizer`): deterministic `z_e` → quantizer → `z_q`, with a flat categorical prior over
@@ -88,7 +88,6 @@ VQ/FSQ:  loss = mean‖μ − v*‖² + other_loss  # MSE-mean recon (σ untrain
   step = `σ·√dt`; `deterministic_inference=True` (default) skips it.
 - A plain-MSE `recon_loss` is logged in every path for the z-usage / prior-leakage diagnostics
   (`z_usage_gap`, `prior_recon_gap`), which compare recon MSE across z choices.
-- `kl_min` = per-dim free bits (clamp each dim's KL ≥ `kl_min` before summing) to fight posterior collapse.
 - **Padding & masking.** `drop_n_last_frames` (default `max(0, horizon − n_action_steps − n_obs_steps + 1)`) keeps the EXECUTED region unpadded, but the predicted tail may be copy-padded at episode ends. With `do_mask_loss_for_padding=True`, `compute_loss` builds `valid = ~action_is_pad` `(B, H)` and (a) zeroes padded ticks in the recon MSE (`recon_se * valid.unsqueeze(-1)`, still normalized by nominal `B·H·D`, DP-style) and (b) passes `valid` as the per-chunk posterior `valid_mask`. With `do_mask_loss_for_padding=False` (default) `valid` is all-True — recon is a plain `.mean()` over `(B, H, D)` and the posterior mask is all-True, identical to the legacy behavior.
 
 
@@ -119,8 +118,8 @@ Factory wiring: `policies/factory.py` (`get_policy_class` / `make_policy_config`
 `recon_mode` (`"sde"` single-step teacher-forced | `"ode"` free-running PD rollout — the `compute_loss` branch) ·
 `rollout_sigma` (inference SDE noise; 0 ⇒ deterministic) · `pd_k_p`/`pd_k_v`/`pd_n_substeps` (ode PD dynamics) ·
 `n_obs_steps`, `horizon` (= training-chunk length H), `n_action_steps` (= deploy h-refresh period; ≤ horizon) · `sde_dt` (None → 1/fps) ·
-`use_latent_z`, `z_dim`, `posterior_uses_h` (q reads h too; else trajectory-only), `drift_uses_h` (False ⇒ drift reads `z` only, no `h`; the velocity-blind field is purely z-conditioned) ·
-`beta` (β-VAE KL coefficient; replaces `kl_weight`), `kl_min`, `sigma_activation` (`exp`|`softplus`), `z_sigma_min` ·
+`use_latent_z`, `z_dim`, `posterior_uses_h` (q reads h too; else trajectory-only), `posterior_uses_state` (q's traj encoder reads state+action; else actions only), `drift_uses_h` (False ⇒ drift reads `z` only, no `h`; the velocity-blind field is purely z-conditioned) ·
+`beta` (β-VAE KL coefficient; replaces `kl_weight`), `sigma_activation` (`exp`|`softplus`), `z_sigma_min` ·
 `use_vq`, `quantizer` (`"fsq"` | `"vq"`) · FSQ: `fsq_levels` (per-dim levels; #codes = prod, z_dim = len), `fsq_prior_weight` · VQ: `vq_codebook_size` (#codes; ≤ batch), `vq_commit_weight`, `vq_decay`, `vq_prior_weight` (z_dim = configured z_dim) ·
 `state_noise_std` (train-only; "sde" = drift-window noise / corrective target, "ode" = DART start-perturbation), `do_mask_loss_for_padding` (mask copy-padded chunk ticks in recon + posterior) ·
 `deterministic_z_inference` · vision/optim knobs copied verbatim from `DiffusionConfig` for fairness.
