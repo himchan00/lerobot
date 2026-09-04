@@ -15,6 +15,7 @@
 # Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the SDE
 # is integrated one step at a time on the measured state x.
 
+import warnings
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
@@ -93,7 +94,7 @@ class LatentSDEConfig(PreTrainedConfig):
     # n_action_steps: actions EXECUTED per replan at deployment (h & z refresh period). Mirrors DP:
     #                 unroll `horizon`, execute the first `n_action_steps`, then re-encode h / re-sample
     #                 z. Requires 1 <= n_action_steps <= horizon. (DP's Push-T recipe is train-16/act-8.)
-    n_obs_steps: int = 1
+    n_obs_steps: int = 2
     horizon: int = 16
     n_action_steps: int = 8
 
@@ -133,7 +134,7 @@ class LatentSDEConfig(PreTrainedConfig):
     #   drift and reaches the field only via the prior p(z|h)/posterior (z is an h→z→field bottleneck);
     #   the cond is then whatever z_mode leaves (z for "cond", or empty → plain MLP for "input").
     #   Requires use_latent_z=True. Acts independently of z_mode.
-    drift_uses_h: bool = False
+    drift_uses_h: bool = True
 
     # ---- SDE specifics ------------------------------------------------------------------------
     # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
@@ -167,6 +168,16 @@ class LatentSDEConfig(PreTrainedConfig):
     #   "clean" — the clean demo state, so the same demo maps to the same z regardless of state-noise.
     posterior_state: str = "clean"  # "clean" | "noisy"
 
+    # normalize_state: re-origin the state/action fed to the DRIFT net input and the POSTERIOR
+    #   trajectory encoder to the chunk-initial state x_0 (subtract x_0 so x_{0:H} → 0..x_H−x_0).
+    #   The drift becomes translation-equivariant (its velocity target (a−x)/dt is unchanged; the
+    #   absolute SDE step mean = x_now + μ·dt still uses the un-shifted x_now) and the posterior sees
+    #   the chunk as a displacement path. Requires action_dim == state_dim (x_0 is a state, subtracted
+    #   from the actions too). Because the drift then no longer reads the absolute proprio state, the
+    #   chunk-initial state should be reinjected through the prior's proprio window with
+    #   use_latent_z=True and prior_uses_state=True (else the policy loses current-state info). Off = legacy.
+    normalize_state: bool = True
+
     # ---- Inference -----------------------------------------------------------------------------
     # If True, drift-only inference. False → SDE noise σ·√dt with σ the learned action-decoder scalar.
     deterministic_inference: bool = True
@@ -192,14 +203,22 @@ class LatentSDEConfig(PreTrainedConfig):
     #   False — q(z | traj): trajectory-only encoder (the prior still predicts z from h). The canonical
     #           latent-plan/skill-VAE view (play-LMP, OPAL); a valid ELBO, near-tight when the
     #           trajectory determines z (it already carries the scene, so h is redundant to q).
-    posterior_uses_h: bool = True
+    posterior_uses_h: bool = False
 
     # posterior_uses_state: does the POSTERIOR trajectory encoder read the state path, or actions only?
     #   True  (default) — traj = concat([state, action]) over the chunk (_TrajEncoder in = state+action).
     #   False — traj = the action trajectory alone (state channels dropped; _TrajEncoder in = action_dim);
     #           z then summarizes the demonstrated action sequence without the states it visits.
     #   Independent of posterior_uses_h (which controls the pooled-h concat, not the traj channels).
-    posterior_uses_state: bool = True
+    posterior_uses_state: bool = False
+
+    # prior_uses_state: does the PRIOR p(z|·) read the n_obs_steps state window in addition to the
+    #   image h? The prior stays causal (past frames only), so this mirrors the image h exactly.
+    #   False (default) — p(z|h): image-only prior (legacy).
+    #   True  — p(z | h, x_{1-n_obs..0}): the n_obs_steps proprio frames (flattened, same window as the
+    #           images) are concatenated onto the prior input. Widens the state dataloader window by
+    #           n_obs_steps-1 past frames (no effect when n_obs_steps==1). Only active with use_latent_z.
+    prior_uses_state: bool = True
 
     # ---- Discrete-latent variant (mutually exclusive with the Gaussian CVAE) ------------------
     # use_vq=True swaps the Gaussian CVAE for a discrete latent: deterministic posterior → quantizer
@@ -292,6 +311,18 @@ class LatentSDEConfig(PreTrainedConfig):
             raise ValueError(f"`posterior_state` must be 'clean' or 'noisy'. Got {self.posterior_state!r}.")
         if self.z_mode not in ("cond", "input"):
             raise ValueError(f"`z_mode` must be 'cond' or 'input'. Got {self.z_mode!r}.")
+
+        if self.normalize_state and not (self.use_latent_z and self.prior_uses_state):
+            # normalize_state strips absolute proprio from the drift input; the chunk-initial state
+            # can only be reinjected via the prior's proprio window, which needs the latent-z prior.
+            warnings.warn(
+                "`normalize_state=True` re-origins the drift input to the chunk-initial state, so the "
+                "drift no longer sees the absolute proprio state; the current state must be reinjected "
+                "through the prior's proprio window, which requires `use_latent_z=True` and "
+                f"`prior_uses_state=True`. Got use_latent_z={self.use_latent_z}, "
+                f"prior_uses_state={self.prior_uses_state}.",
+                stacklevel=2,
+            )
 
         if self.z_dim <= 0:
             raise ValueError(f"`z_dim` must be positive. Got {self.z_dim}.")
@@ -389,7 +420,10 @@ class LatentSDEConfig(PreTrainedConfig):
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
         # State: current + next horizon-1 frames (deltas 0..horizon-1), so compute_loss sees the demo
         # state trajectory over the whole horizon. Velocity-blind drift → no past frames (motion ∈ h).
-        return {OBS_STATE: list(range(self.horizon))}
+        # When prior_uses_state, prepend the n_obs_steps-1 PAST frames (deltas 1-n_obs..-1) so the prior
+        # sees the same n_obs window as the image h (no change when n_obs_steps==1).
+        start = 1 - self.n_obs_steps if (self.prior_uses_state and self.use_latent_z) else 0
+        return {OBS_STATE: list(range(start, self.horizon))}
 
     @property
     def action_delta_indices(self) -> list:

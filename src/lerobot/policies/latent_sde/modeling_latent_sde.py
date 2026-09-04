@@ -56,6 +56,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
         self._cached_h: Tensor | None = None
         self._steps_until_h_refresh: int = 0
         self._cached_z: Tensor | None = None
+        self._cached_x0: Tensor | None = None
 
         self.model = LatentSDEModel(config)
         self.reset()
@@ -73,6 +74,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
         self._cached_h = None
         self._steps_until_h_refresh = 0
         self._cached_z = None
+        self._cached_x0 = None
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -104,10 +106,14 @@ class LatentSDEPolicy(PreTrainedPolicy):
         if self._cached_h is None or self._steps_until_h_refresh == 0:
             stacked_images = torch.stack(list(self._queues[OBS_IMAGES]), dim=1)
             self._cached_h = self.model.encode_observations({OBS_IMAGES: stacked_images})
-            self._cached_z = self.model.sample_z_from_prior(self._cached_h)
+            # Prior state window (prior_uses_state): the same n_obs proprio frames (oldest→newest) as h.
+            stacked_states = torch.stack(list(self._queues[OBS_STATE]), dim=1)  # (B, n_obs, D)
+            self._cached_z = self.model.sample_z_from_prior(self._cached_h, stacked_states)
+            # Chunk-initial state: the origin for normalize_state (held for the whole refresh window).
+            self._cached_x0 = x_now
             self._steps_until_h_refresh = self.config.n_action_steps
 
-        action = self.model.step(x_now, self._cached_h, self._cached_z, noise=noise)
+        action = self.model.step(x_now, self._cached_h, self._cached_z, x0=self._cached_x0, noise=noise)
         self._steps_until_h_refresh -= 1
         return action
 
@@ -162,11 +168,25 @@ class LatentSDEModel(nn.Module):
         self.state_dim = config.robot_state_feature.shape[0]
         self.action_dim = config.action_feature.shape[0]
 
+        # normalize_state re-origins the drift/posterior inputs to the chunk-initial state x_0. Since
+        # x_0 is a STATE subtracted from the actions too, it requires action_dim == state_dim (holds
+        # for the kinematic-imitation setup, e.g. PushT where action == next EE-pose target).
+        self.normalize_state = config.normalize_state
+        if self.normalize_state and self.action_dim != self.state_dim:
+            raise ValueError(
+                "normalize_state=True requires action_dim == state_dim (x_0 is a state subtracted "
+                f"from actions too); got action_dim={self.action_dim}, state_dim={self.state_dim}."
+            )
+
         # The prior is always p(z|h) (h-conditioned). posterior_uses_h → q(z|traj,h), else q(z|traj)
         # (trajectory-only; the canonical latent-plan VAE — the prior still predicts z from h).
         self.posterior_uses_h = config.use_latent_z and config.posterior_uses_h
         # posterior_uses_state → the traj encoder reads concat([state, action]); else the actions alone.
         self.posterior_uses_state = config.posterior_uses_state
+        # prior_uses_state → the prior also reads the n_obs_steps proprio window, embedded (Linear+Mish)
+        # to the prior hidden dim before concat with h so the low-dim state isn't drowned out by h.
+        self.prior_uses_state = config.use_latent_z and config.prior_uses_state
+        self.prior_state_encoder = None
         if not self.use_latent_z:
             self.z_dim = 0
             self.prior = None
@@ -176,6 +196,14 @@ class LatentSDEModel(nn.Module):
             self.z_dim = config.z_dim
             posterior_hidden = config.z_posterior_hidden_dim or self.h_dim
             prior_hidden = config.z_prior_hidden_dim or self.h_dim
+            # Prior input = h (+ the state window embedded to prior_hidden when prior_uses_state).
+            prior_in_dim = self.h_dim
+            if self.prior_uses_state:
+                self.prior_state_encoder = nn.Sequential(
+                    nn.Linear(config.n_obs_steps * self.state_dim, prior_hidden),
+                    nn.Mish(),
+                )
+                prior_in_dim += prior_hidden
 
             # TCN posterior depth auto-sized so its receptive field (RF ≈ 4·2^L) matches the chunk
             # length (horizon), kernel 3. E.g. horizon 8→1, 16→2, 32→3, 64→4.
@@ -192,7 +220,7 @@ class LatentSDEModel(nn.Module):
                 else:  # "vq"
                     self.num_codes = config.vq_codebook_size
                 self.prior = LatentPriorVQ(
-                    h_dim=self.h_dim,
+                    h_dim=prior_in_dim,
                     codebook_size=self.num_codes,
                     hidden_dim=prior_hidden,
                 )
@@ -225,7 +253,7 @@ class LatentSDEModel(nn.Module):
                     # vq_codebook_size > batch_size, the surplus codes start unseeded — keep K <= batch_size.
             else:
                 self.prior = LatentPrior(
-                    h_dim=self.h_dim,
+                    h_dim=prior_in_dim,
                     z_dim=self.z_dim,
                     hidden_dim=prior_hidden,
                     sigma_activation=config.sigma_activation,
@@ -330,19 +358,38 @@ class LatentSDEModel(nn.Module):
             eps = torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
         return mean + std * eps
 
+    def _prior_input(self, h: Tensor, state_obs: Tensor | None) -> Tensor:
+        """Prior input = h, or concat([h, state embedding]) when prior_uses_state.
+
+        state_obs: (B, n_obs_steps, state_dim) — the causal proprio window (past frames incl. current),
+        the same window as the image h. Flattened and embedded (Linear+Mish) to the prior hidden dim
+        before concat with h. Ignored when prior_uses_state is False.
+        """
+        if not self.prior_uses_state:
+            return h
+        if state_obs is None:
+            raise ValueError("prior_uses_state=True requires `state_obs` for the prior input.")
+        s = self.prior_state_encoder(state_obs.flatten(start_dim=1))
+        return torch.cat([h, s], dim=-1)
+
     def sample_z_from_prior(
         self,
         h: Tensor,
+        state_obs: Tensor | None = None,
         deterministic: bool | None = None,
         generator: torch.Generator | None = None,
     ) -> Tensor | None:
-        """Sample z ~ p(z|h) (Gaussian or VQ-categorical). Returns None when use_latent_z=False."""
+        """Sample z ~ p(z|h[, state]) (Gaussian or VQ-categorical). Returns None when use_latent_z=False.
+
+        state_obs: (B, n_obs_steps, state_dim); required iff prior_uses_state (else ignored).
+        """
         if not self.use_latent_z:
             return None
         if deterministic is None:
             deterministic = self.config.deterministic_z_inference
+        prior_in = self._prior_input(h, state_obs)
         if self.use_vq:
-            logits = self.prior(h)
+            logits = self.prior(prior_in)
             if deterministic:
                 k = logits.argmax(dim=-1)
             else:
@@ -354,7 +401,7 @@ class LatentSDEModel(nn.Module):
                 return self.vq.indices_to_codes(k)
             return self.vq.get_output_from_indices(k)
         else:
-            mu_p, sigma_p = self.prior(h)
+            mu_p, sigma_p = self.prior(prior_in)
             if deterministic:
                 return mu_p
             eps = torch.randn(mu_p.shape, dtype=mu_p.dtype, device=mu_p.device, generator=generator)
@@ -379,6 +426,7 @@ class LatentSDEModel(nn.Module):
         x_now: Tensor,
         h: Tensor,
         z: Tensor | None,
+        x0: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
@@ -387,11 +435,20 @@ class LatentSDEModel(nn.Module):
         Args:
             x_now: (B, state_dim) — the CURRENT state frame. The drift net reads only this single
                    frame (velocity-blind); the residual update is anchored to it.
+            x0: (B, state_dim) chunk-initial state — the origin for normalize_state (subtracted from
+                the drift's net input only; the SDE update stays anchored to the absolute x_now).
+                Required when normalize_state=True.
             noise: (B, action_dim) optional pre-sampled Brownian increment. Mirrors
                    `DiffusionModel.conditional_sample(noise=...)`: when given, replaces the
                    internal `randn`; ignored when `deterministic_inference` is True.
         """
-        net_in, cond = self._drift_inputs(x_now, h, z)
+        if self.normalize_state:
+            if x0 is None:
+                raise ValueError("normalize_state=True requires `x0` (chunk-initial state) in step().")
+            x_in = x_now - x0
+        else:
+            x_in = x_now
+        net_in, cond = self._drift_inputs(x_in, h, z)
         mu = self.net(net_in, cond)
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         return self._sde_step(
@@ -439,14 +496,18 @@ class LatentSDEModel(nn.Module):
             f"vs config.horizon={self.config.horizon}."
         )
 
-        # state_full: (B, H, state_dim). x_seq[k] = state at chunk-tick k (deltas 0..H-1) — the
-        # drift's single-frame input (velocity-blind).
+        # state_full: (B, n_lead + H, state_dim). The trailing H frames (deltas 0..H-1) are the
+        # drift/posterior horizon; when prior_uses_state, n_lead = n_obs-1 leading past frames (deltas
+        # 1-n_obs..-1) precede them so the prior sees the same n_obs window as the image h.
         state_full = batch[OBS_STATE]
-        if state_full.shape[1] != H:
+        n_lead = self.config.n_obs_steps - 1 if self.prior_uses_state else 0
+        if state_full.shape[1] != n_lead + H:
             raise ValueError(
-                f"Expected batch[OBS_STATE] T={H} (horizon); got T={state_full.shape[1]}. "
-                f"Check observation_delta_indices_per_key."
+                f"Expected batch[OBS_STATE] T={n_lead + H} (n_obs-1 + horizon); got "
+                f"T={state_full.shape[1]}. Check observation_delta_indices_per_key."
             )
+        state_obs = state_full[:, : self.config.n_obs_steps]  # (B, n_obs, state_dim) — prior window (clean)
+        state_seq = state_full[:, n_lead:]                    # (B, H, state_dim) — horizon states (clean)
         dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         noise = self.training and self.config.state_noise_std > 0
         std = self.config.state_noise_std * dt**0.5
@@ -457,16 +518,23 @@ class LatentSDEModel(nn.Module):
         # ramps std·√dt/H → std·√dt across chunk ticks 0..H-1 (tick 0 gets std·√dt/H, NOT zero;
         # peak at t=H-1).
         if not noise:
-            state_win = state_full
+            state_win = state_seq
         elif self.config.state_noise_schedule == "linear":
-            delta = torch.arange(H, device=state_full.device, dtype=state_full.dtype)
+            delta = torch.arange(H, device=state_seq.device, dtype=state_seq.dtype)
             std_t = std * (delta + 1) / H                # (H,) std/H at tick 0 → std at tick H-1
-            state_win = state_full + std_t.view(1, -1, 1) * torch.randn_like(state_full)
+            state_win = state_seq + std_t.view(1, -1, 1) * torch.randn_like(state_seq)
         else:  # "uniform"
-            state_win = state_full + std * torch.randn_like(state_full)
+            state_win = state_seq + std * torch.randn_like(state_seq)
 
         x_seq = state_win                                    # (B, H, state_dim) — noised anchor; drift's frame
-        x_seq_clean = state_full                             # (B, H, state_dim) — clean demo anchor x_k
+        x_seq_clean = state_seq                              # (B, H, state_dim) — clean demo anchor x_k
+
+        # normalize_state: re-origin the drift input and the posterior traj to the chunk-initial demo
+        # state x_0 (clean — the training analog of the inference-time cached measured state). x_0 is
+        # subtracted from the drift's per-tick state, the posterior state path, and the posterior
+        # actions (all displacements from chunk start). The velocity target (a−x)/dt is translation-
+        # invariant so it is left absolute; likewise the SDE update anchors to the absolute x_seq.
+        x0 = state_seq[:, :1] if self.normalize_state else None  # (B, 1, state_dim)
 
         h = self.encode_observations(batch)                  # (B, cond_dim)
 
@@ -489,19 +557,27 @@ class LatentSDEModel(nn.Module):
             # action is always the clean demo action). "clean" ⇒ same demo → same z regardless of the
             # train-time state-noise; "noisy" ⇒ legacy (the same noised state the drift reads).
             post_state = x_seq_clean if self.config.posterior_state == "clean" else x_seq
+            # normalize_state → re-origin the posterior state path AND actions to x_0 (displacements).
+            post_action = action_target
+            if self.normalize_state:
+                post_state = post_state - x0
+                post_action = action_target - x0
             # posterior_uses_state → encode concat([state, action]); else the action trajectory alone.
             traj = (
-                torch.cat([post_state, action_target], dim=-1)
+                torch.cat([post_state, post_action], dim=-1)
                 if self.posterior_uses_state
-                else action_target
+                else post_action
             )
             valid_mask = valid                               # (B, H); ~action_is_pad when masking
             # pass h to the posterior only when posterior_uses_h (else q(z | traj) — trajectory-only).
             posterior_args = (traj, valid_mask, h) if self.posterior_uses_h else (traj, valid_mask)
 
+            # prior input = h (+ the causal n_obs state window when prior_uses_state).
+            prior_in = self._prior_input(h, state_obs)
+
             if self.use_vq:
                 # 2-stage VQ-VAE spirit: prior is a pure observer of h — don't let its CE shape the encoder.
-                prior_logits = self.prior(h.detach())
+                prior_logits = self.prior(prior_in)
                 z_e = self.posterior(*posterior_args)
                 if self.config.quantizer == "fsq":
                     # FSQ: STE through the fixed grid — no learnable codebook, no commitment loss.
@@ -517,7 +593,7 @@ class LatentSDEModel(nn.Module):
                 vq_prior_ce_per_sample = F.cross_entropy(prior_logits, vq_indices.detach(), reduction="none")  # (B,)
                 mu_p = sigma_p = mu_q = sigma_q = None
             else:
-                mu_p, sigma_p = self.prior(h)
+                mu_p, sigma_p = self.prior(prior_in)
                 mu_q, sigma_q = self.posterior(*posterior_args)
                 eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
                 z_q = mu_q + sigma_q * eps_z
@@ -525,7 +601,9 @@ class LatentSDEModel(nn.Module):
             mu_p = sigma_p = mu_q = sigma_q = None
             z_q = None
 
-        flat_x = x_seq.reshape(B * H, self.state_dim)        # current frame per tick (velocity-blind)
+        # normalize_state → the drift reads the displacement x_k − x_0 (not the absolute state).
+        x_seq_net = x_seq - x0 if self.normalize_state else x_seq
+        flat_x = x_seq_net.reshape(B * H, self.state_dim)    # current frame per tick (velocity-blind)
         flat_h = h.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
         flat_z = None
         if self.use_latent_z:
@@ -615,7 +693,7 @@ class LatentSDEModel(nn.Module):
                 # posterior's recon gain transfers to deployment only if this stays near recon_loss; if
                 # it rises toward the rolled (mismatched-z) level, the gain is posterior LEAKAGE — z
                 # encodes trajectory info the prior can't reproduce. prior_recon_gap = the deploy penalty.
-                z_prior = self.sample_z_from_prior(h)  # (B, z_dim), deploy prior distribution
+                z_prior = self.sample_z_from_prior(h, state_obs)  # (B, z_dim), deploy prior distribution
                 flat_z_prior = z_prior.unsqueeze(1).expand(B, H, -1).reshape(B * H, -1)
                 net_in_p, cond_p = self._drift_inputs(flat_x, flat_h, flat_z_prior)
                 mu_prior = self.net(net_in_p, cond_p).reshape(B, H, action_dim)
@@ -678,7 +756,8 @@ class LatentSDEModel(nn.Module):
 # z conditions the drift net via FiLM alongside h (cond = concat([h, z])); the net input is x_aug only.
 
 class LatentPrior(nn.Module):
-    """p(z | h) — 2-layer MLP producing (μ_p, σ_p) from the image-only conditioning h."""
+    """p(z | h[, state]) — 2-layer MLP producing (μ_p, σ_p) from the prior input (image h, plus the
+    n_obs proprio window embedded to prior_hidden when prior_uses_state). `h_dim` is the combined input width."""
 
     def __init__(
         self,
@@ -711,9 +790,11 @@ class LatentPrior(nn.Module):
 
 
 class LatentPriorVQ(nn.Module):
-    """p(k | h) over codebook indices, parameterised as a 2-layer MLP classifier.
+    """p(k | h[, state]) over codebook indices, parameterised as a 2-layer MLP classifier.
 
-    Trained via CE against the posterior's (detached) index. Head init zeros → uniform prior at init.
+    Input is the image h, plus the n_obs proprio window embedded to prior_hidden when prior_uses_state
+    (`h_dim` is the combined input width). Trained via CE against the posterior's (detached) index. Head
+    init zeros → uniform prior at init.
     """
 
     def __init__(self, h_dim: int, codebook_size: int, hidden_dim: int):
@@ -775,7 +856,8 @@ class _TrajEncoder(nn.Module):
 
 
 class LatentPosteriorTraj(nn.Module):
-    """q(z | x_{0:T}, a_{0:T}, [h]) — (state, action)-traj encoder pooled feats (concat h iff h_dim>0) → (μ, σ).
+    """q(z | x_{0:T}, a_{0:T}, [h]) — (state, action)-traj encoder pooled feats (concat h iff h_dim>0)
+    → 2-layer MLP trunk → (μ, σ) heads (same trunk+heads shape as LatentPrior).
 
     Concats the chunk h when h_dim>0 (posterior_uses_h); h_dim=0 → trajectory-only.
     """
@@ -795,9 +877,16 @@ class LatentPosteriorTraj(nn.Module):
         self.sigma_act = _sigma_act(sigma_activation)
         self.sigma_min = sigma_min
         self.encoder = _TrajEncoder(input_dim, hidden_dim, num_levels, n_groups)
+        # 2-layer MLP trunk over [traj feature ⊕ h] before the heads (mirrors LatentPrior).
         head_in = hidden_dim + h_dim
-        self.mu_head = nn.Linear(head_in, z_dim)
-        self.sigma_head = nn.Linear(head_in, z_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(head_in, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Mish(),
+        )
+        self.mu_head = nn.Linear(hidden_dim, z_dim)
+        self.sigma_head = nn.Linear(hidden_dim, z_dim)
         nn.init.zeros_(self.sigma_head.weight)
         nn.init.zeros_(self.sigma_head.bias)
 
@@ -805,13 +894,15 @@ class LatentPosteriorTraj(nn.Module):
         feat = self.encoder(traj, valid_mask)
         if h is not None:
             feat = torch.cat([feat, h], dim=-1)
+        feat = self.trunk(feat)
         mu = self.mu_head(feat)
         sigma = self.sigma_act(self.sigma_head(feat)) + self.sigma_min
         return mu, sigma
 
 
 class LatentPosteriorTrajVQ(nn.Module):
-    """Deterministic VQ posterior — (state, action)-traj encoder pooled feats (concat h iff h_dim>0) → z_e."""
+    """Deterministic VQ posterior — (state, action)-traj encoder pooled feats (concat h iff h_dim>0)
+    → 2-layer MLP trunk → z_e head (same trunk+head shape as LatentPriorVQ)."""
 
     def __init__(
         self,
@@ -824,13 +915,21 @@ class LatentPosteriorTrajVQ(nn.Module):
     ):
         super().__init__()
         self.encoder = _TrajEncoder(input_dim, hidden_dim, num_levels, n_groups)
-        self.head = nn.Linear(hidden_dim + h_dim, z_dim)
+        # 2-layer MLP trunk over [traj feature ⊕ h] before the head (mirrors LatentPriorVQ).
+        head_in = hidden_dim + h_dim
+        self.trunk = nn.Sequential(
+            nn.Linear(head_in, hidden_dim),
+            nn.Mish(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Mish(),
+        )
+        self.head = nn.Linear(hidden_dim, z_dim)
 
     def forward(self, traj: Tensor, valid_mask: Tensor, h: Tensor | None = None) -> Tensor:
         feat = self.encoder(traj, valid_mask)
         if h is not None:
             feat = torch.cat([feat, h], dim=-1)
-        return self.head(feat)
+        return self.head(self.trunk(feat))
 
 
 def _masked_mean_pool(h: Tensor, valid_mask: Tensor) -> Tensor:
