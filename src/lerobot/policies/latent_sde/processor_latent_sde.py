@@ -5,6 +5,8 @@
 # is identical to DP's. Kept as its own factory function so that future LatentSDE-
 # specific steps (e.g. wrench input scaling for the §4 controller-pushforward objective)
 # have an obvious home.
+# The so3_r3_body mode keeps raw dataset state/action values with IDENTITY normalization;
+# pose conversion belongs to the model, not the statistical normalizer.
 
 from typing import Any
 
@@ -13,10 +15,12 @@ import torch
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
+    NewLineTaskProcessorStep,
     NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     RenameObservationsProcessorStep,
+    TokenizerProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
@@ -35,8 +39,11 @@ def make_latent_sde_pre_post_processors(
 ]:
     """Build pre- and post-processor pipelines for the latent-SDE policy.
 
-    Pre: rename obs (no-op) → add batch dim → move to device → normalize state/image/action.
+    Pre: rename obs (no-op) → add batch dim → optional VLM task tokenization → move to device
+    → normalize state/image/action.
     Post: unnormalize action → move to CPU.
+
+    In so3_r3_body mode, the caller keeps raw state/action normalization at IDENTITY.
     """
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
@@ -48,6 +55,16 @@ def make_latent_sde_pre_post_processors(
             stats=dataset_stats,
         ),
     ]
+    if config.context_encoder == "smolvlm2":
+        input_steps[2:2] = [
+            NewLineTaskProcessorStep(),
+            TokenizerProcessorStep(
+                tokenizer_name=config.vlm_model_name,
+                padding="longest",
+                padding_side="right",
+                max_length=config.tokenizer_max_length,
+            ),
+        ]
     output_steps = [
         UnnormalizerProcessorStep(
             features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats

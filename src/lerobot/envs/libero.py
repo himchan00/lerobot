@@ -377,9 +377,18 @@ class LiberoEnv(gym.Env):
         truncated = False
         return observation, reward, terminated, truncated, info
 
-    def close(self):
+    def close(self) -> None:
         if self._env is not None:
             self._env.close()
+            self._env = None
+
+
+class _LiberoSyncVectorEnv(gym.vector.SyncVectorEnv):
+    """Allow repeated evaluation while releasing each round's recreated simulators."""
+
+    def reset(self, **kwargs: Any) -> tuple[Any, dict[str, Any]]:
+        self.closed = False
+        return super().reset(**kwargs)
 
 
 def _make_env_fns(
@@ -466,6 +475,8 @@ def create_libero_envs(
         print(f"Restricting to task_ids={task_ids_filter}")
 
     is_async = env_cls is gym.vector.AsyncVectorEnv
+    if env_cls is gym.vector.SyncVectorEnv:
+        env_cls = _LiberoSyncVectorEnv
 
     out: dict[str, dict[int, Any]] = defaultdict(dict)
     for suite_name in suite_names:

@@ -37,6 +37,27 @@ export MUJOCO_GL=egl  # for headless servers (HPC, cloud)
 
 </Tip>
 
+### Noninteractive headless setup
+
+For unattended jobs, initialize LIBERO before its first import and pre-download the simulator
+assets. The setup module uses a pinned `lerobot/libero-assets` snapshot in
+`~/.cache/libero/assets`, creates `~/.libero/config.yaml` without prompting, and preserves an
+existing configuration. Set `LIBERO_CONFIG_PATH` to a new directory if an existing configuration
+points at a different Python installation. The assets are separate from the training dataset.
+
+```bash
+uv sync --locked --extra libero --extra training --extra smolvla --extra latent_sde --extra diffusion
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+uv run --no-sync python -m lerobot.scripts.lerobot_setup_libero --check
+```
+
+`--check` resets, steps and renders the first task of each standard suite; it does not evaluate a
+policy. A rendering or asset error stops setup rather than silently disabling evaluation.
+Ubuntu containers need `libegl1`, `libgl1`, `libgles2` and `ffmpeg`, plus access to the host's NVIDIA
+graphics driver. Set `NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics` when launching the
+container, not only after it has started.
+
 ## Evaluation
 
 ### Default evaluation (recommended)
@@ -145,6 +166,170 @@ lerobot-train \
   --eval.n_episodes=1 \
   --env_eval_freq=1000
 ```
+
+### Periodic performance logging in AMLT
+
+`amlt/libero.yaml` prepares the headless simulator and assets before each training job starts.
+All three jobs save checkpoints and evaluate every **5,000 updates** over
+`libero_spatial,libero_object,libero_goal,libero_10`, with **one episode per task** (40 total).
+Evaluation uses the normal suite episode limits and 256x256 camera observations. One synchronous
+environment and one task run at a time to limit simulator resources; the training loop pauses for
+evaluation. Each task's simulator is closed after evaluation and recreated lazily on the next
+evaluation reset, so later evaluations do not reuse a closed simulator or keep all tasks resident.
+This low-episode evaluation is a noisy training monitor, not a replacement for a
+higher-episode benchmark evaluation. Restrict `env.task`/`env.task_ids` for cheaper monitoring,
+and label those results as a task subset.
+
+W&B records the overall `eval/pc_success`, `eval/avg_sum_reward`, and `eval/eval_s`.
+Per-suite results remain available in the trainer's console logs after the full evaluation.
+`eval/video` contains a rollout clip; all rendered clips remain under the job's
+`train/eval/videos_step_<step>` output directory. Metrics and video are logged after the full
+evaluation completes; W&B may finalize that history row at the next training log. There is no
+need to wait for all training to finish. Partial evaluations do not produce overall W&B metrics.
+Checkpoints are saved before evaluation; resuming restores training state, not an interrupted evaluation.
+Held-out dataset loss is separate and remains disabled unless `dataset.eval_split` and
+`eval_steps` are configured.
+
+W&B initializes before dataset preparation, so a run may exist without any training metrics.
+Follow AMLT stdout to distinguish dataset downloads from training and evaluation. W&B log
+resumption does not accelerate downloads or restore model state.
+
+For a bounded local integration run in the `lerobot` conda environment, first run setup:
+
+```bash
+conda run --no-capture-output -n lerobot \
+  uv run --no-sync python -m lerobot.scripts.lerobot_setup_libero --check
+```
+
+Then run one training update and a two-step rollout with offline W&B logging:
+
+```bash
+conda run --no-capture-output -n lerobot env MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
+  uv run --no-sync lerobot-train \
+    --policy.type=smolvla --policy.load_vlm_weights=true --policy.push_to_hub=false \
+    --dataset.repo_id=HuggingFaceVLA/libero \
+    --dataset.revision=86958911c0f959db2bbbdb107eb3e17c5f9c798e \
+    --dataset.episodes='[0]' \
+    --env.type=libero --env.task=libero_spatial --env.task_ids='[0]' \
+    --env.observation_height=256 --env.observation_width=256 --env.episode_length=2 \
+    --env_eval_freq=1 --eval.n_episodes=1 --eval.batch_size=1 --eval.use_async_envs=false \
+    --steps=1 --batch_size=1 --num_workers=0 --persistent_workers=false \
+    --log_freq=1 --save_checkpoint=false \
+    --wandb.enable=true --wandb.mode=offline --wandb.disable_artifact=true \
+    --output_dir=outputs/train/libero_eval_smoke
+```
+
+Use a fresh output directory on each run. These short rollouts only exercise training, simulation,
+and logging; their success rate is not a meaningful benchmark score. The same overrides can be
+applied to the Latent-SDE command in `amlt/libero.yaml` without changing its policy settings.
+`uv run --no-sync` uses the repository's existing Python environment while conda supplies local
+tools such as FFmpeg. Offline W&B runs and videos are retained in the selected output directory;
+the AMLT jobs keep online W&B logging enabled.
+
+### Resuming an interrupted AMLT job
+
+Restarting an AMLT job does not itself enable LeRobot checkpoint restoration. The jobs in
+`amlt/libero.yaml` now detect `train/checkpoints/last`, require nonempty model/config and
+optimizer/scheduler/RNG/step files, and append `--resume=true` and `--config_path` automatically.
+The current YAML's explicit options, including environment evaluation, still override the saved
+training configuration. The trainer's existing-output protection remains enabled.
+
+If an interrupted run created `train` but never created `train/checkpoints`, its output is moved to
+a unique `$AMLT_OUTPUT_DIR/train-aborted.*/train` backup before starting again at **step 0**.
+The startup log explicitly distinguishes this fresh restart from checkpoint resume, and clears
+AMLT's inherited `WANDB_RUN_ID`/`WANDB_RESUME` when a new training history is needed.
+For a preparation-only attempt with the same comparison version, startup resolves the previous
+online run from `wandb/latest-run` and checks its W&B history. If it has no history rows and its
+configured output directory matches this job, startup reuses that ID with `WANDB_RESUME=must`.
+Only W&B logging resumes: model training still starts at **step 0**, without `--resume=true`.
+Runs that already have history, or lack compatible local run metadata, get a new ID so independent
+training curves are not mixed. A W&B lookup failure stops before archiving or training rather than
+assuming the run is empty.
+If a checkpoint directory exists but `last` is missing, broken or incomplete, the job still stops
+without moving or deleting results. In particular, a missing `last` link is not treated as permission
+to discard numbered checkpoints.
+
+The LIBERO recipe sets `save_freq=5000`; the global training default remains 20,000. An interruption
+before the first checkpoint still cannot restore training progress. If training has already
+logged training history but no checkpoint was saved, a fresh restart intentionally creates another
+run rather than mixing independent training histories. A complete checkpoint instead restores the
+saved W&B run ID with strict resume. Aborting a job does not itself save a checkpoint; only
+previously saved steps can be resumed. More frequent checkpoints increase storage use.
+
+The equivalent explicit resume command inside a job is:
+
+```bash
+uv run --no-sync lerobot-train \
+  --config_path="$AMLT_OUTPUT_DIR/train/checkpoints/last/pretrained_model/train_config.json" \
+  --resume=true \
+  --output_dir="$AMLT_OUTPUT_DIR/train"
+```
+
+Add the environment/evaluation options above if the saved configuration predates evaluation setup.
+Editing the local YAML does not rewrite commands already stored in an existing AMLT experiment;
+these settings apply to future submissions. Existing experiments and W&B histories are not
+changed or merged automatically.
+
+### Geometry-aware Latent-SDE actions
+
+The body-frame mode is `so3_r3_body`. If reusing the earlier `latent_sde_so3_libero` preset in
+`amlt/libero.yaml`, change its application argument from `--policy.sde_geometry=so3_r3` to
+`--policy.sde_geometry=so3_r3_body` and start a fresh run; do not resume old pose weights.
+Keep its remaining comparison settings, including `state_noise_std=0`, unless augmentation
+is an intentional experimental change.
+
+The optional `latent_sde` pose mode uses `SO(3) × R³` geometry for the LIBERO
+end-effector pose. Enable it with these training options:
+
+```bash
+--policy.type=latent_sde \
+--policy.sde_geometry=so3_r3_body \
+--policy.action_representation=delta_state \
+--policy.normalization_mapping='{"VISUAL":"MEAN_STD","STATE":"IDENTITY","ACTION":"IDENTITY"}' \
+--policy.sde_dt=0.1 \
+--policy.action_anchor=nearest \
+--policy.state_noise_std=0.1
+```
+
+This example uses the default ResNet context encoder. For `context_encoder=smolvlm2`,
+keep its existing camera/tokenizer settings and use `VISUAL=IDENTITY` as well.
+The dataset interface remains the raw 8D state and 7D action described above. Keep
+`STATE` and `ACTION` normalization at `IDENTITY`: pose conversion happens inside the
+policy, with position/finger values plus a 6D rotation representation for its 11 state features.
+With the default `normalize_state=True`, the drift reads position `R0.T @ (p - p0)` and
+rotation `R0.T @ R` relative to the clean chunk-start pose. Finger positions and the joint
+observation context stay absolute. The reference is held until the next context refresh;
+`normalize_state=False` opts out of this drift-input transformation.
+
+Delta actions already represent increments, so the posterior retains the clean 7D commands
+without subtracting an 8D state. Body drift outputs and controller conversion still use the
+current measured pose, not the chunk-start reference. The fixed 0.05 m / 0.5 rad per-command
+conversion lives inside geometry; no pose-scale settings are needed.
+
+`nearest` preserves the clean action's nominal endpoint, then recomputes the body-local
+pose increment from the perturbed query state. Candidate selection uses only the squared
+local pose increment norm; finger distance is not part of that metric. `state_noise_std`
+and the existing schedule provide one six-dimensional Gaussian in those same normalized
+body-controller units. The body action variance stays diagonal per output coordinate;
+Euclidean mode still uses the scalar variance path.
+
+Sampling also uses one ordinary Gaussian body increment before the usual controller
+clipping. The likelihood remains a **local tangent approximation**, not a globally
+normalized manifold density. Evaluation still requires LIBERO `control_mode=relative`
+and `obs_type=pixels_agent_pos`; those are caller preconditions, not factory checks.
+
+<Tip warning={true}>
+  The nominal endpoint is not the observed next pose. In particular, robosuite's
+  zero angular command can retain the previous controller orientation goal
+  rather than replacing it with the measured orientation. Also, dataset FPS,
+  `sde_dt`, and the simulator's control frequency are distinct: changing
+  `sde_dt` does not change LIBERO's control frequency. This geometry option
+  leaves the current Euclidean Latent-SDE path and its checkpoint keys
+  unchanged. Body-mode weights must be trained for `so3_r3_body`; legacy
+  `so3_r3` weights use a different decoder and are rejected. Saved configs must
+  omit the removed geometry-specific fields; they are not automatically
+  migrated.
+</Tip>
 
 ## Reproducing published results
 

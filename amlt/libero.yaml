@@ -1,0 +1,221 @@
+# yaml-language-server: $schema=file:///home/v-hihwang/lerobot/.vscode/amlt-config.schema.json
+# ^ Update with: amlt schema add <file>  |  VS Code: Run Task > amlt
+description: LIBERO training with periodic four-suite evaluation for SmolVLA and Latent-SDE.
+
+target:
+  service: manifold  # run "amlt target list manifold" to see available targets
+  name: msrresrchbasicvc
+  workspace_name: wsgcrrbt  # the Singularity workspace to submit to
+
+environment:
+  image: amlt-sing/acpt-torch2.8.x-py3.10-cuda12.6-ubuntu22.04
+  env:
+    MUJOCO_GL: egl
+    PYOPENGL_PLATFORM: egl
+    NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+    # Preserve the baseline's no-AMP training/eval; the frozen VLM still loads in BF16.
+    ACCELERATE_MIXED_PRECISION: "no"
+  setup:
+    - |
+      set -e
+      if [ "$$(id -u)" -eq 0 ]; then
+        apt-get update && apt-get install -y --no-install-recommends libegl1 libgl1 libgles2 ffmpeg
+      else
+        sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1 libgl1 libgles2 ffmpeg
+      fi
+    - python -m pip install uv
+    - uv sync --locked --python 3.12 --extra smolvla --extra latent_sde --extra training --extra diffusion --extra libero
+    - uv run --no-sync python -m lerobot.scripts.lerobot_setup_libero --check
+
+code:
+  local_dir: $CONFIG_DIR/..
+  ignore:
+    - "*"
+    - "!src/"
+    - "!src/lerobot/"
+    - "!src/lerobot/**"
+    - "src/*.egg-info/**"
+    - "!pyproject.toml"
+    - "!setup.py"
+    - "!uv.lock"
+    - "!README.md"
+    - "!LICENSE"
+
+jobs:
+  - name: smolvla_libero
+    sku: 80G1-A100
+    submit_args:
+      env:
+        WANDB_API_KEY: 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
+    command:
+      - &resume_setup |
+        set -e
+        OUTPUT_DIR="$$AMLT_OUTPUT_DIR/train"
+        CHECKPOINT_DIR="$$OUTPUT_DIR/checkpoints/last"
+        # New batch size, video dataset, and body-frame geometry require a fresh experiment.
+        # Bump this version for incompatible recipe changes; never relabel old checkpoints.
+        COMPARISON_VERSION=smolvla-aligned-1obs-50steps-b64-video-relative-v3
+        COMPARISON_FILE="$$AMLT_OUTPUT_DIR/libero-comparison-version"
+        WANDB_PROJECT=lerobot_libero
+        RESUME_FLAGS=()
+        if [ -f "$$CHECKPOINT_DIR/pretrained_model/train_config.json" ]; then
+          for checkpoint_file in \
+            pretrained_model/config.json \
+            pretrained_model/model.safetensors \
+            pretrained_model/train_config.json \
+            training_state/training_step.json \
+            training_state/rng_state.safetensors \
+            training_state/optimizer_param_groups.json \
+            training_state/optimizer_state.safetensors \
+            training_state/scheduler_state.json; do
+            if [ ! -s "$$CHECKPOINT_DIR/$$checkpoint_file" ]; then
+              echo "[ERROR] Incomplete checkpoint: missing or empty $$CHECKPOINT_DIR/$$checkpoint_file" >&2
+              exit 1
+            fi
+          done
+          if [ ! -f "$$COMPARISON_FILE" ] \
+            || [ "$$(cat -- "$$COMPARISON_FILE")" != "$$COMPARISON_VERSION" ]; then
+            echo "[ERROR] Checkpoint is not from this aligned LIBERO comparison; existing results were preserved." >&2
+            echo "[ERROR] Use a new experiment name; old model/normalization/optimizer states cannot be resumed." >&2
+            exit 1
+          fi
+          echo "[INFO] Resuming training from $$CHECKPOINT_DIR"
+          RESUME_FLAGS=(--resume=true "--config_path=$$CHECKPOINT_DIR/pretrained_model/train_config.json")
+        elif [ -d "$$OUTPUT_DIR" ] && [ ! -L "$$OUTPUT_DIR" ] \
+          && [ ! -e "$$OUTPUT_DIR/checkpoints" ] && [ ! -L "$$OUTPUT_DIR/checkpoints" ]; then
+          WANDB_LOG_RESUME_ID=""
+          if [ -d "$$OUTPUT_DIR/wandb/latest-run" ] \
+            && [ -f "$$COMPARISON_FILE" ] \
+            && [ "$$(cat -- "$$COMPARISON_FILE")" = "$$COMPARISON_VERSION" ]; then
+            WANDB_LOG_RESUME_ID=$$(uv run --no-sync python -c '
+        import os
+        import re
+        import sys
+        from pathlib import Path
+        import wandb
+
+        output_dir = Path(sys.argv[1])
+        run_dir = (output_dir / "wandb/latest-run").resolve()
+        match = re.fullmatch(r"run-\d{8}_\d{6}-([A-Za-z0-9_.-]+)", run_dir.name)
+        if match is None:
+            raise RuntimeError(f"Cannot identify the previous W&B run from {run_dir}")
+        api = wandb.Api(timeout=30)
+        entity = os.environ.get("WANDB_ENTITY") or api.default_entity
+        run = api.run(f"{entity}/{sys.argv[2]}/{match[1]}")
+        if run.config.get("output_dir") != str(output_dir):
+            raise RuntimeError("Previous W&B run belongs to a different output directory")
+        if next(iter(run.scan_history(page_size=1)), None) is None:
+            print(run.id)
+        ' "$$OUTPUT_DIR" "$$WANDB_PROJECT")
+          fi
+          BACKUP_DIR=$$(mktemp -d "$$AMLT_OUTPUT_DIR/train-aborted.XXXXXXXX")
+          mv -- "$$OUTPUT_DIR" "$$BACKUP_DIR/train"
+          echo "[WARNING] No checkpoint was saved. Previous output preserved in $$BACKUP_DIR/train"
+          if [ -n "$$WANDB_LOG_RESUME_ID" ]; then
+            export WANDB_RUN_ID="$$WANDB_LOG_RESUME_ID" WANDB_RESUME=must
+            echo "[INFO] Resuming empty W&B run $$WANDB_RUN_ID; training restarts at step 0, not from a checkpoint."
+          else
+            unset WANDB_RUN_ID WANDB_RESUME
+            echo "[WARNING] Restarting from step 0 with a new W&B run; this is not checkpoint resume."
+          fi
+        elif [ -e "$$OUTPUT_DIR" ] || [ -L "$$OUTPUT_DIR" ]; then
+          echo "[ERROR] No resumable checkpoint in $$OUTPUT_DIR; existing results were preserved." >&2
+          echo "[ERROR] Use a new experiment name for fresh training, or restore a complete checkpoint." >&2
+          exit 1
+        else
+          echo "[INFO] Starting fresh training at $$OUTPUT_DIR"
+        fi
+        printf '%s\n' "$$COMPARISON_VERSION" > "$$COMPARISON_FILE"
+      - &comparison_setup |
+        # A shared local snapshot pins both the backbone AND tokenizer, including SmolVLA.
+        VLM_MODEL_ID=HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+        VLM_MODEL_REVISION=7b375e1b73b11138ff12fe22c8f2822d8fe03467
+        VLM_MODEL_DIR=$$(uv run --no-sync python -c '
+        import sys
+        from huggingface_hub import snapshot_download
+        print(snapshot_download(sys.argv[1], revision=sys.argv[2]))
+        ' "$$VLM_MODEL_ID" "$$VLM_MODEL_REVISION")
+        COMPARISON_FLAGS=(
+          "--policy.vlm_model_name=$$VLM_MODEL_DIR"
+          --policy.push_to_hub=false
+          --batch_size=64
+          --save_freq=5000
+          --env_eval_freq=20000
+          --dataset.repo_id=lerobot/libero
+          --dataset.revision=a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4
+          # Avoid platform-dependent automatic fallback to another decoder.
+          --dataset.video_backend=torchcodec
+          --env.type=libero
+          --env.task=libero_spatial,libero_object,libero_goal,libero_10
+          --env.observation_height=256
+          --env.observation_width=256
+          --eval.n_episodes=1
+          --eval.use_async_envs=false
+          "--output_dir=$$OUTPUT_DIR"
+          --wandb.enable=true
+          "--wandb.project=$$WANDB_PROJECT"
+        )
+      - |
+        uv run --no-sync lerobot-train \
+          --policy.type=smolvla \
+          --policy.load_vlm_weights=true \
+          "$${COMPARISON_FLAGS[@]}" \
+          "$${RESUME_FLAGS[@]}"
+
+  - name: latent_sde_libero
+    sku: 80G1-A100
+    submit_args: &latent_sde_submit_args
+      env:
+        WANDB_API_KEY: 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
+    command:
+      - *resume_setup
+      - *comparison_setup
+      - &latent_sde_setup |
+        # Match supervision/refresh budgets, not control semantics: SDE still uses per-tick
+        # state feedback, whereas SmolVLA executes its 50-action chunk open-loop.
+        LATENT_SDE_FLAGS=(
+          --policy.context_encoder=smolvlm2
+          --policy.conditioning=token_kv
+          --policy.action_representation=delta_state
+          --policy.n_obs_steps=1
+          --policy.horizon=50
+          --policy.n_action_steps=50
+          --policy.do_mask_loss_for_padding=true
+          --policy.state_noise_std=0
+          # SmolVLA uses its native preset; only Latent-SDE needs these overrides.
+          --use_policy_training_preset=false
+          --optimizer.type=adamw
+          --optimizer.lr=1e-4
+          --optimizer.betas='[0.9,0.95]'
+          --optimizer.weight_decay=1e-10
+          --scheduler.type=cosine_decay_with_warmup
+          --scheduler.num_warmup_steps=1000
+          --scheduler.num_decay_steps=30000
+          --scheduler.peak_lr=1e-4
+          --scheduler.decay_lr=2.5e-6
+        )
+      - |
+        uv run --no-sync lerobot-train \
+          --policy.type=latent_sde \
+          --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"MEAN_STD","ACTION":"MEAN_STD"}' \
+          "$${COMPARISON_FLAGS[@]}" \
+          "$${LATENT_SDE_FLAGS[@]}" \
+          "$${RESUME_FLAGS[@]}"
+
+  - name: latent_sde_so3_libero
+    sku: 80G1-A100
+    submit_args: *latent_sde_submit_args
+    command:
+      - *resume_setup
+      - *comparison_setup
+      - *latent_sde_setup
+      # Body-frame SO3 requires raw physical STATE/ACTION units; legacy so3_r3 is unsupported.
+      - |
+        uv run --no-sync lerobot-train \
+          --policy.type=latent_sde \
+          --policy.sde_geometry=so3_r3_body \
+          --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"IDENTITY","ACTION":"IDENTITY"}' \
+          --job_name=latent_sde_so3_libero \
+          "$${COMPARISON_FLAGS[@]}" \
+          "$${LATENT_SDE_FLAGS[@]}" \
+          "$${RESUME_FLAGS[@]}"

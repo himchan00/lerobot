@@ -505,6 +505,17 @@ def eval_policy(
         mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
         # Extend metrics.
         batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
+        # Don't penalise early (successful) termination. PushT ends the instant coverage clears the
+        # success threshold, so a fast success accrues fewer reward steps than a slow run and scores
+        # lower under a raw sum. Credit the steps after the terminating step with the terminal
+        # (success) reward — as if the achieved coverage were held to max_steps. Non-success episodes
+        # (including truncation at max_steps, where held_steps == 0) are left unchanged.
+        episode_succeeded = einops.reduce(rollout_data["success"] * mask, "b n -> b", "any")
+        terminal_reward = rollout_data["reward"].gather(1, done_indices[:, None]).squeeze(1)
+        held_steps = (n_steps - (done_indices + 1)).clamp(min=0).to(terminal_reward.dtype)
+        batch_sum_rewards = batch_sum_rewards + torch.where(
+            episode_succeeded, terminal_reward * held_steps, torch.zeros_like(terminal_reward)
+        )
         sum_rewards.extend(batch_sum_rewards.tolist())
         batch_max_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "max")
         max_rewards.extend(batch_max_rewards.tolist())

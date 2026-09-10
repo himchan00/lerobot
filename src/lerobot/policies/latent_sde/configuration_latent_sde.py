@@ -4,7 +4,7 @@
 # "Latent-SDE Policies for Hierarchical Robot Manipulation" (research_brief.md v7).
 #
 # PoC scope:
-#   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|h, x_seq, a_seq);
+#   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|a_seq);
 #     drift/diffusion net reads z as FiLM cond alongside h (cond = concat([h, z])); net input is x_aug only;
 #   * free-space Euler-Maruyama log-likelihood (research_brief.md §3.7) + KL[q||p] (β-VAE).
 #
@@ -15,7 +15,6 @@
 # Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the SDE
 # is integrated one step at a time on the measured state x.
 
-import warnings
 from dataclasses import dataclass, field
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
@@ -33,34 +32,31 @@ class LatentSDEConfig(PreTrainedConfig):
 
     SDE roles (research_brief.md §1.2, §3):
         x  — measured robot state (proprio). Push-T: 2-D `observation.state` (agent_pos).
-             The drift/diffusion net reads **all n_obs_steps frames flattened** (augmented
-             input, mirrors DP's state branch) so it has access to first-differences ≈
-             velocity; the Euler-Maruyama residual is still anchored to the most recent
-             frame (`mean = s_t + μ·dt`). Fed at every Tier-2 tick. At training time the
-             chunk's x_seq is sampled directly from the dataset (see
-             `observation_delta_indices_per_key`), matching the deployment-time stream.
-        h  — perception conditioning (Tier-1). Image features only in this PoC: vision
-             encoder output stacked over `n_obs_steps` frames, flattened, fed via FiLM.
-             Refreshed every `n_action_steps` ticks so the vision-encoder duty cycle
+             The drift/diffusion net reads the current frame on every Tier-2 tick. In target-state
+             mode, the Euler-Maruyama residual is anchored to that frame (`mean = s_t + μ·dt`).
+             At training time the trailing horizon states are sampled directly from the dataset
+             (see `observation_delta_indices_per_key`), matching the deployment-time stream.
+        h  — joint observation conditioning (Tier-1). ResNet image features are concatenated
+             with an embedding of the causal state window. SmolVLM2 receives image-language
+             tokens plus one projected token per causal state frame, ordered oldest to newest.
+             Refreshed every `n_action_steps` ticks so the context-encoder duty cycle
              matches DiffusionPolicy's (fair compute) and the Tier-1/Tier-2 rate split
              is reproduced architecturally. cf. notes/h_is_conditioning.tex
         z  — per-episode latent strategy. CVAE-style: prior p(z|h) is re-sampled at
              deployment **in lock-step with every h refresh** ("episode" =
              one h-refresh window), committing each chunk to one mode. At training,
-             posterior q(z|h, x_seq, a_seq) provides chunk-level mode signal; loss = NLL +
+             posterior q(z|a_seq) provides chunk-level mode signal; loss = NLL +
              beta · KL[q||p]. z conditions the drift net via FiLM alongside h
              (cond = concat([h, z])); the drift/diffusion block structure is unchanged.
 
-    `observation.environment_state` (e.g. Push-T's 16-D T-block pose) is currently ignored
-    to keep the h-is-image-only contract clean. Add a concat-into-x or concat-into-h route
-    if the experiment warrants it.
-
-    Drift/diffusion network output:
-        mu — SDE drift only, shape (B, action_dim). Inference step: x_d = x + mu·dt + σ·√dt·ε.
+    Euclidean drift/diffusion network output:
+        mu — SDE drift only, shape (B, action_dim). Target-state inference returns
+        x + mu·dt + σ·√dt·ε; delta-state inference returns mu·dt + σ·√dt·ε.
         Training loss (Gaussian path): nll + beta·KL[q‖p], nll the Gaussian NLL of Δx ~ N(μ·dt, σ²·dt)
-        over the H·action_dim deltas (v* = (a−x)/dt), nll and KL both /(H·action_dim). σ² (SDE diffusion
-        coeff²) is NOT gradient-trained — an EMA of the per-batch MLE dt·mean‖v*−μ‖² (σ-VAE); beta is
-        the β-VAE coefficient on KL. (VQ/FSQ keep an MSE recon + commitment/prior-CE.)
+        over the H·action_dim deltas (v* = (a−x)/dt for target-state, a/dt for delta-state), nll and
+        KL both /(H·action_dim). σ² (SDE diffusion coeff²) is NOT gradient-trained — an EMA of the
+        per-batch MLE dt·mean‖v*−μ‖² (σ-VAE); beta is the β-VAE coefficient on KL. (VQ/FSQ keep an
+        MSE recon + commitment/prior-CE.)
 
     Push-T I/O (mirrors DiffusionConfig):
         - "observation.state" required.
@@ -76,12 +72,17 @@ class LatentSDEConfig(PreTrainedConfig):
                           DP: unroll `horizon`, execute the first `n_action_steps`, then re-encode h
                           and re-sample z. Requires 1 <= n_action_steps <= horizon.
         do_mask_loss_for_padding: mask copy-padded chunk ticks (episode ends) in the recon + posterior.
-        sde_dt:           Δt for one Euler-Maruyama step. Push-T fps=10 Hz → 0.1 s.
+        action_representation: "target_state" predicts a target state residual; "delta_state" predicts
+                          the action delta directly, including a pragmatic continuous gripper channel.
+        sde_geometry:     "euclidean" preserves the original step; "so3_r3_body" uses body-local
+                          pose increments and a diagonal variance EMA.
+        sde_dt:           Model-time Δt for one Euclidean or product-pose split step; not a simulator
+                          frequency setting. Pose mode requires a finite positive value.
         sigma_activation: "exp" or "softplus"; used only by z prior/posterior σ heads.
         beta:             β-VAE coefficient on KL[q||p] in the ELBO loss = nll + beta·KL. The
-                          action-decoder σ² is calibrated by EMA to the analytic MLE (σ-VAE),
-                          not gradient-trained (see sigma_ema_decay). Inference SDE noise
-                          per step = σ·√dt.
+                          Euclidean action-decoder σ² is calibrated by EMA to the analytic MLE
+                          (σ-VAE), not gradient-trained (see sigma_ema_decay). Body mode uses the same
+                          update per coordinate. Inference noise per step scales with √dt in both modes.
 
     Removed (no analog in single-step SDE):
         noise scheduler block, diffusion_step_embed_dim,
@@ -106,6 +107,21 @@ class LatentSDEConfig(PreTrainedConfig):
         }
     )
 
+    # ---- Context / action representation capabilities ----------------------------------------
+    context_encoder: str = "resnet"  # "resnet" | "smolvlm2"
+    conditioning: str = "film"  # "film" | "token_kv"; token_kv requires SmolVLM2
+    action_representation: str = "target_state"  # "target_state" | "delta_state"
+
+    sde_geometry: str = "euclidean"  # "euclidean" | "so3_r3_body"
+
+    # The generic SmolVLM2 backbone is always loaded from this immutable revision and kept frozen.
+    vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    vlm_model_revision: str = "7b375e1b73b11138ff12fe22c8f2822d8fe03467"
+    vlm_num_layers: int = 16
+    vlm_context_dim: int = 512
+    vlm_resize_shape: tuple[int, int] = (512, 512)
+    tokenizer_max_length: int = 48
+
     # ---- Vision backbone (copied verbatim from DiffusionConfig for fairness) -----------------
     vision_backbone: str = "resnet18"
     resize_shape: tuple[int, int] | None = None
@@ -126,23 +142,24 @@ class LatentSDEConfig(PreTrainedConfig):
     use_film_scale_modulation: bool = True
 
     # z_mode: where the latent z enters the drift net (no effect when use_latent_z=False):
-    #   "cond"  — concat z onto the FiLM cond.
-    #   "input" — concat z onto the net input instead.
+    #   "cond"  — append z to FiLM conditioning, or add its projection to the token-KV query.
+    #   "input" — concat z with the current state before the drift's input projection.
     z_mode: str = "cond"  # "cond" | "input"
 
-    # drift_uses_h: is h in the drift net's FiLM cond? True → h ∈ cond. False → h is dropped from the
-    #   drift and reaches the field only via the prior p(z|h)/posterior (z is an h→z→field bottleneck);
-    #   the cond is then whatever z_mode leaves (z for "cond", or empty → plain MLP for "input").
-    #   Requires use_latent_z=True. Acts independently of z_mode.
+    # drift_uses_h: provide joint context directly to the drift (FiLM vector or prefix K/V).
+    #   False removes that direct route; deployment context can still reach the field through
+    #   z sampled from p(z|h). The current state remains the drift input in either mode.
+    #   Acts independently of z_mode; without z this is a proprio-only ablation.
     drift_uses_h: bool = True
 
     # ---- SDE specifics ------------------------------------------------------------------------
-    # If sde_dt is None, defaults to 1/fps at runtime. Push-T: 0.1 s (10 Hz).
+    # If sde_dt is None, uses 1.0 at runtime (not inferred from FPS). Push-T: 0.1 s (10 Hz).
     sde_dt: float | None = 0.1
     sigma_activation: str = "exp"   # "exp" | "softplus"; used by z prior/posterior heads only
 
     # Action-decoder σ² (SDE diffusion coeff²) is NOT gradient-trained: it's EMA'd toward the analytic
     # per-batch MLE dt·mean‖v*−μ‖² (calibrated σ-VAE, arXiv:2006.13202). sigma_ema_decay = EMA decay.
+    # Scalar in Euclidean mode; per-coordinate in normalized body-controller units for so3_r3_body.
     sigma_ema_decay: float = 0.99
 
     # Train-only state-noise augmentation. >0 perturbs the drift's state window by std·√dt per frame
@@ -163,23 +180,17 @@ class LatentSDEConfig(PreTrainedConfig):
     #               autonomous field; identical to "clean" unless the state_noise_std tube is on).
     action_anchor: str = "nearest"  # "clean" | "nearest"
 
-    # State fed to the z-posterior trajectory encoder (the action is always the clean demo action):
-    #   "noisy" — the train-time perturbed state the drift reads (legacy consistency aug).
-    #   "clean" — the clean demo state, so the same demo maps to the same z regardless of state-noise.
-    posterior_state: str = "clean"  # "clean" | "noisy"
-
-    # normalize_state: re-origin the state/action fed to the DRIFT net input and the POSTERIOR
-    #   trajectory encoder to the chunk-initial state x_0 (subtract x_0 so x_{0:H} → 0..x_H−x_0).
-    #   The drift becomes translation-equivariant (its velocity target (a−x)/dt is unchanged; the
-    #   absolute SDE step mean = x_now + μ·dt still uses the un-shifted x_now) and the posterior sees
-    #   the chunk as a displacement path. Requires action_dim == state_dim (x_0 is a state, subtracted
-    #   from the actions too). Because the drift then no longer reads the absolute proprio state, the
-    #   chunk-initial state should be reinjected through the prior's proprio window with
-    #   use_latent_z=True and prior_uses_state=True (else the policy loses current-state info). Off = legacy.
+    # normalize_state: express DRIFT inputs relative to the clean chunk-initial state x_0.
+    #   Euclidean inputs subtract x_0. Pose inputs use R_0.T @ (p - p_0) and R_0.T @ R, keeping
+    #   the continuous rotation-column features and absolute finger positions. The origin is fixed
+    #   until the next h/z refresh. Joint observation context stays absolute.
+    #   Only target-state POSTERIOR actions subtract x_0 (requiring action_dim == state_dim).
+    #   Delta-state posterior actions stay unchanged, allowing different state/action dimensions.
+    #   Velocity targets, integration, and controller conversion keep their original coordinates.
     normalize_state: bool = True
 
     # ---- Inference -----------------------------------------------------------------------------
-    # If True, drift-only inference. False → SDE noise σ·√dt with σ the learned action-decoder scalar.
+    # If True, drift-only inference. False → SDE noise σ·√dt with σ from the action_var EMA.
     deterministic_inference: bool = True
 
     # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
@@ -187,7 +198,8 @@ class LatentSDEConfig(PreTrainedConfig):
     # z_dim=8: Picked by analogy with ACT's CVAE (latent_dim=32, hidden_dim=512 → z/h = 1/16);
     # beta: β-VAE coefficient on KL[q||p]. Too high → posterior collapse (q≡p, z carries no chunk info).
     #   Too low → q ignores prior (deployment z uninformed). 1e-2 .. 1.0 worth sweeping.
-    # z_prior_hidden_dim / z_posterior_hidden_dim: hidden width of the (μ,σ) MLPs. None → h_dim.
+    # z_prior_hidden_dim / z_posterior_hidden_dim: hidden width of the (μ,σ) MLPs. None uses the
+    # original visual-window width for ResNet, or vlm_context_dim for SmolVLM2.
     # deterministic_z_inference: use μ_p instead of sampling z at deploy. Debug/ablation only.
 
     use_latent_z: bool = True
@@ -197,28 +209,6 @@ class LatentSDEConfig(PreTrainedConfig):
     beta: float = 1.0                # β-VAE coefficient on KL[q‖p] in the ELBO (loss = nll + beta·KL)
     z_sigma_min: float = 1e-6        # hard floor for z prior/posterior σ; init σ_p ≈ 1 (exp) or ≈ 0.69 (softplus)
     deterministic_z_inference: bool = False
-
-    # posterior_uses_h: does the POSTERIOR encoder read h in addition to the trajectory?
-    #   True  (default) — q(z | traj, h): legacy CVAE posterior.
-    #   False — q(z | traj): trajectory-only encoder (the prior still predicts z from h). The canonical
-    #           latent-plan/skill-VAE view (play-LMP, OPAL); a valid ELBO, near-tight when the
-    #           trajectory determines z (it already carries the scene, so h is redundant to q).
-    posterior_uses_h: bool = False
-
-    # posterior_uses_state: does the POSTERIOR trajectory encoder read the state path, or actions only?
-    #   True  (default) — traj = concat([state, action]) over the chunk (_TrajEncoder in = state+action).
-    #   False — traj = the action trajectory alone (state channels dropped; _TrajEncoder in = action_dim);
-    #           z then summarizes the demonstrated action sequence without the states it visits.
-    #   Independent of posterior_uses_h (which controls the pooled-h concat, not the traj channels).
-    posterior_uses_state: bool = False
-
-    # prior_uses_state: does the PRIOR p(z|·) read the n_obs_steps state window in addition to the
-    #   image h? The prior stays causal (past frames only), so this mirrors the image h exactly.
-    #   False (default) — p(z|h): image-only prior (legacy).
-    #   True  — p(z | h, x_{1-n_obs..0}): the n_obs_steps proprio frames (flattened, same window as the
-    #           images) are concatenated onto the prior input. Widens the state dataloader window by
-    #           n_obs_steps-1 past frames (no effect when n_obs_steps==1). Only active with use_latent_z.
-    prior_uses_state: bool = True
 
     # ---- Discrete-latent variant (mutually exclusive with the Gaussian CVAE) ------------------
     # use_vq=True swaps the Gaussian CVAE for a discrete latent: deterministic posterior → quantizer
@@ -267,74 +257,22 @@ class LatentSDEConfig(PreTrainedConfig):
 
         if self.drop_n_last_frames is None:
             self.drop_n_last_frames = max(0, self.horizon - self.n_action_steps - self.n_obs_steps + 1)
-        if self.drop_n_last_frames < 0:
-            raise ValueError(f"`drop_n_last_frames` must be >= 0. Got {self.drop_n_last_frames}.")
 
-        if not self.vision_backbone.startswith("resnet"):
-            raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
-            )
-
-        if self.horizon < 1:
-            raise ValueError(f"`horizon` must be >= 1. Got {self.horizon}.")
         if not (1 <= self.n_action_steps <= self.horizon):
             raise ValueError(
                 f"`n_action_steps` must satisfy 1 <= n_action_steps <= horizon. "
                 f"Got n_action_steps={self.n_action_steps}, horizon={self.horizon}."
             )
 
-        if self.sde_dt is not None and self.sde_dt <= 0:
-            raise ValueError(f"`sde_dt` must be positive (or None). Got {self.sde_dt}.")
-
-        if self.sigma_activation not in ("exp", "softplus"):
-            raise ValueError(
-                f"`sigma_activation` must be 'exp' or 'softplus'. Got {self.sigma_activation!r}."
-            )
-        if self.z_sigma_min <= 0:
-            raise ValueError(f"`z_sigma_min` must be > 0. Got {self.z_sigma_min}.")
-
-        if self.beta < 0:
-            raise ValueError(f"`beta` must be non-negative. Got {self.beta}.")
-        if not (0.0 < self.sigma_ema_decay < 1.0):
-            raise ValueError(f"`sigma_ema_decay` must be in (0, 1). Got {self.sigma_ema_decay}.")
-
-        if self.state_noise_std < 0:
-            raise ValueError(f"`state_noise_std` must be non-negative. Got {self.state_noise_std}.")
         if self.state_noise_schedule not in ("uniform", "linear"):
             raise ValueError(
                 f"`state_noise_schedule` must be 'uniform' or 'linear'. Got {self.state_noise_schedule!r}."
             )
-
         if self.action_anchor not in ("clean", "nearest"):
             raise ValueError(f"`action_anchor` must be 'clean' or 'nearest'. Got {self.action_anchor!r}.")
-        if self.posterior_state not in ("clean", "noisy"):
-            raise ValueError(f"`posterior_state` must be 'clean' or 'noisy'. Got {self.posterior_state!r}.")
+
         if self.z_mode not in ("cond", "input"):
             raise ValueError(f"`z_mode` must be 'cond' or 'input'. Got {self.z_mode!r}.")
-
-        if self.normalize_state and not (self.use_latent_z and self.prior_uses_state):
-            # normalize_state strips absolute proprio from the drift input; the chunk-initial state
-            # can only be reinjected via the prior's proprio window, which needs the latent-z prior.
-            warnings.warn(
-                "`normalize_state=True` re-origins the drift input to the chunk-initial state, so the "
-                "drift no longer sees the absolute proprio state; the current state must be reinjected "
-                "through the prior's proprio window, which requires `use_latent_z=True` and "
-                f"`prior_uses_state=True`. Got use_latent_z={self.use_latent_z}, "
-                f"prior_uses_state={self.prior_uses_state}.",
-                stacklevel=2,
-            )
-
-        if self.z_dim <= 0:
-            raise ValueError(f"`z_dim` must be positive. Got {self.z_dim}.")
-        if self.z_prior_hidden_dim is not None and self.z_prior_hidden_dim <= 0:
-            raise ValueError(
-                f"`z_prior_hidden_dim` must be positive or None. Got {self.z_prior_hidden_dim}."
-            )
-        if self.z_posterior_hidden_dim is not None and self.z_posterior_hidden_dim <= 0:
-            raise ValueError(
-                f"`z_posterior_hidden_dim` must be positive or None. Got "
-                f"{self.z_posterior_hidden_dim}."
-            )
 
         if self.use_vq:
             if not self.use_latent_z:
@@ -343,29 +281,8 @@ class LatentSDEConfig(PreTrainedConfig):
                 raise ValueError(f"`quantizer` must be 'fsq' or 'vq'. Got {self.quantizer!r}.")
             if self.quantizer == "fsq":
                 self.z_dim = len(self.fsq_levels)  # FSQ latent dim == number of levels
-                if len(self.fsq_levels) < 1 or any(lvl < 2 for lvl in self.fsq_levels):
-                    raise ValueError(
-                        f"`fsq_levels` must be a non-empty tuple of ints >= 2. Got {self.fsq_levels}."
-                    )
-                if self.fsq_prior_weight < 0:
-                    raise ValueError(f"`fsq_prior_weight` must be non-negative. Got {self.fsq_prior_weight}.")
-            else:  # "vq" — z_dim is the (configured) code dim; codebook is learnable.
-                if self.vq_codebook_size < 2:
-                    raise ValueError(f"`vq_codebook_size` must be >= 2. Got {self.vq_codebook_size}.")
-                if not (0.0 < self.vq_decay <= 1.0):
-                    raise ValueError(f"`vq_decay` must be in (0, 1]. Got {self.vq_decay}.")
-                if self.vq_commit_weight < 0 or self.vq_prior_weight < 0:
-                    raise ValueError("`vq_commit_weight` and `vq_prior_weight` must be non-negative.")
 
-
-        if self.resize_shape is not None and (
-            len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
-        ):
-            raise ValueError(f"`resize_shape` must be a pair of positive integers. Got {self.resize_shape}.")
-        if not (0 < self.crop_ratio <= 1.0):
-            raise ValueError(f"`crop_ratio` must be in (0, 1]. Got {self.crop_ratio}.")
-
-        if self.resize_shape is not None:
+        if self.context_encoder == "resnet" and self.resize_shape is not None:
             if self.crop_ratio < 1.0:
                 self.crop_shape = (
                     int(self.resize_shape[0] * self.crop_ratio),
@@ -373,8 +290,6 @@ class LatentSDEConfig(PreTrainedConfig):
                 )
             else:
                 self.crop_shape = None
-        if self.crop_shape is not None and (self.crop_shape[0] <= 0 or self.crop_shape[1] <= 0):
-            raise ValueError(f"`crop_shape` must have positive dimensions. Got {self.crop_shape}.")
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(
@@ -391,45 +306,26 @@ class LatentSDEConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        if len(self.image_features) == 0 and self.env_state_feature is None:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
-
-        if self.resize_shape is None and self.crop_shape is not None:
-            for key, image_ft in self.image_features.items():
-                if self.crop_shape[0] > image_ft.shape[1] or self.crop_shape[1] > image_ft.shape[2]:
-                    raise ValueError(
-                        f"`crop_shape` should fit within the image shapes. Got {self.crop_shape} "
-                        f"for `crop_shape` and {image_ft.shape} for `{key}`."
-                    )
-
-        if len(self.image_features) > 0:
-            first_image_key, first_image_ft = next(iter(self.image_features.items()))
-            for key, image_ft in self.image_features.items():
-                if image_ft.shape != first_image_ft.shape:
-                    raise ValueError(
-                        f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
-                    )
+        """Required config interface; callers provide the documented feature layout."""
 
     @property
     def observation_delta_indices(self) -> list:
-        # Image stream: past n_obs_steps frames only (vision encoder cost matches DP).
+        # Image stream: past n_obs_steps frames only (context encoder cost matches DP).
         # State stream gets a longer window via `observation_delta_indices_per_key`.
         return list(range(1 - self.n_obs_steps, 1))
 
     @property
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
-        # State: current + next horizon-1 frames (deltas 0..horizon-1), so compute_loss sees the demo
-        # state trajectory over the whole horizon. Velocity-blind drift → no past frames (motion ∈ h).
-        # When prior_uses_state, prepend the n_obs_steps-1 PAST frames (deltas 1-n_obs..-1) so the prior
-        # sees the same n_obs window as the image h (no change when n_obs_steps==1).
-        start = 1 - self.n_obs_steps if (self.prior_uses_state and self.use_latent_z) else 0
-        return {OBS_STATE: list(range(start, self.horizon))}
+        # State always includes the causal n_obs_steps context window followed by the horizon-length
+        # teacher-forced trajectory. The current frame (delta 0) belongs to both slices.
+        return {OBS_STATE: list(range(1 - self.n_obs_steps, self.horizon))}
 
     @property
     def action_delta_indices(self) -> list:
         # `horizon` consecutive action targets per sample, anchored at "now" (deltas 0..horizon-1,
-        # not shifted by n_obs_steps like DP). The SDE integrates forward from x_now. At deploy only
-        # the first `n_action_steps` are executed before the h/z refresh.
+        # not shifted by n_obs_steps like DP). Target-state actions integrate from x_now; delta-state
+        # actions integrate from zero. At deploy only the first `n_action_steps` are executed before
+        # the h/z refresh.
         return list(range(0, self.horizon))
 
     @property

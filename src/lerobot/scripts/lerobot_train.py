@@ -715,7 +715,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
                 if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    wandb_log_dict = eval_tracker.to_dict()
                     wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
