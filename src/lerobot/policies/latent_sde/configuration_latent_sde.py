@@ -15,11 +15,62 @@
 # Only difference: the chunk-horizon Conv1d collapses to point-wise Linear because the SDE
 # is integrated one step at a time on the measured state x.
 
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass
 
 from lerobot.configs import NormalizationMode, PreTrainedConfig
-from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
+from lerobot.configs.parser import parse_arg
+from lerobot.optim import AdamConfig, CosineDecayWithWarmupSchedulerConfig, DiffuserSchedulerConfig
 from lerobot.utils.constants import OBS_STATE
+
+# Env-dependent defaults: fields left None are filled in __post_init__ from ENV_PRESETS[--env.type];
+# explicit values win. pusht = the DP recipe, libero = the SmolVLA recipe.
+ENV_PRESETS = {
+    "pusht": {
+        "context_encoder": "resnet",
+        "conditioning": "film",
+        "sde_geometry": "euclidean",
+        "n_obs_steps": 2,
+        "horizon": 16,
+        "n_action_steps": 8,
+        "crop_shape": (84, 84),
+        "normalization_mapping": {
+            "VISUAL": NormalizationMode.MEAN_STD,
+            "STATE": NormalizationMode.MIN_MAX,
+            "ACTION": NormalizationMode.MIN_MAX,
+        },
+        "do_mask_loss_for_padding": False,
+        "optimizer_lr": 1e-3,
+        "optimizer_betas": (0.95, 0.999),
+        "optimizer_weight_decay": 1e-6,
+        "scheduler_name": "cosine",
+        "scheduler_warmup_steps": 500,
+    },
+    "libero": {
+        "context_encoder": "smolvlm2",
+        "conditioning": "token_kv",
+        "sde_geometry": "so3_r3_body",
+        "n_obs_steps": 1,
+        "horizon": 50,
+        "n_action_steps": 10,
+        "crop_shape": None,
+        # Body geometry reads raw poses and controller commands.
+        "normalization_mapping": {
+            "VISUAL": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,
+        },
+        "do_mask_loss_for_padding": True,
+        # SmolVLA's values; it uses AdamW, identical to Adam at this weight decay.
+        "optimizer_lr": 1e-4,
+        "optimizer_betas": (0.9, 0.95),
+        "optimizer_weight_decay": 1e-10,
+        "scheduler_name": "cosine_decay_with_warmup",
+        "scheduler_warmup_steps": 1000,
+        "scheduler_decay_steps": 30_000,
+        "scheduler_decay_lr": 2.5e-6,
+    },
+}
 
 
 @PreTrainedConfig.register_subclass("latent_sde")
@@ -27,13 +78,13 @@ from lerobot.utils.constants import OBS_STATE
 class LatentSDEConfig(PreTrainedConfig):
     """Configuration class for LatentSDEPolicy.
 
-    Defaults are tuned for Push-T (proprio + single camera) and mirror DiffusionPolicy
-    so this PoC is a like-for-like replacement of the denoising U-Net.
+    Env-dependent fields default to None and are filled from ENV_PRESETS by `--env.type`. The Push-T
+    preset mirrors DiffusionPolicy so this PoC is a like-for-like replacement of the denoising U-Net.
 
     SDE roles (research_brief.md §1.2, §3):
         x  — measured robot state (proprio). Push-T: 2-D `observation.state` (agent_pos).
-             The drift/diffusion net reads the current frame on every Tier-2 tick. In target-state
-             mode, the Euler-Maruyama residual is anchored to that frame (`mean = s_t + μ·dt`).
+             The drift/diffusion net reads the current frame on every Tier-2 tick. In Euclidean
+             mode, the one-step residual is anchored to that frame (`mean = x_t + s·μ`).
              At training time the trailing horizon states are sampled directly from the dataset
              (see `observation_delta_indices_per_key`), matching the deployment-time stream.
         h  — joint observation conditioning (Tier-1). ResNet image features are concatenated
@@ -50,13 +101,15 @@ class LatentSDEConfig(PreTrainedConfig):
              (cond = concat([h, z])); the drift/diffusion block structure is unchanged.
 
     Euclidean drift/diffusion network output:
-        mu — SDE drift only, shape (B, action_dim). Target-state inference returns
-        x + mu·dt + σ·√dt·ε; delta-state inference returns mu·dt + σ·√dt·ε.
-        Training loss (Gaussian path): nll + beta·KL[q‖p], nll the Gaussian NLL of Δx ~ N(μ·dt, σ²·dt)
-        over the H·action_dim deltas (v* = (a−x)/dt for target-state, a/dt for delta-state), nll and
-        KL both /(H·action_dim). σ² (SDE diffusion coeff²) is NOT gradient-trained — an EMA of the
-        per-batch MLE dt·mean‖v*−μ‖² (σ-VAE); beta is the β-VAE coefficient on KL. (VQ/FSQ keep an
-        MSE recon + commitment/prior-CE.)
+        mu — the standardized one-step action, shape (B, action_dim), in units of the action scale s
+        (see action_scale). Inference returns the target state x + s·(mu + σ·ε).
+        There is no model-time Δt: one step per action, at the environment's own rate.
+        Training loss (Gaussian path): nll + beta·KL[q‖p], nll the Gaussian NLL of d*/s ~ N(μ, σ²)
+        over the H·action_dim steps (d* = a−x), nll and KL both
+        /(H·action_dim). σ² is NOT gradient-trained — an EMA of the per-batch MLE mean‖d*/s−μ‖²
+        (σ-VAE); beta is the β-VAE coefficient on KL. The optimized loss is (nll + beta·KL)·sg(2σ²),
+        so the recon gradient equals the plain MSE gradient and grad norms match the VQ/FSQ path
+        (logged nll_loss / kl_loss stay unscaled). (VQ/FSQ keep an MSE recon + commitment/prior-CE.)
 
     Push-T I/O (mirrors DiffusionConfig):
         - "observation.state" required.
@@ -72,17 +125,14 @@ class LatentSDEConfig(PreTrainedConfig):
                           DP: unroll `horizon`, execute the first `n_action_steps`, then re-encode h
                           and re-sample z. Requires 1 <= n_action_steps <= horizon.
         do_mask_loss_for_padding: mask copy-padded chunk ticks (episode ends) in the recon + posterior.
-        action_representation: "target_state" predicts a target state residual; "delta_state" predicts
-                          the action delta directly, including a pragmatic continuous gripper channel.
-        sde_geometry:     "euclidean" preserves the original step; "so3_r3_body" uses body-local
-                          pose increments and a diagonal variance EMA.
-        sde_dt:           Model-time Δt for one Euclidean or product-pose split step; not a simulator
-                          frequency setting. Pose mode requires a finite positive value.
+        sde_geometry:     "euclidean" predicts a target-state residual (action_dim == state_dim);
+                          "so3_r3_body" predicts body-local increments of relative pose commands plus
+                          the gripper (same scalar variance EMA).
+        action_scale:     per-dimension std of the one-step action target, swept from the dataset.
         sigma_activation: "exp" or "softplus"; used only by z prior/posterior σ heads.
         beta:             β-VAE coefficient on KL[q||p] in the ELBO loss = nll + beta·KL. The
-                          Euclidean action-decoder σ² is calibrated by EMA to the analytic MLE
-                          (σ-VAE), not gradient-trained (see sigma_ema_decay). Body mode uses the same
-                          update per coordinate. Inference noise per step scales with √dt in both modes.
+                          action-decoder σ² (one scalar in both modes) is calibrated by EMA to the
+                          analytic MLE (σ-VAE), not gradient-trained (see sigma_ema_decay).
 
     Removed (no analog in single-step SDE):
         noise scheduler block, diffusion_step_embed_dim,
@@ -95,28 +145,21 @@ class LatentSDEConfig(PreTrainedConfig):
     # n_action_steps: actions EXECUTED per replan at deployment (h & z refresh period). Mirrors DP:
     #                 unroll `horizon`, execute the first `n_action_steps`, then re-encode h / re-sample
     #                 z. Requires 1 <= n_action_steps <= horizon. (DP's Push-T recipe is train-16/act-8.)
-    n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    # None → ENV_PRESETS (also every other `| None = None` field listed there).
+    n_obs_steps: int | None = None
+    horizon: int | None = None
+    n_action_steps: int | None = None
 
-    normalization_mapping: dict[str, NormalizationMode] = field(
-        default_factory=lambda: {
-            "VISUAL": NormalizationMode.MEAN_STD,
-            "STATE": NormalizationMode.MIN_MAX,
-            "ACTION": NormalizationMode.MIN_MAX,
-        }
-    )
+    normalization_mapping: dict[str, NormalizationMode] | None = None
 
     # ---- Context / action representation capabilities ----------------------------------------
-    context_encoder: str = "resnet"  # "resnet" | "smolvlm2"
-    conditioning: str = "film"  # "film" | "token_kv"; token_kv requires SmolVLM2
-    action_representation: str = "target_state"  # "target_state" | "delta_state"
+    context_encoder: str | None = None  # "resnet" | "smolvlm2"
+    conditioning: str | None = None  # "film" | "token_kv"; token_kv requires SmolVLM2
 
-    sde_geometry: str = "euclidean"  # "euclidean" | "so3_r3_body"
+    sde_geometry: str | None = None  # "euclidean" | "so3_r3_body"
 
-    # The generic SmolVLM2 backbone is always loaded from this immutable revision and kept frozen.
+    # The generic SmolVLM2 backbone (Hub main, same as SmolVLA's default) is kept frozen.
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
-    vlm_model_revision: str = "7b375e1b73b11138ff12fe22c8f2822d8fe03467"
     vlm_num_layers: int = 16
     vlm_context_dim: int = 512
     vlm_resize_shape: tuple[int, int] = (512, 512)
@@ -153,27 +196,31 @@ class LatentSDEConfig(PreTrainedConfig):
     drift_uses_h: bool = True
 
     # ---- SDE specifics ------------------------------------------------------------------------
-    # If sde_dt is None, uses 1.0 at runtime (not inferred from FPS). Push-T: 0.1 s (10 Hz).
-    sde_dt: float | None = 0.1
+    # One drift step per action at the environment's own rate; there is no separate model-time Δt.
     sigma_activation: str = "exp"   # "exp" | "softplus"; used by z prior/posterior heads only
 
+    # action_scale: per-dim std s of the one-step target d (a − x / body increment); the drift predicts
+    #   d/s. None → swept from the dataset before training and cached (see action_scale.py).
+    action_scale: list[float] | None = None
+
     # Action-decoder σ² (SDE diffusion coeff²) is NOT gradient-trained: it's EMA'd toward the analytic
-    # per-batch MLE dt·mean‖v*−μ‖² (calibrated σ-VAE, arXiv:2006.13202). sigma_ema_decay = EMA decay.
-    # Scalar in Euclidean mode; per-coordinate in normalized body-controller units for so3_r3_body.
+    # per-batch MLE mean‖d*/s−μ‖² (calibrated σ-VAE, arXiv:2006.13202). sigma_ema_decay = EMA decay.
+    # One scalar in every mode (so3_r3_body included): with the loss rescale sg(2σ²) the recon
+    # gradient is then exactly the unweighted MSE gradient over all action coordinates.
     sigma_ema_decay: float = 0.99
 
-    # Train-only state-noise augmentation. >0 perturbs the drift's state window by std·√dt per frame
-    # and recomputes the recon target from the perturbed anchor → corrective drift. 0.0 = legacy.
-    state_noise_std: float = 0.1
+    # Train-only state-noise augmentation: perturbs the drift's state window by std·s per frame (a fraction
+    # of a typical one-step action) and recomputes the corrective target. 0.0 = off.
+    state_noise_std: float = 0.3
 
     # state_noise_schedule: how the per-frame std varies across the chunk.
-    #   "uniform" — same std·√dt on every frame (legacy).
-    #   "linear"  — std ramps std·√dt/H → std·√dt over chunk ticks 0..H-1 (indices 1..H, so tick 0 gets
-    #               std·√dt/H, NOT zero; peak at last tick); past obs frames (delta<0) get 0.
+    #   "uniform" — same std·s on every frame.
+    #   "linear"  — std ramps std·s/H → std·s over chunk ticks 0..H-1 (indices 1..H, so tick 0 gets
+    #               std·s/H, NOT zero; peak at last tick); past obs frames (delta<0) get 0.
     #               `state_noise_std` is the PEAK (last-tick) std.
     state_noise_schedule: str = "uniform"  # "uniform" | "linear"
 
-    # Recon target v* = (a_anchor − x̃)/dt (one-step full return to a demo action from the noised anchor
+    # Recon target d* = a_anchor − x̃ (one-step full return to a demo action from the noised anchor
     # x̃). action_anchor picks which demo action a_anchor:
     #   "clean"   — the corresponding-index action a_k (== legacy corrective target).
     #   "nearest" — the action a_j of the nearest demo state x_j over the chunk (Behavior-Controllable
@@ -184,13 +231,13 @@ class LatentSDEConfig(PreTrainedConfig):
     #   Euclidean inputs subtract x_0. Pose inputs use R_0.T @ (p - p_0) and R_0.T @ R, keeping
     #   the continuous rotation-column features and absolute finger positions. The origin is fixed
     #   until the next h/z refresh. Joint observation context stays absolute.
-    #   Only target-state POSTERIOR actions subtract x_0 (requiring action_dim == state_dim).
-    #   Delta-state posterior actions stay unchanged, allowing different state/action dimensions.
-    #   Velocity targets, integration, and controller conversion keep their original coordinates.
+    #   Euclidean POSTERIOR actions subtract x_0; so3_r3_body's posterior reads the clean body-frame
+    #   increment / s.
+    #   Drift targets, integration, and controller conversion keep their original coordinates.
     normalize_state: bool = True
 
     # ---- Inference -----------------------------------------------------------------------------
-    # If True, drift-only inference. False → SDE noise σ·√dt with σ from the action_var EMA.
+    # If True, drift-only inference. False → SDE noise s·σ·ε with σ from the action_var EMA.
     deterministic_inference: bool = True
 
     # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
@@ -235,28 +282,47 @@ class LatentSDEConfig(PreTrainedConfig):
     compile_mode: str = "reduce-overhead"
 
     # Loss computation: mask copy-padded chunk ticks (episode ends) out of the recon + posterior.
-    do_mask_loss_for_padding: bool = False
+    do_mask_loss_for_padding: bool | None = None
 
-    # Skip the last `drop_n_last_frames` anchors of each episode at sampling time. None → auto =
-    # `max(0, horizon - n_action_steps - n_obs_steps + 1)` (DP formula). For horizon >= 2*n_action_steps
+    # Skip the last `drop_n_last_frames` anchors of each episode at sampling time. None → 0 with
+    # do_mask_loss_for_padding (padding is masked), else the DP formula
+    # `max(0, horizon - n_action_steps - n_obs_steps + 1)`. For horizon >= 2*n_action_steps
     # + n_obs_steps - 2 (the default 64/32/2 sits on this threshold) it keeps the EXECUTED region unpadded
     # and copy-pads only the predicted tail; below that some executed ticks may pad too (masked iff
     # do_mask_loss_for_padding).
     drop_n_last_frames: int | None = None
 
-    # ---- Training presets (copied verbatim from DiffusionConfig for fairness) ----------------
-    optimizer_lr: float = 1e-3
-    optimizer_betas: tuple = (0.95, 0.999)
+    # ---- Training presets (ENV_PRESETS: pusht = DiffusionConfig's, libero = SmolVLAConfig's) ----
+    optimizer_lr: float | None = None
+    optimizer_betas: tuple | None = None
     optimizer_eps: float = 1e-8
-    optimizer_weight_decay: float = 1e-6
-    scheduler_name: str = "cosine"
-    scheduler_warmup_steps: int = 500
+    optimizer_weight_decay: float | None = None
+    scheduler_name: str | None = None  # diffusers name (e.g. "cosine") | "cosine_decay_with_warmup"
+    scheduler_warmup_steps: int | None = None
+    scheduler_decay_steps: int | None = None  # cosine_decay_with_warmup only
+    scheduler_decay_lr: float | None = None  # cosine_decay_with_warmup only
 
     def __post_init__(self):
         super().__post_init__()
 
+        unset = [key for key in ENV_PRESETS["pusht"] if key != "crop_shape" and getattr(self, key) is None]
+        if unset:
+            env_type = parse_arg("env.type")  # the training CLI's env; saved configs are already complete
+            if env_type not in ENV_PRESETS:
+                raise ValueError(
+                    f"latent_sde: {unset} default per env; set --env.type to one of {list(ENV_PRESETS)} "
+                    "or pass them explicitly."
+                )
+            for key, value in ENV_PRESETS[env_type].items():
+                if getattr(self, key) is None:
+                    setattr(self, key, copy.deepcopy(value))
+
         if self.drop_n_last_frames is None:
-            self.drop_n_last_frames = max(0, self.horizon - self.n_action_steps - self.n_obs_steps + 1)
+            self.drop_n_last_frames = (
+                0
+                if self.do_mask_loss_for_padding
+                else max(0, self.horizon - self.n_action_steps - self.n_obs_steps + 1)
+            )
 
         if not (1 <= self.n_action_steps <= self.horizon):
             raise ValueError(
@@ -299,7 +365,14 @@ class LatentSDEConfig(PreTrainedConfig):
             weight_decay=self.optimizer_weight_decay,
         )
 
-    def get_scheduler_preset(self) -> DiffuserSchedulerConfig:
+    def get_scheduler_preset(self) -> DiffuserSchedulerConfig | CosineDecayWithWarmupSchedulerConfig:
+        if self.scheduler_name == "cosine_decay_with_warmup":
+            return CosineDecayWithWarmupSchedulerConfig(
+                peak_lr=self.optimizer_lr,
+                decay_lr=self.scheduler_decay_lr,
+                num_warmup_steps=self.scheduler_warmup_steps,
+                num_decay_steps=self.scheduler_decay_steps,
+            )
         return DiffuserSchedulerConfig(
             name=self.scheduler_name,
             num_warmup_steps=self.scheduler_warmup_steps,
@@ -323,8 +396,8 @@ class LatentSDEConfig(PreTrainedConfig):
     @property
     def action_delta_indices(self) -> list:
         # `horizon` consecutive action targets per sample, anchored at "now" (deltas 0..horizon-1,
-        # not shifted by n_obs_steps like DP). Target-state actions integrate from x_now; delta-state
-        # actions integrate from zero. At deploy only the first `n_action_steps` are executed before
+        # not shifted by n_obs_steps like DP). Euclidean target states integrate from x_now; body
+        # commands from zero. At deploy only the first `n_action_steps` are executed before
         # the h/z refresh.
         return list(range(0, self.horizon))
 

@@ -1,89 +1,201 @@
-# HC 개인용 환경 메모
+# HC 개인용 메모
 
-LeRobot 레포에서 Push-T 벤치마크 + Diffusion Policy 학습용 셋업 기록.
+## 1. 환경 세팅 (연구실 GPU 서버, Ubuntu 22.04 — robot9에서 확인)
 
-## 1. 추가 설치 (base install 끝난 뒤)
+레포 루트(robot9: `/PublicSSD/himchan/lerobot`)에서.
 
-레포 루트(`/home/v-hihwang/lerobot`)에서:
-
-```bash
-pip install -e '.[pusht,diffusion,training]'
-```
-
-각 extra가 가져오는 핵심 패키지:
-
-| extra | 패키지 | 역할 |
-|---|---|---|
-| `pusht` | `gym-pusht`, `pymunk` | Push-T 시뮬레이션 환경 |
-| `diffusion` | `diffusers` | Diffusion Policy의 noise scheduler / UNet 빌딩 블록 |
-| `training` | `accelerate`, `wandb` | 학습 루프 |
-
-
-설치 확인:
+### Push-T
 
 ```bash
-python -c "import gym_pusht, pymunk, diffusers, accelerate, wandb; print('ok')"
+# python과 ffmpeg를 conda-forge 한 채널에서 같이 설치 (defaults 채널과 섞으면 torchcodec이 FFmpeg를 못 불러옴)
+conda create -y -n latent_sde --override-channels -c conda-forge python=3.12 "ffmpeg=7"
+conda activate latent_sde
+pip install -e '.[pusht,diffusion,training,latent_sde]'
+
+# Ubuntu 22.04: env의 libstdc++를 먼저 로드 (torchcodec의 CXXABI_1.3.15 에러 방지)
+conda env config vars set LD_PRELOAD=$CONDA_PREFIX/lib/libstdc++.so.6
+# wandb 로그인(서버당 한 번) + entity 고정 (계정 기본 entity piggene00은 권한 없음)
+wandb login
+conda env config vars set WANDB_ENTITY=himchan00
+conda deactivate && conda activate latent_sde
 ```
 
-## 2. 학습 커맨드 (Push-T + Diffusion Policy)
+### LIBERO (위 env에 추가)
+
+```bash
+# egl_probe는 pip 격리 빌드에서 cmake를 못 찾음 → 격리 없이 먼저 빌드
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+pip install --no-build-isolation egl_probe==1.0.2 hf-egl-probe==1.0.2
+pip install -e '.[pusht,diffusion,training,latent_sde,libero,smolvla]'
+# LIBERO asset (경로 질문에는 N)
+echo N | python -c 'from libero.libero.utils.download_utils import download_assets_from_huggingface; download_assets_from_huggingface()'
+
+# 학습 전마다: 캐시는 PublicSSD (robot9엔 PublicHDD 없음), 헤드리스 렌더링
+export HF_HOME=/PublicSSD/himchan/hf_cache MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+```
+
+- tmux 서버를 `latent_sde`가 켜진 셸에서 띄웠으면 새 창에서 `conda activate`가 무시되어 `LD_PRELOAD`/`WANDB_ENTITY`가 안 잡힘 → `conda deactivate` 후 activate.
+- MuJoCo 종료 때 나오는 `Exception ignored in ... EGLError`는 무시해도 됨.
+
+## 2. 학습 커맨드
+
+### 2.1 Push-T + Diffusion Policy
 
 ```bash
 lerobot-train \
     --policy.type=diffusion \
     --policy.push_to_hub=false \
+    --policy.crop_shape=[84,84] \
+    --policy.crop_is_random=true \
+    --policy.horizon=16 \
+    --policy.n_action_steps=8 \
     --dataset.repo_id=lerobot/pusht \
     --env.type=pusht \
     --output_dir=outputs/train/diffusion_pusht \
     --job_name=diffusion_pusht \
     --batch_size=64 \
+    --seed=0 \
     --eval.use_async_envs=false \
     --wandb.enable=True \
     --wandb.project=lerobot_pusht
 ```
 
-> `batch_size=64`: `examples/training/train_policy.py`의 Diffusion+PushT 예제 값을 사용.
+- 96×96 이미지를 학습 때 84×84 랜덤 크롭 (원 DP 논문 설정). 이 포크는 `crop_shape` 기본값이 `None`이라 명시.
+- `--eval.use_async_envs=false`: async 워커에서 gym_pusht가 등록되지 않아 생기는 NamespaceNotFound 우회.
 
-> `--eval.use_async_envs=false`: Push-T는 eval async forkserver 워커에서 gym_pusht가 재등록 안 돼서 NamespaceNotFound 발생해서 -> false로 지정해서 우회.
-
-콘솔 스크립트가 안 잡히면 `python -m lerobot.scripts.lerobot_train ...` 로도 가능.
-
-## 2.1 Eval 커맨드 (저장된 체크포인트 필요)
+### 2.2 Push-T + Latent-SDE (`latent_sde_z16_2_16_8_h_init_state_zeroed`, 최고 성능 63%)
 
 ```bash
-lerobot-eval \
-    --policy.path=outputs/train/diffusion_pusht/checkpoints/100000/pretrained_model \
+lerobot-train \
+    --policy.type=latent_sde \
     --env.type=pusht \
-    --eval.n_episodes=50 \
+    --dataset.repo_id=lerobot/pusht \
+    --policy.use_vq=false \
+    --policy.z_dim=16 \
+    --policy.drift_uses_h=true \
+    --policy.push_to_hub=false \
+    --output_dir=outputs/train/latent_sde_z16_2_16_8_h_init_state_zeroed \
+    --job_name=latent_sde_z16_2_16_8_h_init_state_zeroed \
+    --batch_size=64 \
+    --seed=0 \
+    --steps=200000 \
     --eval.use_async_envs=false \
-    --output_dir=outputs/eval/diffusion_pusht \
-    --job_name=diffusion_pusht_eval \
-    --seed=1000
+    --eval.batch_size=50 \
+    --wandb.enable=true \
+    --wandb.project=lerobot_pusht
 ```
-- `--policy.*` 오버라이드로 학습 시 config의 정책 옵션을 평가용으로만 바꿀 수 있음 (`deterministic_inference`, `n_action_steps` 등).
 
+- `--env.type=pusht` 프리셋: ResNet + FiLM, `n_obs_steps` 2 / `horizon` 16 / `n_action_steps` 8, crop 84, DP 정규화, Adam 1e-3. 그 외 기본값: Gaussian z, β=1, `normalize_state=true`.
+- 63% = 160k/180k/200k 체크포인트 × 100 에피소드 평균. 이 run은 9/30 코드(state noise 0.1·√dt)로 학습됨 → 지금 코드에서 같은 noise는 `--policy.state_noise_std=0.378` (기본 0.3).
 
-## 3. 메모
+### 2.3 LIBERO + SmolVLA
 
-- **Robot class 지정 불필요/불가**: Push-T는 sim 벤치마크라 `TrainPipelineConfig`에 `robot` 필드 자체가 없음. `--robot.type=...`는 `lerobot-record` 같은 실제 하드웨어용 스크립트에서만 사용.
-- Diffusion Policy의 디폴트 하이퍼파라미터(`src/lerobot/policies/diffusion/configuration_diffusion.py`)는 이미 Push-T 기준으로 튜닝되어 있어 추가 인자 거의 불필요.
-- 학습 산출물(체크포인트/eval 비디오): `outputs/train/diffusion_pusht/`.
-- 데이터셋 `lerobot/pusht`는 HF Hub에서 첫 실행 시 자동 다운로드 (`~/.cache/huggingface/`).
-- 파이썬 스크립트 형태 예시는 `examples/training/train_policy.py` (이 파일 자체가 Diffusion + Push-T 조합).
+```bash
+lerobot-train \
+    --policy.type=smolvla \
+    --policy.load_vlm_weights=true \
+    --policy.n_action_steps=10 \
+    --env.type=libero \
+    --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+    --env.observation_height=256 \
+    --env.observation_width=256 \
+    --dataset.repo_id=lerobot/libero \
+    --dataset.video_backend=torchcodec \
+    --steps=30000 \
+    --batch_size=64 \
+    --save_freq=5000 \
+    --env_eval_freq=10000 \
+    --eval.n_episodes=1 \
+    --eval.use_async_envs=false \
+    --policy.push_to_hub=false \
+    --output_dir=outputs/train/smolvla_libero_30k \
+    --job_name=smolvla_libero_30k \
+    --wandb.enable=true \
+    --wandb.project=lerobot_libero
+```
 
-## 4. AMLT (Singularity) 셋업 시 주의사항
+- SmolVLA 자체 프리셋(AdamW 1e-4, warmup 1,000, cosine 30k → 2.5e-6)이 3절 세팅과 같아서 optimizer 인자는 필요 없음. `n_action_steps=10`은 평가 때 재계획 주기에만 영향.
+- VLM: SmolVLA와 Latent-SDE 모두 `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`의 Hub `main`을 불러옴 (현재 rev `7b375e1b`).
 
-`amlt/diffusion_pusht.yaml`로 H100 클러스터(`msrresrchbasicvc`)에 잡 던질 때 밟은 함정들:
+### 2.4 LIBERO + Latent-SDE (SO3)
 
-- **HF 캐시 분리**: `/mnt/v-hihwang`은 rslex 마운트라 `statvfs`가 항상 0을 반환 → `datasets` 라이브러리의 disk-space 체크에 막혀 `OSError: Not enough disk space` 발생. 해결: persistent 캐시는 `/mnt`에, builder 임시 캐시만 로컬 `/scratch`에 분리.
-  ```yaml
-  HF_HOME: /mnt/v-hihwang/projects/lerobot/hf_cache       # 큰 데이터셋 본체 (persistent)
-  HF_HUB_CACHE: /mnt/v-hihwang/projects/lerobot/hf_cache/hub
-  HF_DATASETS_CACHE: /scratch/hf_datasets_cache           # 작은 builder 임시 (재생성 OK)
-  ```
-- **FIPS abort 회피**: H100 노드는 FIPS enforce. pip wheel `av` (PyAV)가 번들한 OpenSSL이 import 시 `OpenSSL internal error: FATAL FIPS SELFTEST FAILURE`로 즉시 abort. 해결: setup에 두 줄 추가.
-  ```yaml
-  - conda run --name lerobot pip uninstall -y av || true
-  - conda run --name lerobot conda install -y -c conda-forge av
-  ```
-- **Preemption resume**: 출력 디렉터리는 `/mnt`에 두고 `${OUTPUT_DIR}/checkpoints/last/pretrained_model/train_config.json` 존재 여부로 분기 → 있으면 `--resume=true --config_path=$CKPT_CFG`, 없으면 fresh start (stale dir은 `rm -rf`로 정리해야 lerobot의 `FileExistsError` 회피).
-- **`--eval.use_async_envs=false`**는 AMLT에서도 그대로 필요 (forkserver 워커가 `gym_pusht` import 안 함).
+```bash
+lerobot-train \
+    --policy.type=latent_sde \
+    --env.type=libero \
+    --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
+    --env.observation_height=256 \
+    --env.observation_width=256 \
+    --dataset.repo_id=lerobot/libero \
+    --dataset.video_backend=torchcodec \
+    --steps=30000 \
+    --batch_size=64 \
+    --save_freq=5000 \
+    --env_eval_freq=10000 \
+    --eval.n_episodes=1 \
+    --eval.use_async_envs=false \
+    --policy.push_to_hub=false \
+    --output_dir=outputs/train/latent_sde_so3_libero_30k \
+    --job_name=latent_sde_so3_libero_30k \
+    --wandb.enable=true \
+    --wandb.project=lerobot_libero
+```
+
+- 나머지 설정은 전부 `--env.type=libero` 프리셋 (3절). z16 변형: `--policy.z_dim=16`.
+- robot9: `outputs/queue_libero/queue8.sh` (tmux `libero_queue`)로 `latent_sde_so3_libero_30k` → `..._30k_z16` → `smolvla_libero_30k` 순서로 실행 (run당 약 3.5h). 5090, batch 64에서 메모리 약 14GB, 0.376 s/step.
+
+## 3. LIBERO 학습 세팅과 근거 (논문용)
+
+Latent-SDE의 LIBERO 설정은 `--env.type=libero` 프리셋(`ENV_PRESETS`, `configuration_latent_sde.py`)에 들어 있고, 학습 길이만 CLI로 준다.
+기준은 SmolVLA(같은 SmolVLM2 백본을 쓰는 VLA 베이스라인)의 LIBERO 레시피이며, 바꾼 곳은 아래 "SmolVLA 논문과 다른 점"에 근거와 함께 정리했다.
+
+### 데이터와 관측
+| 항목 | 값 | 근거 |
+|---|---|---|
+| 데이터 | `lerobot/libero` (lerobot 기본 `v3.0` 태그 = 현재 rev `a1aaacb7`), 1,693 에피소드, 40 태스크, 273,465 프레임, 10 fps | SmolVLA 논문 §4.1의 LIBERO 데이터(`physical-intelligence/libero`, 1,693 에피소드)와 같은 에피소드 수. `lerobot/smolvla_libero` 체크포인트도 이 데이터로 학습 |
+| 관측 | agentview + wrist 256×256, SmolVLM 입력 512×512 | 논문 §4.3 "images resized to 512×512" (`vlm_resize_shape`) |
+| state / action | state 8D `[p, axis-angle, finger qpos]`, action 7D 상대 OSC_POSE 명령 + 그리퍼 ±1 | 데이터셋 그대로 (robosuite OSC_POSE: 명령 1 = 0.05 m / 0.5 rad) |
+
+### 모델
+| 항목 | 값 | 근거 |
+|---|---|---|
+| 문맥 인코더 | SmolVLM2-500M-Video-Instruct (Hub `main`, 현재 rev `7b375e1b`) 고정, 앞 16층 | 논문 §4.3: VLM 고정, LLM 앞 16층만 사용, 주 모델(0.45B)은 SmolVLM2-500M. SmolVLA 베이스라인과 같은 모델 |
+| drift 조건 | `token_kv` (층별 VLM K/V를 cross-attention) | SmolVLA action expert와 같은 방식의 조건 주입 (논문 Table 6: CA가 SA보다 좋음) |
+| 액션 기하 | `so3_r3_body`: 현재 EEF body frame 증분, 정규화 IDENTITY | LIBERO 액션이 상대 OSC 명령이라 물리 단위(pose)에서 증분을 정의해야 함. 표준화는 `action_scale`로 따로 함 |
+| 관측 창 / 학습 구간 | `n_obs_steps=1`, `horizon=50` | SmolVLA 기본값(`n_obs_steps=1`, `chunk_size=50`), 논문 Table 12: chunk 10~50이 좋음 |
+| 재계획 주기 | `n_action_steps=10` (h·z를 10 tick마다 새로 계산; drift는 매 tick 현재 state로 동작) | 논문 Table 13 (chunk 50 고정): 실행 스텝 1 → 80.3, **10 → 82.8**, 30 → 70.8, 50 → 51.8 |
+| 에피소드 끝 처리 | `drop_n_last_frames=0` + padding 마스크 | SmolVLA도 padding action을 loss에서 가리고 프레임을 버리지 않음. DP 공식(50−10−1+1=40)이면 에피소드(평균 162프레임) 끝 40개 = 약 25%, 과제를 마무리하는 구간이 빠짐 |
+| 액션 표준화 | `action_scale`: 데이터셋 전체의 한 스텝 목표 표준편차 (위치 0.390, 회전 0.062, 그리퍼 1.0 명령 단위) | drift 목표가 차원마다 분산 약 1이 되도록 |
+| posterior 입력 | body frame 증분 / s (= noise 없는 drift 목표) | drift 목표와 같은 좌표·스케일 |
+| state noise | `state_noise_std=0.3` (전형적인 한 스텝 대비 비율) | 교정용 증강. Push-T와 같은 값 |
+| latent z | Gaussian CVAE, `z_dim=8`, β=1 (z16 변형 비교) | 기본값 |
+
+### 최적화
+| 항목 | 값 | 근거 |
+|---|---|---|
+| optimizer | Adam, lr 1e-4, β=(0.9, 0.95), eps 1e-8, weight decay 1e-10, grad clip 10 | 논문 §4.3 (AdamW, β₁=0.9, β₂=0.95, lr 1e-4) + lerobot `SmolVLAConfig` (eps, wd, clip). SmolVLA는 AdamW지만 wd 1e-10에서는 Adam과 같음: AdamW의 감쇠 θ(1−lr·wd)=θ(1−1e-14)는 fp32에서 그대로 θ이고, Adam의 L2 항 1e-10·θ는 대부분 gradient의 fp32 분해능보다 작음 |
+| 학습률 스케줄 | warmup 1,000, cosine으로 1e-4 → 2.5e-6, decay 30k = 전체 학습 길이 | 논문 §4.3 (cosine, 최소 2.5e-6) + `SmolVLAConfig` (warmup 1,000, decay 30k). 이 값은 openpi `CosineDecaySchedule` 기본값이고, openpi는 `pi0_libero`를 정확히 30k 스텝 학습함 (decay = 학습 길이) |
+| 학습 길이 | 30,000 스텝 × batch 64 (약 192만 샘플, 약 7 epoch) | 논문의 시뮬레이션 fine-tune은 100k 스텝 / batch 64. 하지만 HF 공식 SmolVLA LIBERO 체크포인트(`HuggingFaceVLA/smolvla_libero_ckpts`, `train_config.json`)도 decay 30k로 100k를 학습해 30k 이후 70%는 최소 학습률 2.5e-6에 고정됨. 그래서 스케줄이 실제로 쓰는 30k에서 멈춤 (openpi `pi0_libero`와 같은 길이). 계산 비용 약 1/3 |
+| batch | 64 | 논문 §4.3 시뮬레이션 fine-tune (HF 공식 체크포인트는 32) |
+| 정밀도 | fp32 학습 (AMP 없음), 고정 VLM은 bf16 로드 | 논문은 bf16 + `torch.compile` (속도용). 이 모델은 VLM이 이미 bf16이고 학습 부분이 작아 bf16 autocast가 오히려 약 7% 느림 (5090: 0.402 vs 0.376 s/step, loss 동일) |
+
+### 평가
+- 학습 중 모니터링: 10k마다, 4 suite × 10 태스크 × 태스크당 1회 (40 에피소드), `n_action_steps=10`. 잡음이 커서 추세 확인용.
+- 논문 수치: 논문 §4.1과 같게 **태스크당 10회** (suite당 100, 총 400 에피소드)로 최종 체크포인트를 따로 평가하고 suite별 + 평균 성공률을 보고할 것 (TODO).
+- SmolVLA 베이스라인: 2.3 명령으로 같은 데이터·batch·30k 스텝 학습, 같은 `n_action_steps=10`으로 평가 (TODO). 논문 프로토콜(`n_action_steps=1`) 결과는 참고용으로 같이 보고.
+
+### SmolVLA 논문과 다른 점 (논문에 쓸 것)
+- 학습 30k 스텝 (논문 100k): 기준 스케줄이 30k 이후 최소 학습률이라 추가 70k의 효과가 작고, 계산 비용을 1/3로 줄임. 베이스라인도 같은 30k로 학습해 공정성 유지.
+- 재계획 10스텝 (논문 시뮬레이션은 매 스텝): 논문 Table 13에서 10이 가장 좋고, latent_sde는 drift가 매 tick state 피드백을 받아 재계획 주기가 h·z 갱신에만 해당.
+- Adam (SmolVLA는 AdamW): wd 1e-10에서 수치적으로 같음.
+- fp32 학습 (논문 bf16): 속도 이득이 없어서 (위 정밀도 행).
+
+### 버전 고정 방침
+- 데이터와 VLM 모두 고정하지 않음: 데이터는 lerobot 기본 `v3.0` 태그, VLM은 Hub `main` (SmolVLA와 Latent-SDE가 항상 같은 것을 받음).
+- 논문용 기록 (2026-10-01 학습 기준): `lerobot/libero` rev `a1aaacb7f6cd6ee5fb43120f673cebb0cfea7dd4`, `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` rev `7b375e1b73b11138ff12fe22c8f2822d8fe03467`.
+
+### 참고 출처
+- SmolVLA 논문: arXiv 2506.01844 — §4.1 (LIBERO 데이터·평가), §4.3 (구현 세부), Table 12 (chunk 크기), Table 13 (실행 스텝).
+- lerobot `src/lerobot/policies/smolvla/configuration_smolvla.py`: optimizer/scheduler 프리셋 (lr 1e-4, β (0.9, 0.95), eps 1e-8, wd 1e-10, clip 10, warmup 1,000, decay 30k → 2.5e-6).
+- HF 공식 체크포인트 `HuggingFaceVLA/smolvla_libero_ckpts` (`100000/pretrained_model/train_config.json`): 100k 스텝, batch 32, decay 30k, `n_action_steps=1`, `physical-intelligence/libero`.
+- openpi `src/openpi/training/optimizer.py` (`CosineDecaySchedule`: warmup 1,000, peak 2.5e-5, decay 30k, 2.5e-6), `src/openpi/training/config.py` (`pi0_libero`: `num_train_steps=30_000`).

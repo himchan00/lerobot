@@ -66,6 +66,11 @@ class LatentSDEPolicy(PreTrainedPolicy):
     def __init__(self, config: LatentSDEConfig, **kwargs):
         super().__init__(config)
         self.config = config
+        # Training from scratch: sweep the dataset once for the action scale (cached, stored in the config).
+        if config.action_scale is None and not config.pretrained_path and kwargs.get("dataset_meta") is not None:
+            from .action_scale import resolve_action_scale
+
+            config.action_scale = resolve_action_scale(config, kwargs["dataset_meta"])
 
         self._queues = None
         self._cached_context: ObservationContext | None = None
@@ -156,7 +161,6 @@ class LatentSDEModel(nn.Module):
     def __init__(self, config: LatentSDEConfig):
         super().__init__()
         self.config = config
-        self.action_representation = config.action_representation
         self.state_dim = config.robot_state_feature.shape[0]
         self.action_dim = config.action_feature.shape[0]
         if config.sde_geometry not in ("euclidean", "so3_r3_body"):
@@ -295,13 +299,19 @@ class LatentSDEModel(nn.Module):
             )
 
         # Action-decoder variance σ² (SDE diffusion coeff²): a buffer, NOT gradient-trained — EMA'd
-        # toward the analytic per-batch MLE dt·mean‖v*−μ‖² (calibrated σ-VAE, arXiv:2006.13202), and
+        # toward the analytic per-batch MLE mean‖d*−μ‖² (calibrated σ-VAE, arXiv:2006.13202), and
         # WARM-STARTED from the first training batch. Warm-start matters: a σ²=1 init down-weights recon
-        # by ~dt/σ² and stalls early convergence (posterior collapses under β before σ calibrates). Feeds
-        # the Gaussian NLL and SDE noise σ·√dt. Body mode estimates each controller-coordinate
-        # variance separately, including the independent gripper command. Euclidean VQ keeps σ²=1.
-        self.register_buffer("action_var", torch.ones((self.action_dim,) if self.pose_geometry else ()))
+        # by ~1/σ² and stalls early convergence (posterior collapses under β before σ calibrates). Feeds
+        # the Gaussian NLL and SDE noise σ. One scalar in every mode (body mode included, over all
+        # seven controller coordinates), so the rescaled recon gradient is the unweighted MSE gradient.
+        # Euclidean VQ keeps σ²=1.
+        self.register_buffer("action_var", torch.ones(()))
         self.register_buffer("sigma_initialized", torch.zeros((), dtype=torch.bool))
+        # Per-dim action scale s (config.action_scale): drift target d/s, output s·μ.
+        scale = config.action_scale if config.action_scale is not None else [1.0] * self.action_dim
+        if len(scale) != self.action_dim:
+            raise ValueError(f"`action_scale` needs {self.action_dim} values, got {len(scale)}.")
+        self.register_buffer("action_scale", torch.tensor(scale, dtype=torch.float32), persistent=False)
 
         if config.compile_model:
             self.net = torch.compile(self.net, mode=config.compile_mode)
@@ -346,10 +356,9 @@ class LatentSDEModel(nn.Module):
         state_features = self.state_encoder(state_obs.flatten(start_dim=1))
         return ObservationContext(h=torch.cat([img_features.flatten(start_dim=1), state_features], dim=-1))
 
-    def _effective_sigma(self) -> float | Tensor:
-        """Diffusion std in decoder coordinates; keep the legacy scalar rounding in Euclidean mode."""
-        sigma = self.action_var.sqrt()
-        return sigma if self.pose_geometry else sigma.item()
+    def _effective_sigma(self) -> float:
+        """Scalar diffusion std in decoder coordinates."""
+        return self.action_var.sqrt().item()
 
     def _state_features(self, state: Tensor, reference_state: Tensor | None = None) -> Tensor:
         if self.pose_geometry:
@@ -361,7 +370,6 @@ class LatentSDEModel(nn.Module):
         state: Tensor,
         action: Tensor,
         action_is_pad: Tensor | None,
-        dt: float,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         batch_size, horizon = state.shape[:2]
         augment = self.training and self.config.state_noise_std > 0
@@ -377,11 +385,14 @@ class LatentSDEModel(nn.Module):
         if self.config.do_mask_loss_for_padding:
             state = torch.where(candidates[..., None], state, torch.zeros_like(state))
             action = torch.where(candidates[..., None], action, torch.zeros_like(action))
-        target_pose = action_to_endpoint(pose_from_state(state), action[..., :6])
+        pose = pose_from_state(state)
+        target_pose = action_to_endpoint(pose, action[..., :6])
         target_gripper = action[..., 6:7]
+        # Posterior input: the clean body-frame increment / s (the noise-free drift target).
+        post_action = torch.cat((local(pose, target_pose), target_gripper), dim=-1) / self.action_scale.to(state.dtype)
         query = state
         if augment:
-            std: float | Tensor = self.config.state_noise_std * math.sqrt(dt)
+            std: float | Tensor = self.config.state_noise_std * self.action_scale[:6].to(state.dtype)
             if self.config.state_noise_schedule == "linear":
                 ramp = torch.arange(1, horizon + 1, device=state.device, dtype=state.dtype) / horizon
                 std = std * ramp[None, :, None]
@@ -395,27 +406,26 @@ class LatentSDEModel(nn.Module):
                     for value in (target_pose, target_gripper)
                 )
         tangent = local(pose_from_state(query), target_pose)
-        velocity = torch.cat((tangent, target_gripper), dim=-1) / dt
-        return state, action, query, velocity, candidates
+        return state, post_action, query, torch.cat((tangent, target_gripper), dim=-1), candidates
 
     def _sde_step(
         self,
         x_now: Tensor,
         mu: Tensor,
-        dt: float,
         deterministic: bool,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
-        mean = x_now + mu * dt
-        if deterministic:
-            return mean
-        std = self._effective_sigma() * (dt ** 0.5)
-        if noise is not None:
-            eps = noise.to(dtype=mean.dtype, device=mean.device)
-        else:
-            eps = torch.randn(mean.shape, dtype=mean.dtype, device=mean.device, generator=generator)
-        return mean + std * eps
+        # One-step action = s·(μ + σ·ε).
+        delta = mu
+        if not deterministic:
+            std = self._effective_sigma()
+            if noise is not None:
+                eps = noise.to(dtype=delta.dtype, device=delta.device)
+            else:
+                eps = torch.randn(delta.shape, dtype=delta.dtype, device=delta.device, generator=generator)
+            delta = delta + std * eps
+        return x_now + self.action_scale.to(delta.dtype) * delta
 
     def sample_z_from_prior(
         self,
@@ -509,19 +519,13 @@ class LatentSDEModel(nn.Module):
                    Body mode uses ordinary Gaussian noise in normalized body-controller coordinates.
         """
         mu = self.predict_drift(x_now[:, None], context, z, x0=x0[:, None] if x0 is not None else None)[:, 0]
-        dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
         if self.pose_geometry:
             mu = mu.to(torch.float64 if x_now.dtype == torch.float64 else torch.float32)
         # Keep controller actions in the measured-state dtype under autocast.
-        integration_anchor = (
-            x_now
-            if self.action_representation == "target_state" and not self.pose_geometry
-            else x_now.new_zeros(mu.shape)
-        )
+        integration_anchor = x_now.new_zeros(mu.shape) if self.pose_geometry else x_now
         action = self._sde_step(
             integration_anchor,
             mu,
-            dt=dt,
             deterministic=self.config.deterministic_inference,
             generator=generator,
             noise=noise,
@@ -535,18 +539,19 @@ class LatentSDEModel(nn.Module):
         return action
 
     def compute_loss(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float]]:
-        """ELBO loss (Gaussian path): nll + beta·KL[q‖p] over the configured action representation.
+        """ELBO loss (Gaussian path): nll + beta·KL[q‖p].
 
-        In Euclidean mode, nll = Gaussian NLL of the decoder Δx ~ N(μ·dt, σ²·dt): per element
-        0.5·log(2πσ²·dt) + dt·(v*−μ)²/(2σ²), where v* is `(a-x)/dt` for target-state
-        actions and `a/dt` for delta-state actions. Terms are summed over the H·D deltas then /(H·D);
+        In Euclidean mode, nll = Gaussian NLL of the one-step decoder d*/s ~ N(μ, σ²): per element
+        0.5·log(2πσ²) + (d*−μ)²/(2σ²), where d* = a−x (target-state actions) divided by the action
+        scale s. Terms are summed over the H·D steps then /(H·D);
         KL is likewise /(H·D), so both share the scale and β keeps its meaning (β=1 = ELBO). σ²
-        (`self.action_var`) is NOT gradient-trained — an EMA of the per-batch MLE dt·mean‖v*−μ‖²
-        (σ-VAE), so the NLL trains only μ. VQ/FSQ keep MSE-mean recon + prior-CE (+ commitment for
+        (`self.action_var`) is NOT gradient-trained — an EMA of the per-batch MLE mean‖d*−μ‖²
+        (σ-VAE), so the NLL trains only μ. The optimized loss is (nll + β·KL)·sg(2σ²), whose recon
+        gradient is the plain MSE gradient. VQ/FSQ keep MSE-mean recon + prior-CE (+ commitment for
         "vq"); a plain-MSE `recon_loss` is logged for the z-usage/leakage diagnostics.
 
         Body mode uses local(query, nominal endpoint), expressed in controller units, as the delta
-        target and estimates a diagonal EMA. The same Gaussian/MSE and H*7 normalization apply.
+        target and shares the scalar σ² EMA. The same Gaussian/MSE and H*7 normalization apply.
         This is a local tangent approximation, not a globally normalized manifold transition.
         Nearest augmentation relabels endpoints, not the clean posterior actions.
 
@@ -573,29 +578,25 @@ class LatentSDEModel(nn.Module):
         state_full = batch[OBS_STATE]
         n_lead = self.config.n_obs_steps - 1
         state_seq = state_full[:, n_lead:]                    # (B, H, state_dim) — horizon states (clean)
-        dt = self.config.sde_dt if self.config.sde_dt is not None else 1.0
-        noise = (
-            self.action_representation == "target_state" and self.training and self.config.state_noise_std > 0
-        )
-        std = self.config.state_noise_std * dt**0.5
+        noise = self.training and self.config.state_noise_std > 0
+        std = self.config.state_noise_std * self.action_scale.to(state_seq.dtype)
 
         # Drift input (train-only state-noise): perturb the demo states, then recompute the recon
         # target from the perturbed anchor (corrective drift). The posterior still reads clean actions.
-        # state_noise_schedule: "uniform" = std·√dt on every tick; "linear" = std
-        # ramps std·√dt/H → std·√dt across chunk ticks 0..H-1 (tick 0 gets std·√dt/H, NOT zero;
-        # peak at t=H-1).
-        pose_velocity = None
+        # state_noise_schedule: "uniform" = std·s on every tick; "linear" ramps it (1/H → 1)× over the chunk.
+        pose_drift_target = None
         pose_candidates = None
         if self.pose_geometry:
-            state_seq, action_target, state_win, pose_velocity, pose_candidates = self._prepare_pose_training(
-                state_seq, action_target, batch.get("action_is_pad"), dt
+            # action_target becomes the posterior input: clean body-frame increment / s.
+            state_seq, action_target, state_win, pose_drift_target, pose_candidates = self._prepare_pose_training(
+                state_seq, action_target, batch.get("action_is_pad")
             )
         elif not noise:
             state_win = state_seq
         elif self.config.state_noise_schedule == "linear":
             delta = torch.arange(H, device=state_seq.device, dtype=state_seq.dtype)
-            std_t = std * (delta + 1) / H                # (H,) std/H at tick 0 → std at tick H-1
-            state_win = state_seq + std_t.view(1, -1, 1) * torch.randn_like(state_seq)
+            std_t = std * ((delta + 1) / H).view(-1, 1)  # (H, D) std/H at tick 0 → std at tick H-1
+            state_win = state_seq + std_t.unsqueeze(0) * torch.randn_like(state_seq)
         else:  # "uniform"
             state_win = state_seq + std * torch.randn_like(state_seq)
 
@@ -603,7 +604,7 @@ class LatentSDEModel(nn.Module):
         x_seq_clean = state_seq                              # (B, H, state_dim) — clean demo anchor x_k
 
         # Hold the clean chunk origin, not the augmented query or the oldest context observation.
-        # Only drift features and target-state posterior actions are re-centered; targets stay unchanged.
+        # Only drift features and Euclidean posterior actions are re-centered; targets stay unchanged.
         x0 = state_seq[:, :1] if self.normalize_state else None  # (B, 1, state_dim)
 
         context = self.encode_observations(batch)
@@ -625,9 +626,9 @@ class LatentSDEModel(nn.Module):
             valid = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
 
         if self.use_latent_z:
-            # Delta commands are already displacements, not state targets to subtract x0 from.
+            # Pose mode already holds body-frame increments; only Euclidean target states are re-centered.
             post_action = action_target
-            if x0 is not None and self.action_representation == "target_state":
+            if x0 is not None and not self.pose_geometry:
                 post_action = action_target - x0
 
             if self.use_vq:
@@ -658,14 +659,10 @@ class LatentSDEModel(nn.Module):
         mu = self.predict_drift(x_seq, context, z_q, x0=x0)
 
         if self.pose_geometry:
-            assert pose_velocity is not None
-            target_velocity = pose_velocity
-        elif self.action_representation == "delta_state":
-            # The complete action vector is interpreted as a per-step delta. For LIBERO this
-            # pragmatically includes the continuous gripper channel even though it is not geometric.
-            target_velocity = action_target / dt
+            assert pose_drift_target is not None
+            drift_target = pose_drift_target
         else:
-            # Recon target v* = (a_anchor − x̃)/dt: one-step full return to a demo action from the noised
+            # Recon target d* = a_anchor − x̃: one-step full return to a demo action from the noised
             # anchor x̃ = x_seq. action_anchor picks a_anchor:
             #   "clean"   — the corresponding-index action a_k (== legacy corrective target).
             #   "nearest" — the action a_j of the nearest demo state x_j over the chunk (autonomous field; z
@@ -675,8 +672,9 @@ class LatentSDEModel(nn.Module):
                 a_anchor = torch.gather(action_target, 1, nn_idx.unsqueeze(-1).expand(-1, -1, action_dim))
             else:  # "clean"
                 a_anchor = action_target
-            target_velocity = (a_anchor - x_seq) / dt
-        sq_err = (mu - target_velocity) ** 2                 # (B, H, action_dim) — unmasked
+            drift_target = a_anchor - x_seq
+        drift_target = drift_target / self.action_scale.to(drift_target.dtype)
+        sq_err = (mu - drift_target) ** 2                 # (B, H, action_dim) — unmasked
         # Plain-MSE recon (zero copy-padded ticks, normalize by NOMINAL B·H·D, reduces to a plain mean
         # when nothing is masked). Not the training objective in the Gaussian path — kept for logging
         # and the z-usage / prior-leakage diagnostics below, which compare recon MSE across z choices.
@@ -689,19 +687,19 @@ class LatentSDEModel(nn.Module):
                 error = sq_err.detach().to(
                     torch.float64 if sq_err.dtype == torch.float64 else torch.float32
                 )
-                sums = dt * (error * valid.unsqueeze(-1)).sum(dim=(0, 1))
-                stats = torch.cat((sums, valid.sum().to(sums).reshape(1)))
+                sums = (error * valid.unsqueeze(-1)).sum()
+                stats = torch.stack((sums, (valid.sum() * action_dim).to(sums)))
                 if (
                     self.training
                     and torch.distributed.is_available()
                     and torch.distributed.is_initialized()
                 ):
                     torch.distributed.all_reduce(stats)
-                batch_var = (stats[:-1] / stats[-1]).clamp_min(1e-8)
+                batch_var = (stats[0] / stats[1]).clamp_min(1e-8)
             elif self.config.do_mask_loss_for_padding:
-                batch_var = dt * (sq_err.detach() * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim).clamp_min(1)
+                batch_var = (sq_err.detach() * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim).clamp_min(1)
             else:
-                batch_var = dt * sq_err.detach().mean()
+                batch_var = sq_err.detach().mean()
             if self.training:
                 d = self.config.sigma_ema_decay
                 with torch.no_grad():
@@ -723,7 +721,7 @@ class LatentSDEModel(nn.Module):
             loss = recon_loss + other_loss
         else:
             var = self.action_var                            # σ² — detached buffer, so only μ gets a gradient
-            nll_elem = 0.5 * math.log(2 * math.pi * dt) + 0.5 * var.log() + dt * sq_err / (2 * var)
+            nll_elem = 0.5 * math.log(2 * math.pi) + 0.5 * var.log() + sq_err / (2 * var)
             if self.config.do_mask_loss_for_padding:
                 nll_elem = nll_elem * valid.unsqueeze(-1)    # padded ticks are not observations
             # nll (sum over H·D) and KL (sum over z_dim) both /(H·D): shrinks magnitude, β meaning kept.
@@ -735,18 +733,23 @@ class LatentSDEModel(nn.Module):
                 loss = nll_loss + self.config.beta * kl_loss  # β-VAE ELBO
             else:
                 loss = nll_loss
+            # × sg(2σ²): the recon gradient becomes the plain MSE gradient (β ratio unchanged).
+            loss = loss * (2.0 * self.action_var.detach())
 
         with torch.no_grad():
             loss_dict: dict[str, float] = {
                 "recon_loss": recon_loss.detach().item(),
-                "effective_sigma": self.action_var.mean().sqrt().item(),
+                "effective_sigma": self.action_var.sqrt().item(),
+                "target_rms": (
+                    (drift_target.detach().pow(2) * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim)
+                ).sqrt().item(),
             }
             if nll_loss is not None:
                 loss_dict["nll_loss"] = nll_loss.detach().item()
             if self.use_latent_z:
                 # z_usage_gap: extra recon error from a batch-rolled (mismatched) z. ~0 ⇒ z ignored.
                 mu_rolled = self.predict_drift(x_seq, context, torch.roll(z_q, shifts=1, dims=0), x0=x0)
-                rolled_se = (mu_rolled - target_velocity) ** 2
+                rolled_se = (mu_rolled - drift_target) ** 2
                 if self.config.do_mask_loss_for_padding:
                     rolled_se = rolled_se * valid.unsqueeze(-1)
                 recon_loss_rolled = rolled_se.mean()
@@ -757,7 +760,7 @@ class LatentSDEModel(nn.Module):
                 # encodes trajectory info the prior can't reproduce. prior_recon_gap = the deploy penalty.
                 z_prior = self.sample_z_from_prior(h)         # (B, z_dim), deploy prior distribution
                 mu_prior = self.predict_drift(x_seq, context, z_prior, x0=x0)
-                prior_se = (mu_prior - target_velocity) ** 2
+                prior_se = (mu_prior - drift_target) ** 2
                 if self.config.do_mask_loss_for_padding:
                     prior_se = prior_se * valid.unsqueeze(-1)
                 recon_loss_prior = prior_se.mean()
@@ -1031,7 +1034,7 @@ class LatentSDEDriftDiffusionNet(nn.Module):
         cond: (B, cond_dim)      — global conditioning concat([h, z]) (FiLM); z omitted when no latent.
     Output:
         mu:   (B, action_dim) — SDE drift. The action-decoder σ is a calibrated EMA buffer on
-                                LatentSDEModel (action_var = σ²); inference noise = σ·√dt.
+                                LatentSDEModel (action_var = σ²); inference noise = s·σ·ε.
 
     Width ladder mirrors DiffusionConditionalUnet1d's down_dims hourglass; the "mid" block
     keeps width at d_{L-1} (matches the two mid_modules in the U-Net).

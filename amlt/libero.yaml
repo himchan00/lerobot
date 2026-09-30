@@ -162,7 +162,7 @@ jobs:
           "$${COMPARISON_FLAGS[@]}" \
           "$${RESUME_FLAGS[@]}"
 
-  - name: latent_sde_libero
+  - name: latent_sde_so3_libero
     sku: 80G1-A100
     submit_args: &latent_sde_submit_args
       env:
@@ -176,7 +176,6 @@ jobs:
         LATENT_SDE_FLAGS=(
           --policy.context_encoder=smolvlm2
           --policy.conditioning=token_kv
-          --policy.action_representation=delta_state
           --policy.n_obs_steps=1
           --policy.horizon=50
           --policy.n_action_steps=50
@@ -194,21 +193,6 @@ jobs:
           --scheduler.peak_lr=1e-4
           --scheduler.decay_lr=2.5e-6
         )
-      - |
-        uv run --no-sync lerobot-train \
-          --policy.type=latent_sde \
-          --policy.normalization_mapping='{"VISUAL":"IDENTITY","STATE":"MEAN_STD","ACTION":"MEAN_STD"}' \
-          "$${COMPARISON_FLAGS[@]}" \
-          "$${LATENT_SDE_FLAGS[@]}" \
-          "$${RESUME_FLAGS[@]}"
-
-  - name: latent_sde_so3_libero
-    sku: 80G1-A100
-    submit_args: *latent_sde_submit_args
-    command:
-      - *resume_setup
-      - *comparison_setup
-      - *latent_sde_setup
       # Body-frame SO3 requires raw physical STATE/ACTION units; legacy so3_r3 is unsupported.
       - |
         uv run --no-sync lerobot-train \

@@ -65,7 +65,6 @@ class SmolVLMContextEncoder(nn.Module):
         self.return_layer_kv = config.conditioning == "token_kv"
         self.vlm = AutoModelForImageTextToText.from_pretrained(
             config.vlm_model_name,
-            revision=config.vlm_model_revision,
             torch_dtype="bfloat16",
             low_cpu_mem_usage=True,
         )
