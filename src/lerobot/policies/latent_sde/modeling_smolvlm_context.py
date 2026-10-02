@@ -49,7 +49,7 @@ def _preprocess_images(images: torch.Tensor, resize_shape: tuple[int, int]) -> t
 
 
 class SmolVLMContextEncoder(nn.Module):
-    """Frozen generic SmolVLM2 with trainable state-history tokens and context projection."""
+    """Frozen generic SmolVLM2 with trainable state-history tokens; returns the layer-wise prefix K/V."""
 
     def __init__(self, config: "LatentSDEConfig", state_dim: int):
         super().__init__()
@@ -58,11 +58,8 @@ class SmolVLMContextEncoder(nn.Module):
 
         self.resize_shape = tuple(config.vlm_resize_shape)
         self.num_layers = config.vlm_num_layers
-        self.context_dim = config.vlm_context_dim
-        self.output_dim = self.context_dim
         self.state_dim = state_dim
         self.padded_state_dim = max(32, state_dim)
-        self.return_layer_kv = config.conditioning == "token_kv"
         self.vlm = AutoModelForImageTextToText.from_pretrained(
             config.vlm_model_name,
             torch_dtype="bfloat16",
@@ -77,10 +74,6 @@ class SmolVLMContextEncoder(nn.Module):
             parameter.requires_grad_(False)
         self.vlm.eval()
 
-        self.projection = nn.Sequential(
-            nn.LayerNorm(hidden_size),
-            nn.Linear(hidden_size, self.context_dim),
-        )
         self.state_proj = nn.Linear(self.padded_state_dim, hidden_size)
 
     @property
@@ -129,7 +122,7 @@ class SmolVLMContextEncoder(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[LayerKV, ...]]:
+    ) -> tuple[LayerKV, ...]:
         from lerobot.policies.smolvla.smolvlm_with_expert import apply_rope
 
         text_model = self.vlm.model.text_model
@@ -147,6 +140,8 @@ class SmolVLMContextEncoder(nn.Module):
             key_states = apply_rope(attention.k_proj(hidden_states).view(hidden_shape), position_ids)
             value_states = attention.v_proj(hidden_states).view(hidden_shape)
             layer_kv.append(LayerKV(key=key_states, value=value_states))
+            if len(layer_kv) == len(text_model.layers):
+                break  # only the K/V are read; the last layer's output is never used
             num_heads = query_states.shape[2]
             num_kv_heads = key_states.shape[2]
             num_kv_groups = num_heads // num_kv_heads
@@ -176,7 +171,7 @@ class SmolVLMContextEncoder(nn.Module):
             hidden_states = layer.mlp(layer.post_attention_layernorm(hidden_states))
             hidden_states += residual
 
-        return text_model.norm(hidden_states), tuple(layer_kv)
+        return tuple(layer_kv)
 
     def _pad_state(self, state: torch.Tensor) -> torch.Tensor:
         if self.padded_state_dim == self.state_dim:
@@ -230,12 +225,5 @@ class SmolVLMContextEncoder(nn.Module):
             (num_state_tokens, num_state_tokens), dtype=torch.bool, device=hidden_states.device
         ).tril()
         position_ids = torch.cumsum(valid_mask, dim=1) - 1
-        hidden_states, layer_kv = self._run_text_model(hidden_states, attention_mask, position_ids)
-        pooled = (hidden_states * valid_mask.unsqueeze(-1)).sum(dim=1)
-        pooled = pooled / valid_mask.sum(dim=1, keepdim=True).clamp_min(1)
-
-        projection_parameter = next(self.projection.parameters())
-        h = self.projection(pooled.to(device=projection_parameter.device, dtype=projection_parameter.dtype))
-        if not self.return_layer_kv:
-            return ObservationContext(h=h)
-        return ObservationContext(h=h, layer_kv=layer_kv, valid_mask=valid_mask)
+        layer_kv = self._run_text_model(hidden_states, attention_mask, position_ids)
+        return ObservationContext(layer_kv=layer_kv, valid_mask=valid_mask)

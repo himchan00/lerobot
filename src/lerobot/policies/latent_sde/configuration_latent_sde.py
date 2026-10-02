@@ -4,8 +4,8 @@
 # "Latent-SDE Policies for Hierarchical Robot Manipulation" (research_brief.md v7).
 #
 # PoC scope:
-#   * per-episode latent strategy z with prior p_ψ(z|h) and posterior q_φ(z|a_seq);
-#     drift/diffusion net reads z as FiLM cond alongside h (cond = concat([h, z])); net input is x_aug only;
+#   * per-episode latent strategy z with prior p_ψ(z|context) and posterior q_φ(z|a_seq);
+#     the light drift/diffusion net reads only the current state, with z as its sole FiLM cond;
 #   * free-space Euler-Maruyama log-likelihood (research_brief.md §3.7) + KL[q||p] (β-VAE).
 #
 # Deferred: controller-pushforward objective and (M, K) compliance heads (Tier 3).
@@ -28,7 +28,6 @@ from lerobot.utils.constants import OBS_STATE
 ENV_PRESETS = {
     "pusht": {
         "context_encoder": "resnet",
-        "conditioning": "film",
         "sde_geometry": "euclidean",
         "n_obs_steps": 2,
         "horizon": 16,
@@ -40,6 +39,7 @@ ENV_PRESETS = {
             "ACTION": NormalizationMode.MIN_MAX,
         },
         "do_mask_loss_for_padding": False,
+        "state_noise_std": 0.3,
         "optimizer_lr": 1e-3,
         "optimizer_betas": (0.95, 0.999),
         "optimizer_weight_decay": 1e-6,
@@ -48,7 +48,6 @@ ENV_PRESETS = {
     },
     "libero": {
         "context_encoder": "smolvlm2",
-        "conditioning": "token_kv",
         "sde_geometry": "so3_r3_body",
         "n_obs_steps": 1,
         "horizon": 50,
@@ -61,6 +60,7 @@ ENV_PRESETS = {
             "ACTION": NormalizationMode.IDENTITY,
         },
         "do_mask_loss_for_padding": True,
+        "state_noise_std": 0.0,
         # SmolVLA's values; it uses AdamW, identical to Adam at this weight decay.
         "optimizer_lr": 1e-4,
         "optimizer_betas": (0.9, 0.95),
@@ -87,18 +87,18 @@ class LatentSDEConfig(PreTrainedConfig):
              mode, the one-step residual is anchored to that frame (`mean = x_t + s·μ`).
              At training time the trailing horizon states are sampled directly from the dataset
              (see `observation_delta_indices_per_key`), matching the deployment-time stream.
-        h  — joint observation conditioning (Tier-1). ResNet image features are concatenated
-             with an embedding of the causal state window. SmolVLM2 receives image-language
-             tokens plus one projected token per causal state frame, ordered oldest to newest.
-             Refreshed every `n_action_steps` ticks so the context-encoder duty cycle
-             matches DiffusionPolicy's (fair compute) and the Tier-1/Tier-2 rate split
-             is reproduced architecturally. cf. notes/h_is_conditioning.tex
-        z  — per-episode latent strategy. CVAE-style: prior p(z|h) is re-sampled at
-             deployment **in lock-step with every h refresh** ("episode" =
-             one h-refresh window), committing each chunk to one mode. At training,
+        context — joint observation context (Tier-1), read only by the prior. ResNet: a vector h of
+             image features concatenated with an embedding of the causal state window. SmolVLM2:
+             the layer-wise K/V of image-language tokens plus one projected token per causal state
+             frame, ordered oldest to newest. Refreshed every `n_action_steps` ticks so the
+             context-encoder duty cycle matches DiffusionPolicy's (fair compute) and the
+             Tier-1/Tier-2 rate split is reproduced architecturally.
+        z  — per-episode latent strategy. CVAE-style: prior p(z|context) is re-sampled at
+             deployment **in lock-step with every context refresh** ("episode" =
+             one refresh window), committing each chunk to one mode. At training,
              posterior q(z|a_seq) provides chunk-level mode signal; loss = NLL +
-             beta · KL[q||p]. z conditions the drift net via FiLM alongside h
-             (cond = concat([h, z])); the drift/diffusion block structure is unchanged.
+             beta · KL[q||p]. z is the drift net's only FiLM conditioning, so observations
+             reach the fast loop only through z.
 
     Euclidean drift/diffusion network output:
         mu — the standardized one-step action, shape (B, action_dim), in units of the action scale s
@@ -127,11 +127,11 @@ class LatentSDEConfig(PreTrainedConfig):
         do_mask_loss_for_padding: mask copy-padded chunk ticks (episode ends) in the recon + posterior.
         sde_geometry:     "euclidean" predicts a target-state residual (action_dim == state_dim);
                           "so3_r3_body" predicts body-local increments of relative pose commands plus
-                          the gripper (same scalar variance EMA).
+                          the gripper (one variance EMA per position/rotation/gripper group).
         action_scale:     per-dimension std of the one-step action target, swept from the dataset.
         sigma_activation: "exp" or "softplus"; used only by z prior/posterior σ heads.
         beta:             β-VAE coefficient on KL[q||p] in the ELBO loss = nll + beta·KL. The
-                          action-decoder σ² (one scalar in both modes) is calibrated by EMA to the
+                          action-decoder σ² (scalar; per group in body mode) is calibrated by EMA to the
                           analytic MLE (σ-VAE), not gradient-trained (see sigma_ema_decay).
 
     Removed (no analog in single-step SDE):
@@ -153,15 +153,15 @@ class LatentSDEConfig(PreTrainedConfig):
     normalization_mapping: dict[str, NormalizationMode] | None = None
 
     # ---- Context / action representation capabilities ----------------------------------------
+    # context_encoder also fixes the prior: "resnet" — MLP on h; "smolvlm2" — a learnable query reads
+    #   the layer-wise prefix K/V like SmolVLA's action expert (Gaussian z only).
     context_encoder: str | None = None  # "resnet" | "smolvlm2"
-    conditioning: str | None = None  # "film" | "token_kv"; token_kv requires SmolVLM2
 
     sde_geometry: str | None = None  # "euclidean" | "so3_r3_body"
 
     # The generic SmolVLM2 backbone (Hub main, same as SmolVLA's default) is kept frozen.
     vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
     vlm_num_layers: int = 16
-    vlm_context_dim: int = 512
     vlm_resize_shape: tuple[int, int] = (512, 512)
     tokenizer_max_length: int = 48
 
@@ -177,23 +177,12 @@ class LatentSDEConfig(PreTrainedConfig):
     use_separate_rgb_encoder_per_camera: bool = True
 
     # ---- Drift / diffusion network ------------------------------------------------------------
-    # down_dims reused from DiffusionConfig for per-layer capacity parity with the U-Net's
-    # residual blocks. Point-wise FiLM-ResNet hourglass: state → 256 → 512 → 512 → 256 → heads. 
-    # (Horizon axis absent ⇒ kernel_size=1 == Linear.) DP uses (512, 1024, 2048), but we scale down for the SDE's single-step output.
+    # down_dims follows DiffusionConfig's U-Net width ladder, one level shorter for the single-step output
+    # (DP uses (512, 1024, 2048)). Point-wise FiLM-ResNet hourglass: state → 512 → 1024 → 1024 → 512 → μ,
+    # every block FiLM-conditioned on z. (Horizon axis absent ⇒ kernel_size=1 == Linear.)
     down_dims: tuple[int, ...] = (512, 1024)
     n_groups: int = 8
     use_film_scale_modulation: bool = True
-
-    # z_mode: where the latent z enters the drift net (no effect when use_latent_z=False):
-    #   "cond"  — append z to FiLM conditioning, or add its projection to the token-KV query.
-    #   "input" — concat z with the current state before the drift's input projection.
-    z_mode: str = "cond"  # "cond" | "input"
-
-    # drift_uses_h: provide joint context directly to the drift (FiLM vector or prefix K/V).
-    #   False removes that direct route; deployment context can still reach the field through
-    #   z sampled from p(z|h). The current state remains the drift input in either mode.
-    #   Acts independently of z_mode; without z this is a proprio-only ablation.
-    drift_uses_h: bool = True
 
     # ---- SDE specifics ------------------------------------------------------------------------
     # One drift step per action at the environment's own rate; there is no separate model-time Δt.
@@ -205,13 +194,15 @@ class LatentSDEConfig(PreTrainedConfig):
 
     # Action-decoder σ² (SDE diffusion coeff²) is NOT gradient-trained: it's EMA'd toward the analytic
     # per-batch MLE mean‖d*/s−μ‖² (calibrated σ-VAE, arXiv:2006.13202). sigma_ema_decay = EMA decay.
-    # One scalar in every mode (so3_r3_body included): with the loss rescale sg(2σ²) the recon
-    # gradient is then exactly the unweighted MSE gradient over all action coordinates.
+    # One scalar in Euclidean mode, where the loss rescale sg(2σ²) makes the recon gradient the plain
+    # MSE gradient. so3_r3_body keeps one σ² per position/rotation/gripper group, so each group's
+    # error is weighted by its own residual (as in a heteroscedastic Gaussian decoder).
     sigma_ema_decay: float = 0.99
 
     # Train-only state-noise augmentation: perturbs the drift's state window by std·s per frame (a fraction
-    # of a typical one-step action) and recomputes the corrective target. 0.0 = off.
-    state_noise_std: float = 0.3
+    # of a typical one-step action) and recomputes the corrective target. 0.0 = off. None → ENV_PRESETS
+    # (pusht 0.3; libero 0.0, where noise gave no gain).
+    state_noise_std: float | None = None
 
     # state_noise_schedule: how the per-frame std varies across the chunk.
     #   "uniform" — same std·s on every frame.
@@ -241,15 +232,13 @@ class LatentSDEConfig(PreTrainedConfig):
     deterministic_inference: bool = True
 
     # ---- Per-"episode" latent z (research_brief.md §1.2) ---------------------------------------
-    # use_latent_z=False recovers the no-z PoC exactly (prior/posterior not built, no KL).
     # z_dim=8: Picked by analogy with ACT's CVAE (latent_dim=32, hidden_dim=512 → z/h = 1/16);
     # beta: β-VAE coefficient on KL[q||p]. Too high → posterior collapse (q≡p, z carries no chunk info).
     #   Too low → q ignores prior (deployment z uninformed). 1e-2 .. 1.0 worth sweeping.
     # z_prior_hidden_dim / z_posterior_hidden_dim: hidden width of the (μ,σ) MLPs. None uses the
-    # original visual-window width for ResNet, or vlm_context_dim for SmolVLM2.
+    # visual-window width for ResNet, or 512 for SmolVLM2 (its prior is the token-KV expert).
     # deterministic_z_inference: use μ_p instead of sampling z at deploy. Debug/ablation only.
 
-    use_latent_z: bool = True
     z_dim: int = 8
     z_prior_hidden_dim: int | None = None
     z_posterior_hidden_dim: int | None = None
@@ -337,12 +326,9 @@ class LatentSDEConfig(PreTrainedConfig):
         if self.action_anchor not in ("clean", "nearest"):
             raise ValueError(f"`action_anchor` must be 'clean' or 'nearest'. Got {self.action_anchor!r}.")
 
-        if self.z_mode not in ("cond", "input"):
-            raise ValueError(f"`z_mode` must be 'cond' or 'input'. Got {self.z_mode!r}.")
-
         if self.use_vq:
-            if not self.use_latent_z:
-                raise ValueError("`use_vq=True` requires `use_latent_z=True`.")
+            if self.context_encoder == "smolvlm2":
+                raise ValueError("SmolVLM2's token-KV prior is Gaussian; `use_vq=True` needs the ResNet context.")
             if self.quantizer not in ("fsq", "vq"):
                 raise ValueError(f"`quantizer` must be 'fsq' or 'vq'. Got {self.quantizer!r}.")
             if self.quantizer == "fsq":

@@ -54,10 +54,10 @@ class LatentSDEPolicy(PreTrainedPolicy):
     Wraps `LatentSDEModel` and implements the LeRobot policy interface
     (reset / select_action / forward) with DiffusionPolicy-style observation queues.
 
-    Inference duty cycle (research_brief.md §1.2): h (context conditioning) and z
-    (per-episode latent) are refreshed together every `n_action_steps` ticks —
-    matching DP's context-encoder cadence. The drift/diffusion net runs every tick
-    on the current measured state.
+    Inference duty cycle (research_brief.md §1.2): the observation context and z (per-episode
+    latent, sampled from the prior on that context) are refreshed together every `n_action_steps`
+    ticks — matching DP's context-encoder cadence. The light drift/diffusion net runs every tick
+    on the current measured state and z only.
     """
 
     config_class = LatentSDEConfig
@@ -73,8 +73,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
             config.action_scale = resolve_action_scale(config, kwargs["dataset_meta"])
 
         self._queues = None
-        self._cached_context: ObservationContext | None = None
-        self._steps_until_h_refresh: int = 0
+        self._steps_until_refresh: int = 0
         self._cached_z: Tensor | None = None
         self._cached_x0: Tensor | None = None
 
@@ -85,14 +84,13 @@ class LatentSDEPolicy(PreTrainedPolicy):
         return self.model.parameters()
 
     def reset(self):
-        """Clear observation queues and cached context. Call on `env.reset()`."""
+        """Clear observation queues and the cached z. Call on `env.reset()`."""
         self._queues = {
             OBS_STATE: deque(maxlen=self.config.n_obs_steps),
         }
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
-        self._cached_context = None
-        self._steps_until_h_refresh = 0
+        self._steps_until_refresh = 0
         self._cached_z = None
         self._cached_x0 = None
 
@@ -108,7 +106,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """One SDE step per tick with per-tick state-feedback.
 
-        Refresh h every `n_action_steps` ticks and re-sample z alongside it (chunk-local hold).
+        Re-encode the context and re-sample z every `n_action_steps` ticks (chunk-local hold).
         """
         batch = dict(batch)
         batch.pop(ACTION, None)
@@ -121,22 +119,21 @@ class LatentSDEPolicy(PreTrainedPolicy):
         # The fast drift input is the current state; the context uses the causal observation window.
         x_now = self._queues[OBS_STATE][-1]                                # (B, D) — current state frame
 
-        # Slow path: re-encode h and re-sample z every n_action_steps ticks.
-        if self._cached_context is None or self._steps_until_h_refresh == 0:
+        # Slow path: re-encode the context and re-sample z every n_action_steps ticks.
+        if self._cached_z is None or self._steps_until_refresh == 0:
             stacked_images = torch.stack(list(self._queues[OBS_IMAGES]), dim=1)
             stacked_states = torch.stack(list(self._queues[OBS_STATE]), dim=1)
             context_batch = {OBS_IMAGES: stacked_images, OBS_STATE: stacked_states}
             if self.config.context_encoder == "smolvlm2":
                 for key in (OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK):
                     context_batch[key] = batch[key]
-            self._cached_context = self.model.encode_observations(context_batch)
-            self._cached_z = self.model.sample_z_from_prior(self._cached_context.h)
+            self._cached_z = self.model.sample_z_from_prior(self.model.encode_observations(context_batch))
             # Chunk-initial state: the origin for normalize_state (held for the whole refresh window).
             self._cached_x0 = x_now.clone()
-            self._steps_until_h_refresh = self.config.n_action_steps
+            self._steps_until_refresh = self.config.n_action_steps
 
-        action = self.model.step(x_now, self._cached_context, self._cached_z, x0=self._cached_x0, noise=noise)
-        self._steps_until_h_refresh -= 1
+        action = self.model.step(x_now, self._cached_z, x0=self._cached_x0, noise=noise)
+        self._steps_until_refresh -= 1
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float] | None]:
@@ -168,15 +165,14 @@ class LatentSDEModel(nn.Module):
         self.pose_geometry = config.sde_geometry == "so3_r3_body"
         self.state_feature_dim = 11 if self.pose_geometry else self.state_dim
 
-        # Both heads use joint observation context; the drift also reads current proprioception.
+        # Only the prior reads the joint observation context; the drift reads z and current proprioception.
         global_cond_dim = 0
         num_images = len(self.config.image_features)
         if self.config.context_encoder == "smolvlm2":
             from .modeling_smolvlm_context import SmolVLMContextEncoder
 
             self.context_encoder = SmolVLMContextEncoder(config, state_dim=self.state_feature_dim)
-            self.h_dim = self.context_encoder.output_dim
-            latent_hidden_dim = self.h_dim
+            latent_hidden_dim = 512
         elif self.config.use_separate_rgb_encoder_per_camera:
             # DiffusionRgbEncoder reads a few fields from the config; LatentSDEConfig matches
             # DiffusionConfig's names so no adaptation is needed.
@@ -194,65 +190,69 @@ class LatentSDEModel(nn.Module):
                 nn.Mish(),
             )
             self.h_dim = 2 * latent_hidden_dim
-        self.use_latent_z = config.use_latent_z
 
-        # use_latent_z=False -> no latent modules; otherwise p(z|h) and an action-only posterior.
+        # p(z|context) and an action-only posterior.
         self.use_vq = config.use_vq
 
         self.normalize_state = config.normalize_state
 
-        if not self.use_latent_z:
-            self.z_dim = 0
-            self.prior = None
-            self.posterior = None
-            self.vq = None
+        self.z_dim = config.z_dim
+        posterior_hidden = config.z_posterior_hidden_dim or latent_hidden_dim
+        prior_hidden = config.z_prior_hidden_dim or latent_hidden_dim
+
+        # TCN posterior depth auto-sized so its receptive field (RF ≈ 4·2^L) matches the chunk
+        # length (horizon), kernel 3. E.g. horizon 8→1, 16→2, 32→3, 64→4.
+        tcn_levels = max(1, round(math.log2(config.horizon / 4)))
+
+        if self.use_vq:
+            # Discrete latent (config.quantizer): FSQ or VQ. num_codes = size of the flat index
+            # space the categorical prior/CE/perplexity operate over.
+            if config.quantizer == "fsq":
+                self.num_codes = math.prod(config.fsq_levels)  # prod(levels)
+            else:  # "vq"
+                self.num_codes = config.vq_codebook_size
+            self.prior = LatentPriorVQ(
+                h_dim=self.h_dim,
+                codebook_size=self.num_codes,
+                hidden_dim=prior_hidden,
+            )
+            self.posterior = LatentPosteriorTrajVQ(
+                input_dim=self.action_dim,
+                z_dim=self.z_dim,
+                hidden_dim=posterior_hidden,
+                num_levels=tcn_levels,
+                n_groups=config.n_groups,
+            )
+            if config.quantizer == "fsq":
+                from vector_quantize_pytorch import FSQ
+                # FSQ: bounded scalar grid + straight-through rounding. No learnable codebook,
+                # no commitment loss, no dead codes — z_dim is fixed to len(levels) (config).
+                self.vq = FSQ(levels=config.fsq_levels)
+            else:  # "vq"
+                from vector_quantize_pytorch import VectorQuantize
+                self.vq = VectorQuantize(
+                    dim=self.z_dim,
+                    codebook_size=config.vq_codebook_size,
+                    decay=config.vq_decay,
+                    commitment_weight=config.vq_commit_weight,
+                    use_cosine_sim=True,  # STE: cosine distance is more stable than L2 for high-dim z
+                    rotation_trick=False,  # STE: forward z_q == raw code, so train matches inference (get_output_from_indices)
+                    kmeans_init=True,  # seed codes from data, not random Gaussian (avoids born-dead codes)
+                    threshold_ema_dead_code=2,  # revive codes whose EMA usage dies, countering codebook collapse
+                )
+                # NOTE: kmeans_init seeds K centroids from ONE batch of z_e (B vectors). If
+                # vq_codebook_size > batch_size, the surplus codes start unseeded — keep K <= batch_size.
         else:
-            self.z_dim = config.z_dim
-            posterior_hidden = config.z_posterior_hidden_dim or latent_hidden_dim
-            prior_hidden = config.z_prior_hidden_dim or latent_hidden_dim
+            if config.context_encoder == "smolvlm2":
+                from .modeling_token_kv import SmolVLMTokenKVPrior
 
-            # TCN posterior depth auto-sized so its receptive field (RF ≈ 4·2^L) matches the chunk
-            # length (horizon), kernel 3. E.g. horizon 8→1, 16→2, 32→3, 64→4.
-            tcn_levels = max(1, round(math.log2(config.horizon / 4)))
-
-            if self.use_vq:
-                # Discrete latent (config.quantizer): FSQ or VQ. num_codes = size of the flat index
-                # space the categorical prior/CE/perplexity operate over.
-                if config.quantizer == "fsq":
-                    self.num_codes = math.prod(config.fsq_levels)  # prod(levels)
-                else:  # "vq"
-                    self.num_codes = config.vq_codebook_size
-                self.prior = LatentPriorVQ(
-                    h_dim=self.h_dim,
-                    codebook_size=self.num_codes,
-                    hidden_dim=prior_hidden,
-                )
-                self.posterior = LatentPosteriorTrajVQ(
-                    input_dim=self.action_dim,
+                self.prior = SmolVLMTokenKVPrior(
+                    config,
+                    self.context_encoder.text_config,
                     z_dim=self.z_dim,
-                    hidden_dim=posterior_hidden,
-                    num_levels=tcn_levels,
-                    n_groups=config.n_groups,
+                    sigma_act=_sigma_act(config.sigma_activation),
+                    sigma_min=config.z_sigma_min,
                 )
-                if config.quantizer == "fsq":
-                    from vector_quantize_pytorch import FSQ
-                    # FSQ: bounded scalar grid + straight-through rounding. No learnable codebook,
-                    # no commitment loss, no dead codes — z_dim is fixed to len(levels) (config).
-                    self.vq = FSQ(levels=config.fsq_levels)
-                else:  # "vq"
-                    from vector_quantize_pytorch import VectorQuantize
-                    self.vq = VectorQuantize(
-                        dim=self.z_dim,
-                        codebook_size=config.vq_codebook_size,
-                        decay=config.vq_decay,
-                        commitment_weight=config.vq_commit_weight,
-                        use_cosine_sim=True,  # STE: cosine distance is more stable than L2 for high-dim z
-                        rotation_trick=False,  # STE: forward z_q == raw code, so train matches inference (get_output_from_indices)
-                        kmeans_init=True,  # seed codes from data, not random Gaussian (avoids born-dead codes)
-                        threshold_ema_dead_code=2,  # revive codes whose EMA usage dies, countering codebook collapse
-                    )
-                    # NOTE: kmeans_init seeds K centroids from ONE batch of z_e (B vectors). If
-                    # vq_codebook_size > batch_size, the surplus codes start unseeded — keep K <= batch_size.
             else:
                 self.prior = LatentPrior(
                     h_dim=self.h_dim,
@@ -261,52 +261,39 @@ class LatentSDEModel(nn.Module):
                     sigma_activation=config.sigma_activation,
                     sigma_min=config.z_sigma_min,
                 )
-                self.posterior = LatentPosteriorTraj(
-                    input_dim=self.action_dim,
-                    z_dim=self.z_dim,
-                    hidden_dim=posterior_hidden,
-                    sigma_activation=config.sigma_activation,
-                    sigma_min=config.z_sigma_min,
-                    num_levels=tcn_levels,
-                    n_groups=config.n_groups,
-                )
-                self.vq = None
-
-        # The context route and z input/conditioning route remain independent for both drift heads.
-        self.drift_uses_h = config.drift_uses_h
-        self.z_as_input = self.use_latent_z and config.z_mode == "input"
-        if config.conditioning == "token_kv":
-            from .modeling_token_kv import SmolVLMTokenKVDrift
-
-            self.net = SmolVLMTokenKVDrift(
-                config,
-                self.context_encoder.text_config,
-                state_dim=self.state_feature_dim,
-                output_dim=self.action_dim,
+            self.posterior = LatentPosteriorTraj(
+                input_dim=self.action_dim,
                 z_dim=self.z_dim,
-            )
-        else:
-            z_in_cond = self.use_latent_z and config.z_mode == "cond"
-            net_input_dim = self.state_feature_dim + (self.z_dim if self.z_as_input else 0)
-            net_cond_dim = (self.h_dim if self.drift_uses_h else 0) + (self.z_dim if z_in_cond else 0)
-            self.net = LatentSDEDriftDiffusionNet(
-                input_dim=net_input_dim,
-                action_dim=config.action_feature.shape[0],
-                cond_dim=net_cond_dim,
-                down_dims=config.down_dims,
+                hidden_dim=posterior_hidden,
+                sigma_activation=config.sigma_activation,
+                sigma_min=config.z_sigma_min,
+                num_levels=tcn_levels,
                 n_groups=config.n_groups,
-                use_film_scale_modulation=config.use_film_scale_modulation,
             )
+            self.vq = None
+
+        # Light per-tick drift: current state features in, z as the only FiLM conditioning.
+        self.net = LatentSDEDriftDiffusionNet(
+            input_dim=self.state_feature_dim,
+            action_dim=config.action_feature.shape[0],
+            cond_dim=self.z_dim,
+            down_dims=config.down_dims,
+            n_groups=config.n_groups,
+            use_film_scale_modulation=config.use_film_scale_modulation,
+        )
 
         # Action-decoder variance σ² (SDE diffusion coeff²): a buffer, NOT gradient-trained — EMA'd
         # toward the analytic per-batch MLE mean‖d*−μ‖² (calibrated σ-VAE, arXiv:2006.13202), and
         # WARM-STARTED from the first training batch. Warm-start matters: a σ²=1 init down-weights recon
         # by ~1/σ² and stalls early convergence (posterior collapses under β before σ calibrates). Feeds
-        # the Gaussian NLL and SDE noise σ. One scalar in every mode (body mode included, over all
-        # seven controller coordinates), so the rescaled recon gradient is the unweighted MSE gradient.
+        # the Gaussian NLL and SDE noise σ. One scalar in Euclidean mode; body mode keeps one σ² per
+        # action-scale group (position, rotation, gripper), whose residuals differ in kind.
         # Euclidean VQ keeps σ²=1.
-        self.register_buffer("action_var", torch.ones(()))
+        self.register_buffer("action_var", torch.ones((3,) if self.pose_geometry else ()))
         self.register_buffer("sigma_initialized", torch.zeros((), dtype=torch.bool))
+        if self.pose_geometry:
+            # Output coordinate → σ² group.
+            self.register_buffer("sigma_group", torch.tensor([0, 0, 0, 1, 1, 1, 2]), persistent=False)
         # Per-dim action scale s (config.action_scale): drift target d/s, output s·μ.
         scale = config.action_scale if config.action_scale is not None else [1.0] * self.action_dim
         if len(scale) != self.action_dim:
@@ -323,7 +310,7 @@ class LatentSDEModel(nn.Module):
         the result is cached and reused for `n_action_steps` ticks (matches DP's context-encoder
         duty cycle).
 
-        Returns h of shape (B, h_dim), plus per-layer K/V for token conditioning.
+        Returns the prior's input: ResNet h of shape (B, h_dim), or SmolVLM2's per-layer prefix K/V.
         """
         state = batch[OBS_STATE]
         state_obs = self._state_features(state[:, : self.config.n_obs_steps])
@@ -356,9 +343,9 @@ class LatentSDEModel(nn.Module):
         state_features = self.state_encoder(state_obs.flatten(start_dim=1))
         return ObservationContext(h=torch.cat([img_features.flatten(start_dim=1), state_features], dim=-1))
 
-    def _effective_sigma(self) -> float:
-        """Scalar diffusion std in decoder coordinates."""
-        return self.action_var.sqrt().item()
+    def _dim_var(self) -> Tensor:
+        """σ² per output coordinate (its group's value in body mode, the scalar in Euclidean mode)."""
+        return self.action_var[self.sigma_group] if self.pose_geometry else self.action_var
 
     def _state_features(self, state: Tensor, reference_state: Tensor | None = None) -> Tensor:
         if self.pose_geometry:
@@ -419,7 +406,7 @@ class LatentSDEModel(nn.Module):
         # One-step action = s·(μ + σ·ε).
         delta = mu
         if not deterministic:
-            std = self._effective_sigma()
+            std = self._dim_var().sqrt().to(delta.dtype)
             if noise is not None:
                 eps = noise.to(dtype=delta.dtype, device=delta.device)
             else:
@@ -427,19 +414,21 @@ class LatentSDEModel(nn.Module):
             delta = delta + std * eps
         return x_now + self.action_scale.to(delta.dtype) * delta
 
+    def _prior(self, context: ObservationContext):
+        """Prior head on the observation context: SmolVLM2's reads the layer K/V, ResNet's reads h."""
+        return self.prior(context) if self.config.context_encoder == "smolvlm2" else self.prior(context.h)
+
     def sample_z_from_prior(
         self,
-        h: Tensor,
+        context: ObservationContext,
         deterministic: bool | None = None,
         generator: torch.Generator | None = None,
-    ) -> Tensor | None:
-        """Sample z from the joint-context prior; return None when use_latent_z=False."""
-        if not self.use_latent_z:
-            return None
+    ) -> Tensor:
+        """Sample z from the joint-context prior."""
         if deterministic is None:
             deterministic = self.config.deterministic_z_inference
         if self.use_vq:
-            logits = self.prior(h)
+            logits = self._prior(context)
             if deterministic:
                 k = logits.argmax(dim=-1)
             else:
@@ -451,61 +440,30 @@ class LatentSDEModel(nn.Module):
                 return self.vq.indices_to_codes(k)
             return self.vq.get_output_from_indices(k)
         else:
-            mu_p, sigma_p = self.prior(h)
+            mu_p, sigma_p = self._prior(context)
             if deterministic:
                 return mu_p
             eps = torch.randn(mu_p.shape, dtype=mu_p.dtype, device=mu_p.device, generator=generator)
             return mu_p + sigma_p * eps
 
-    def _drift_inputs(self, x_aug: Tensor, h: Tensor, z: Tensor | None) -> tuple[Tensor, Tensor]:
-        """Assemble the drift net's (input, FiLM cond) from the two independent knobs:
-        input = [x_aug] (+ z if z_mode=="input"); cond = [h if drift_uses_h] (+ z if z_mode=="cond").
-        cond may be empty (0-dim) → the net runs as a plain MLP.
-        """
-        net_in = torch.cat([x_aug, z], dim=-1) if (self.z_as_input and z is not None) else x_aug
-        cond_parts = []
-        if self.drift_uses_h:
-            cond_parts.append(h)
-        if z is not None and not self.z_as_input:
-            cond_parts.append(z)
-        cond = torch.cat(cond_parts, dim=-1) if cond_parts else x_aug.new_zeros(x_aug.shape[0], 0)
-        return net_in, cond
-
-    def predict_drift(
-        self,
-        state: Tensor,
-        context: ObservationContext,
-        z: Tensor | None,
-        *,
-        x0: Tensor | None = None,
-    ) -> Tensor:
-        """Evaluate raw (B,H,D) states, optionally relative to the clean (B,1,D) chunk origin."""
+    def predict_drift(self, state: Tensor, z: Tensor, *, x0: Tensor | None = None) -> Tensor:
+        """Evaluate raw (B,H,D) states under FiLM(z), optionally relative to the clean (B,1,D) chunk origin."""
         if self.normalize_state and x0 is None:
             raise ValueError("normalize_state=True requires the clean chunk-initial state x0.")
         state = self._state_features(state, x0 if self.normalize_state else None)
-        if self.config.conditioning == "token_kv":
-            return self.net(state, context, z, use_context=self.drift_uses_h)
         batch_size, horizon = state.shape[:2]
-        flat_state = state.reshape(batch_size * horizon, -1)
-        flat_h = context.h[:, None].expand(batch_size, horizon, -1).reshape(batch_size * horizon, -1)
-        flat_z = (
-            z[:, None].expand(batch_size, horizon, -1).reshape(batch_size * horizon, -1)
-            if z is not None
-            else None
-        )
-        net_input, condition = self._drift_inputs(flat_state, flat_h, flat_z)
-        return self.net(net_input, condition).reshape(batch_size, horizon, -1)
+        flat_z = z[:, None].expand(batch_size, horizon, -1).reshape(batch_size * horizon, -1)
+        return self.net(state.reshape(batch_size * horizon, -1), flat_z).reshape(batch_size, horizon, -1)
 
     def step(
         self,
         x_now: Tensor,
-        context: ObservationContext,
-        z: Tensor | None,
+        z: Tensor,
         x0: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
-        """One Euclidean or body-tangent Gaussian step from cached context (and optional z).
+        """One Euclidean or body-tangent Gaussian step from the cached z.
 
         Args:
             x_now: (B, state_dim) — the CURRENT state frame. The drift net reads only this single
@@ -518,7 +476,7 @@ class LatentSDEModel(nn.Module):
                    internal `randn`; ignored when `deterministic_inference` is True.
                    Body mode uses ordinary Gaussian noise in normalized body-controller coordinates.
         """
-        mu = self.predict_drift(x_now[:, None], context, z, x0=x0[:, None] if x0 is not None else None)[:, 0]
+        mu = self.predict_drift(x_now[:, None], z, x0=x0[:, None] if x0 is not None else None)[:, 0]
         if self.pose_geometry:
             mu = mu.to(torch.float64 if x_now.dtype == torch.float64 else torch.float32)
         # Keep controller actions in the measured-state dtype under autocast.
@@ -546,12 +504,13 @@ class LatentSDEModel(nn.Module):
         scale s. Terms are summed over the H·D steps then /(H·D);
         KL is likewise /(H·D), so both share the scale and β keeps its meaning (β=1 = ELBO). σ²
         (`self.action_var`) is NOT gradient-trained — an EMA of the per-batch MLE mean‖d*−μ‖²
-        (σ-VAE), so the NLL trains only μ. The optimized loss is (nll + β·KL)·sg(2σ²), whose recon
-        gradient is the plain MSE gradient. VQ/FSQ keep MSE-mean recon + prior-CE (+ commitment for
+        (σ-VAE), so the NLL trains only μ. The optimized loss is (nll + β·KL)·sg(2σ̄²), σ̄² the mean σ²
+        over coordinates (= σ² in Euclidean mode, whose recon gradient is then the plain MSE gradient).
+        VQ/FSQ keep MSE-mean recon + prior-CE (+ commitment for
         "vq"); a plain-MSE `recon_loss` is logged for the z-usage/leakage diagnostics.
 
         Body mode uses local(query, nominal endpoint), expressed in controller units, as the delta
-        target and shares the scalar σ² EMA. The same Gaussian/MSE and H*7 normalization apply.
+        target, with one σ² EMA per position/rotation/gripper group. The same H*7 normalization applies.
         This is a local tangent approximation, not a globally normalized manifold transition.
         Nearest augmentation relabels endpoints, not the clean posterior actions.
 
@@ -608,7 +567,6 @@ class LatentSDEModel(nn.Module):
         x0 = state_seq[:, :1] if self.normalize_state else None  # (B, 1, state_dim)
 
         context = self.encode_observations(batch)
-        h = context.h                                       # (B, cond_dim)
 
         # Padding mask (DP-style). `action_is_pad` (B, H) marks copy-padded chunk ticks at episode
         # ends; it aligns with the action/state deltas 0..H-1. Tick k's recon uses action_target[:, k]
@@ -625,38 +583,34 @@ class LatentSDEModel(nn.Module):
         else:
             valid = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
 
-        if self.use_latent_z:
-            # Pose mode already holds body-frame increments; only Euclidean target states are re-centered.
-            post_action = action_target
-            if x0 is not None and not self.pose_geometry:
-                post_action = action_target - x0
+        # Pose mode already holds body-frame increments; only Euclidean target states are re-centered.
+        post_action = action_target
+        if x0 is not None and not self.pose_geometry:
+            post_action = action_target - x0
 
-            if self.use_vq:
-                prior_logits = self.prior(h)
-                z_e = self.posterior(post_action, valid)
-                if self.config.quantizer == "fsq":
-                    # FSQ: STE through the fixed grid — no learnable codebook, no commitment loss.
-                    z_q_quant, idx_q = self.vq(z_e.unsqueeze(1))
-                    vq_commit_loss = None
-                else:  # "vq": the lib returns commitment_weight·mse(z_e, sg[z_q]) directly (EMA codebook,
-                    # no orthogonal/diversity/CE reg) — use it as-is. The old per-sample recompute existed
-                    # only for the now-removed per_episode H/T_ep per-element weighting.
-                    z_q_quant, idx_q, vq_commit_loss = self.vq(z_e.unsqueeze(1))
-                z_q = z_q_quant.squeeze(1)
-                vq_indices = idx_q.squeeze(1).long()  # FSQ emits int32; CE/bincount want long
-                # k detached on the CE: prior doesn't backprop into the posterior/codebook (van den Oord §3.2).
-                vq_prior_ce_per_sample = F.cross_entropy(prior_logits, vq_indices.detach(), reduction="none")  # (B,)
-                mu_p = sigma_p = mu_q = sigma_q = None
-            else:
-                mu_p, sigma_p = self.prior(h)
-                mu_q, sigma_q = self.posterior(post_action, valid)
-                eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
-                z_q = mu_q + sigma_q * eps_z
-        else:
+        if self.use_vq:
+            prior_logits = self._prior(context)
+            z_e = self.posterior(post_action, valid)
+            if self.config.quantizer == "fsq":
+                # FSQ: STE through the fixed grid — no learnable codebook, no commitment loss.
+                z_q_quant, idx_q = self.vq(z_e.unsqueeze(1))
+                vq_commit_loss = None
+            else:  # "vq": the lib returns commitment_weight·mse(z_e, sg[z_q]) directly (EMA codebook,
+                # no orthogonal/diversity/CE reg) — use it as-is. The old per-sample recompute existed
+                # only for the now-removed per_episode H/T_ep per-element weighting.
+                z_q_quant, idx_q, vq_commit_loss = self.vq(z_e.unsqueeze(1))
+            z_q = z_q_quant.squeeze(1)
+            vq_indices = idx_q.squeeze(1).long()  # FSQ emits int32; CE/bincount want long
+            # k detached on the CE: prior doesn't backprop into the posterior/codebook (van den Oord §3.2).
+            vq_prior_ce_per_sample = F.cross_entropy(prior_logits, vq_indices.detach(), reduction="none")  # (B,)
             mu_p = sigma_p = mu_q = sigma_q = None
-            z_q = None
+        else:
+            mu_p, sigma_p = self._prior(context)
+            mu_q, sigma_q = self.posterior(post_action, valid)
+            eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
+            z_q = mu_q + sigma_q * eps_z
 
-        mu = self.predict_drift(x_seq, context, z_q, x0=x0)
+        mu = self.predict_drift(x_seq, z_q, x0=x0)
 
         if self.pose_geometry:
             assert pose_drift_target is not None
@@ -687,15 +641,17 @@ class LatentSDEModel(nn.Module):
                 error = sq_err.detach().to(
                     torch.float64 if sq_err.dtype == torch.float64 else torch.float32
                 )
-                sums = (error * valid.unsqueeze(-1)).sum()
-                stats = torch.stack((sums, (valid.sum() * action_dim).to(sums)))
+                dim_sums = (error * valid.unsqueeze(-1)).sum(dim=(0, 1))
+                sums = dim_sums.new_zeros(3).index_add_(0, self.sigma_group, dim_sums)
+                counts = valid.sum().to(sums) * torch.bincount(self.sigma_group).to(sums)
+                stats = torch.cat((sums, counts))
                 if (
                     self.training
                     and torch.distributed.is_available()
                     and torch.distributed.is_initialized()
                 ):
                     torch.distributed.all_reduce(stats)
-                batch_var = (stats[0] / stats[1]).clamp_min(1e-8)
+                batch_var = (stats[:3] / stats[3:]).clamp_min(1e-8)
             elif self.config.do_mask_loss_for_padding:
                 batch_var = (sq_err.detach() * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim).clamp_min(1)
             else:
@@ -720,103 +676,102 @@ class LatentSDEModel(nn.Module):
                 other_loss = self.config.fsq_prior_weight * vq_prior_ce_loss
             loss = recon_loss + other_loss
         else:
-            var = self.action_var                            # σ² — detached buffer, so only μ gets a gradient
+            var = self._dim_var()                            # σ² — detached buffer, so only μ gets a gradient
             nll_elem = 0.5 * math.log(2 * math.pi) + 0.5 * var.log() + sq_err / (2 * var)
             if self.config.do_mask_loss_for_padding:
                 nll_elem = nll_elem * valid.unsqueeze(-1)    # padded ticks are not observations
             # nll (sum over H·D) and KL (sum over z_dim) both /(H·D): shrinks magnitude, β meaning kept.
             norm = H * action_dim
             nll_loss = nll_elem.sum(dim=(1, 2)).mean() / norm
-            if self.use_latent_z:
-                kl_per_sample = _gaussian_kl_loss(mu_q, sigma_q, mu_p, sigma_p)  # (B,)
-                kl_loss = kl_per_sample.mean() / norm
-                loss = nll_loss + self.config.beta * kl_loss  # β-VAE ELBO
-            else:
-                loss = nll_loss
-            # × sg(2σ²): the recon gradient becomes the plain MSE gradient (β ratio unchanged).
-            loss = loss * (2.0 * self.action_var.detach())
+            kl_per_sample = _gaussian_kl_loss(mu_q, sigma_q, mu_p, sigma_p)  # (B,)
+            kl_loss = kl_per_sample.mean() / norm
+            loss = nll_loss + self.config.beta * kl_loss  # β-VAE ELBO
+            # × sg(2σ̄²), σ̄² the mean over coordinates: the recon gradient is the MSE gradient weighted by
+            # σ̄²/σ² per coordinate (plain MSE with one σ²); β ratio unchanged.
+            loss = loss * (2.0 * var.mean())
 
         with torch.no_grad():
             loss_dict: dict[str, float] = {
                 "recon_loss": recon_loss.detach().item(),
-                "effective_sigma": self.action_var.sqrt().item(),
+                "effective_sigma": self._dim_var().mean().sqrt().item(),
                 "target_rms": (
                     (drift_target.detach().pow(2) * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim)
                 ).sqrt().item(),
             }
+            if self.pose_geometry:
+                loss_dict.update(zip(("sigma_pos", "sigma_rot", "sigma_grip"), self.action_var.sqrt().tolist()))
             if nll_loss is not None:
                 loss_dict["nll_loss"] = nll_loss.detach().item()
-            if self.use_latent_z:
-                # z_usage_gap: extra recon error from a batch-rolled (mismatched) z. ~0 ⇒ z ignored.
-                mu_rolled = self.predict_drift(x_seq, context, torch.roll(z_q, shifts=1, dims=0), x0=x0)
-                rolled_se = (mu_rolled - drift_target) ** 2
-                if self.config.do_mask_loss_for_padding:
-                    rolled_se = rolled_se * valid.unsqueeze(-1)
-                recon_loss_rolled = rolled_se.mean()
-                loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
-                # recon_loss_prior: recon with z ~ p(z|h) — the DEPLOY-time z (training uses q). The
-                # posterior's recon gain transfers to deployment only if this stays near recon_loss; if
-                # it rises toward the rolled (mismatched-z) level, the gain is posterior LEAKAGE — z
-                # encodes trajectory info the prior can't reproduce. prior_recon_gap = the deploy penalty.
-                z_prior = self.sample_z_from_prior(h)         # (B, z_dim), deploy prior distribution
-                mu_prior = self.predict_drift(x_seq, context, z_prior, x0=x0)
-                prior_se = (mu_prior - drift_target) ** 2
-                if self.config.do_mask_loss_for_padding:
-                    prior_se = prior_se * valid.unsqueeze(-1)
-                recon_loss_prior = prior_se.mean()
-                loss_dict["recon_loss_prior"] = recon_loss_prior.item()
-                loss_dict["prior_recon_gap"] = (recon_loss_prior - recon_loss).item()
-                if self.use_vq:
-                    loss_dict["other_loss"] = other_loss.detach().item()
-                    loss_dict["vq_prior_ce_loss"] = vq_prior_ce_loss.detach().item()
-                    if self.config.quantizer == "vq":
-                        # Weighted commit term (= commitment_weight · mse) as it enters other_loss.
-                        loss_dict["vq_commit_loss"] = vq_commit_loss.detach().item()
-                    # Posterior code usage over the flat index space (num_codes = prod(fsq_levels) for
-                    # FSQ, vq_codebook_size for VQ). Perplexity and active_codes are both capped by
-                    # min(B, num_codes) within one batch — read them as a per-batch lower bound on
-                    # utilization, not a fraction.
-                    counts = torch.bincount(vq_indices, minlength=self.num_codes).float()
-                    probs = counts / counts.sum().clamp_min(1.0)
-                    entropy = -(probs * (probs.clamp_min(1e-12)).log()).sum()
-                    loss_dict["vq_perplexity"] = entropy.exp().item()
-                    loss_dict["vq_active_codes"] = float((counts > 0).sum().item())
-                    if self.config.quantizer == "fsq":
-                        # Per-dim FSQ level usage — sweep-robust: each dim has ≤ max(levels) states
-                        # (≪ batch), so unlike the flat index perplexity these are NOT batch-capped and
-                        # are comparable across fsq_levels of different length/levels. Reported as means
-                        # over dims of fractions in (0, 1]: usage = active_levels/level, perplexity =
-                        # exp(H)/level (1/level ⇒ collapsed to one level, 1 ⇒ uniform over that dim).
-                        level_idx = self.vq.indices_to_level_indices(vq_indices).long()  # (B, d), col j in [0, levels[j])
-                        usage_fracs, ppl_fracs = [], []
-                        for j, lvl in enumerate(self.config.fsq_levels):
-                            cj = torch.bincount(level_idx[:, j], minlength=lvl).float()
-                            pj = cj / cj.sum().clamp_min(1.0)
-                            ppl_j = (-(pj * pj.clamp_min(1e-12).log()).sum()).exp()  # in [1, lvl]
-                            usage_fracs.append((cj > 0).float().mean())              # active_levels / lvl
-                            ppl_fracs.append(ppl_j / lvl)
-                        loss_dict["fsq_level_usage"] = torch.stack(usage_fracs).mean().item()
-                        loss_dict["fsq_level_perplexity"] = torch.stack(ppl_fracs).mean().item()
-                    # Prior-side diversity: inference samples z ~ p(k|h), so a collapsed
-                    # categorical prior is invisible in the posterior histogram above.
-                    prior_marginal = F.softmax(prior_logits, dim=-1).mean(dim=0)
-                    prior_entropy = -(prior_marginal * prior_marginal.clamp_min(1e-12).log()).sum()
-                    loss_dict["vq_prior_perplexity"] = prior_entropy.exp().item()
-                    prior_counts = torch.bincount(
-                        prior_logits.argmax(dim=-1), minlength=self.num_codes
-                    )
-                    loss_dict["vq_prior_active_codes"] = float((prior_counts > 0).sum().item())
-                else:
-                    loss_dict["kl_loss"] = kl_loss.detach().item()
-                    loss_dict["z_sigma_q_mean"] = sigma_q.mean().item()
-                    loss_dict["z_sigma_p_mean"] = sigma_p.mean().item()
+            # z_usage_gap: extra recon error from a batch-rolled (mismatched) z. ~0 ⇒ z ignored.
+            mu_rolled = self.predict_drift(x_seq, torch.roll(z_q, shifts=1, dims=0), x0=x0)
+            rolled_se = (mu_rolled - drift_target) ** 2
+            if self.config.do_mask_loss_for_padding:
+                rolled_se = rolled_se * valid.unsqueeze(-1)
+            recon_loss_rolled = rolled_se.mean()
+            loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
+            # recon_loss_prior: recon with z ~ p(z|context) — the DEPLOY-time z (training uses q). The
+            # posterior's recon gain transfers to deployment only if this stays near recon_loss; if
+            # it rises toward the rolled (mismatched-z) level, the gain is posterior LEAKAGE — z
+            # encodes trajectory info the prior can't reproduce. prior_recon_gap = the deploy penalty.
+            z_prior = self.sample_z_from_prior(context)   # (B, z_dim), deploy prior distribution
+            mu_prior = self.predict_drift(x_seq, z_prior, x0=x0)
+            prior_se = (mu_prior - drift_target) ** 2
+            if self.config.do_mask_loss_for_padding:
+                prior_se = prior_se * valid.unsqueeze(-1)
+            recon_loss_prior = prior_se.mean()
+            loss_dict["recon_loss_prior"] = recon_loss_prior.item()
+            loss_dict["prior_recon_gap"] = (recon_loss_prior - recon_loss).item()
+            if self.use_vq:
+                loss_dict["other_loss"] = other_loss.detach().item()
+                loss_dict["vq_prior_ce_loss"] = vq_prior_ce_loss.detach().item()
+                if self.config.quantizer == "vq":
+                    # Weighted commit term (= commitment_weight · mse) as it enters other_loss.
+                    loss_dict["vq_commit_loss"] = vq_commit_loss.detach().item()
+                # Posterior code usage over the flat index space (num_codes = prod(fsq_levels) for
+                # FSQ, vq_codebook_size for VQ). Perplexity and active_codes are both capped by
+                # min(B, num_codes) within one batch — read them as a per-batch lower bound on
+                # utilization, not a fraction.
+                counts = torch.bincount(vq_indices, minlength=self.num_codes).float()
+                probs = counts / counts.sum().clamp_min(1.0)
+                entropy = -(probs * (probs.clamp_min(1e-12)).log()).sum()
+                loss_dict["vq_perplexity"] = entropy.exp().item()
+                loss_dict["vq_active_codes"] = float((counts > 0).sum().item())
+                if self.config.quantizer == "fsq":
+                    # Per-dim FSQ level usage — sweep-robust: each dim has ≤ max(levels) states
+                    # (≪ batch), so unlike the flat index perplexity these are NOT batch-capped and
+                    # are comparable across fsq_levels of different length/levels. Reported as means
+                    # over dims of fractions in (0, 1]: usage = active_levels/level, perplexity =
+                    # exp(H)/level (1/level ⇒ collapsed to one level, 1 ⇒ uniform over that dim).
+                    level_idx = self.vq.indices_to_level_indices(vq_indices).long()  # (B, d), col j in [0, levels[j])
+                    usage_fracs, ppl_fracs = [], []
+                    for j, lvl in enumerate(self.config.fsq_levels):
+                        cj = torch.bincount(level_idx[:, j], minlength=lvl).float()
+                        pj = cj / cj.sum().clamp_min(1.0)
+                        ppl_j = (-(pj * pj.clamp_min(1e-12).log()).sum()).exp()  # in [1, lvl]
+                        usage_fracs.append((cj > 0).float().mean())              # active_levels / lvl
+                        ppl_fracs.append(ppl_j / lvl)
+                    loss_dict["fsq_level_usage"] = torch.stack(usage_fracs).mean().item()
+                    loss_dict["fsq_level_perplexity"] = torch.stack(ppl_fracs).mean().item()
+                # Prior-side diversity: inference samples z ~ p(k|h), so a collapsed
+                # categorical prior is invisible in the posterior histogram above.
+                prior_marginal = F.softmax(prior_logits, dim=-1).mean(dim=0)
+                prior_entropy = -(prior_marginal * prior_marginal.clamp_min(1e-12).log()).sum()
+                loss_dict["vq_prior_perplexity"] = prior_entropy.exp().item()
+                prior_counts = torch.bincount(
+                    prior_logits.argmax(dim=-1), minlength=self.num_codes
+                )
+                loss_dict["vq_prior_active_codes"] = float((prior_counts > 0).sum().item())
+            else:
+                loss_dict["kl_loss"] = kl_loss.detach().item()
+                loss_dict["z_sigma_q_mean"] = sigma_q.mean().item()
+                loss_dict["z_sigma_p_mean"] = sigma_p.mean().item()
         return loss, loss_dict
 
 
-# Per-episode latent z — joint-context prior p(z|h) and action-trajectory posterior q(z|a_seq).
+# Per-episode latent z — joint-context prior p(z|context) and action-trajectory posterior q(z|a_seq).
 # CVAE-style: train z ~ q via reparam, KL[q||p] regularizes the prior. At deployment z is
-# resampled from p(z|h) in lock-step with every h refresh, committing each chunk to one mode.
-# z conditions the drift net via FiLM alongside h (cond = concat([h, z])); the net input is x_aug only.
+# resampled from the prior in lock-step with every context refresh, committing each chunk to one mode.
+# z is the drift net's only FiLM conditioning; the net input is the current state features.
 
 class LatentPrior(nn.Module):
     """p(z | h) — 2-layer MLP producing (mu_p, sigma_p) from joint observation context."""
@@ -1030,8 +985,8 @@ class LatentSDEDriftDiffusionNet(nn.Module):
     DiffusionConditionalUnet1d (horizon-axis Conv1d → Linear).
 
     Inputs:
-        x:    (B, input_dim)     — current state, plus z when z_mode="input".
-        cond: (B, cond_dim)      — global conditioning concat([h, z]) (FiLM); z omitted when no latent.
+        x:    (B, input_dim)     — current state features.
+        cond: (B, cond_dim)      — the latent z (FiLM); the drift never reads observation context.
     Output:
         mu:   (B, action_dim) — SDE drift. The action-decoder σ is a calibrated EMA buffer on
                                 LatentSDEModel (action_var = σ²); inference noise = s·σ·ε.
@@ -1081,7 +1036,7 @@ class FiLMResidualMLPBlock(nn.Module):
     """Point-wise ResNet block with FiLM-with-scale conditioning.
 
     Mirrors DiffusionConditionalResidualBlock1d (Conv1d → Linear since the SDE acts on a
-    single time step):
+    single time step), with scale/bias a plain Linear of cond:
         x ──► Linear ──► GroupNorm ──► Mish ──► (* scale + bias from cond) ──►
               Linear ──► GroupNorm ──► Mish ──► (+ residual)
     """
@@ -1103,7 +1058,9 @@ class FiLMResidualMLPBlock(nn.Module):
         self.act1 = nn.Mish()
 
         cond_channels = out_dim * 2 if use_film_scale_modulation else out_dim
-        self.cond_encoder = nn.Sequential(nn.Mish(), nn.Linear(cond_dim, cond_channels))
+        # Linear FiLM generator: z is already a learned code, and DP's leading Mish would alias z < -1.19
+        # (Mish is not injective there).
+        self.cond_encoder = nn.Linear(cond_dim, cond_channels)
 
         self.lin2 = nn.Linear(out_dim, out_dim)
         self.norm2 = nn.GroupNorm(n_groups, out_dim)

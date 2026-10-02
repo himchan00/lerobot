@@ -3,15 +3,16 @@
 Latent-SDE policy for hierarchical manipulation (`research_brief.md` is the design source).
 Built as a **like-for-like swap of DiffusionPolicy's denoising U-Net**: the ResNet path uses the
 same vision backbone (`DiffusionRgbEncoder`) and FiLM-with-scale conditioning, with the same
-`GroupNorm` / `down_dims` ladder. The SmolVLM2 path additionally supports token-KV conditioning.
-The FiLM drift replaces chunk-horizon Conv1d with **point-wise Linear** layers. The token-KV drift
-uses independent expert queries for each measured state, never attention between supervised ticks.
+`GroupNorm` / `down_dims` ladder. The FiLM drift replaces chunk-horizon Conv1d with **point-wise
+Linear** layers and is the light, per-tick part of the policy: it reads only the current state and
+`z` (its only FiLM conditioning). Observation context reaches it only through the prior's `z`. With
+SmolVLM2 the prior reads the VLM token K/V the way SmolVLA's action expert does.
 
 ## Core idea
 
 The geometry fixes the action representation:
 
-- `sde_geometry="euclidean"` (Push-T target-state actions): `a ≈ x + s·(μ(x_aug, [h,z]) + σ·ε)`
+- `sde_geometry="euclidean"` (Push-T target-state actions): `a ≈ x + s·(μ(x, z) + σ·ε)`
 - `sde_geometry="so3_r3_body"` (LIBERO relative commands): body increment `≈ s·(μ + σ·ε)`, see below
 
 One drift step per action at the environment's own rate (no model-time Δt). `s` is the per-dimension
@@ -28,9 +29,9 @@ tangent approximation, not a globally normalized manifold transition.
 
 | sym | meaning                                                                                                                                                  | clock                                                                 | fed to net as                                                                                                                                                                                                           |
 |-----|---------|-------|---------------|
-| `x` | measured robot state (proprio). PushT: 2-D `observation.state`; LIBERO: 8-D.                                                                             | every tick (fast)                                                     | the **CURRENT single frame** `(B, state_dim)` — the drift is velocity-blind; scene/motion context lives in `h`. The `target_state` residual is anchored to this frame.                                                  |
-| `h` | joint causal observation context: image history plus state history for ResNet, or image/task tokens plus one projected token per causal state frame for SmolVLM2. | refreshed every `n_action_steps` ticks (matches DP vision duty cycle) | FiLM context or token K/V                                                                                                                                                                                               |
-| `z` | per-chunk latent strategy (CVAE). | re-sampled every `n_action_steps` ticks with each context refresh | `z_mode="cond"` uses FiLM conditioning or expert-query modulation; `"input"` concatenates z with current state before input projection. |
+| `x` | measured robot state (proprio). PushT: 2-D `observation.state`; LIBERO: 8-D.                                                                             | every tick (fast)                                                     | the drift's input: the **CURRENT single frame** `(B, state_dim)` — the drift is velocity-blind; scene/motion context lives in `z`. The `target_state` residual is anchored to this frame.                                 |
+| context | joint causal observation context: image history plus state history for ResNet (vector `h`), or image/task tokens plus one projected token per causal state frame for SmolVLM2 (layer-wise K/V). | refreshed every `n_action_steps` ticks (matches DP vision duty cycle) | the prior only: MLP on `h` (ResNet) or the token-KV expert (SmolVLM2)                                                                                                                                                    |
+| `z` | per-chunk latent strategy (CVAE). | re-sampled every `n_action_steps` ticks with each context refresh | the drift's only FiLM conditioning |
 
 `observation.environment_state` is deliberately ignored; `observation.state` is always part of the
 joint causal context.
@@ -40,9 +41,9 @@ joint causal context.
 - `configuration_latent_sde.py` — `LatentSDEConfig` (draccus `@register_subclass("latent_sde")`). All knobs, derived defaults, and the `*_delta_indices` properties that shape the dataloader windows.
 - `modeling_latent_sde.py` — everything else (see map below).
 - `processor_latent_sde.py` — pre/post pipelines. The ResNet path remains identical to DP's; the SmolVLM2 path additionally applies the existing task-newline/tokenizer steps and keeps visual normalization as identity.
-- `modeling_smolvlm_context.py` — frozen generic SmolVLM2 context encoder plus trainable `LayerNorm + Linear` projection. It does not construct the SmolVLA action expert.
-- `modeling_context.py` — joint observation context: pooled `h`, optional per-layer K/V, and valid-token mask.
-- `modeling_token_kv.py` — pointwise drift expert reading SmolVLA-compatible layer-wise K/V.
+- `modeling_smolvlm_context.py` — frozen generic SmolVLM2 context encoder with trainable state tokens; returns the layer-wise prefix K/V. It does not construct the SmolVLA action expert.
+- `modeling_context.py` — joint observation context: ResNet `h`, or SmolVLM2 per-layer K/V and valid-token mask.
+- `modeling_token_kv.py` — the token-KV prior: a SmolVLA-style action expert whose one learnable query reads the layer-wise K/V.
 - `geometry.py` — compact Torch-only body local/retract, continuous state features, controller
   adapters, and nearest-pose distance.
 - `action_scale.py` — sweeps the dataset once before training for the per-dimension action scale `s`
@@ -56,21 +57,19 @@ joint causal context.
 
 - `LatentSDEPolicy` — LeRobot policy interface (`reset` / `select_action` / `predict_action_chunk` / `forward`) + DP-style obs queues + the h/z inference cache. Thin wrapper.
 - `LatentSDEModel` — assembles `h`, holds prior/posterior/vq + drift net, exposes `compute_loss` (train) and `step` (inference). Mirrors `DiffusionModel`.
-- `LatentSDEDriftDiffusionNet` / `FiLMResidualMLPBlock` — point-wise FiLM-ResNet hourglass, port of `DiffusionConditionalUnet1d`. Outputs drift `μ` only; the scalar variance (all modes) is EMA-calibrated, not a net output.
-- Latent-z modules: `LatentPrior` (Gaussian p(z|h)), `LatentPriorVQ` (VQ p(k|h)), `LatentPosteriorTraj` (Gaussian), `LatentPosteriorTrajVQ` (deterministic + VQ).
+- `LatentSDEDriftDiffusionNet` / `FiLMResidualMLPBlock` — point-wise FiLM-ResNet hourglass, port of `DiffusionConditionalUnet1d`. Each block's FiLM (scale, bias) is a plain `Linear(z)`: DP's leading `Mish` would alias `z < −1.19`, where Mish is not injective. Outputs drift `μ` only; the variance (scalar; per position/rotation/gripper group in body mode) is EMA-calibrated, not a net output.
+- Latent-z modules: `LatentPrior` (Gaussian p(z|h)), `SmolVLMTokenKVPrior` (Gaussian p(z|VLM tokens)), `LatentPriorVQ` (VQ p(k|h)), `LatentPosteriorTraj` (Gaussian), `LatentPosteriorTrajVQ` (deterministic + VQ).
 - `_TrajEncoder` — **TCN** (dilated Temporal Conv Net, Bai et al. 2018) over a variable-length trajectory: 1×1 channel lift + kernel-3 dilated residual blocks (`_TCNResidualBlock`, dilation 1,2,4,… doubling per level) + masked mean-pool. `RF = 1 + 4·(2^L − 1)` grows exponentially with depth. Depth: **auto-sized** `num_levels = max(1, round(log2(horizon/4)))` so RF ≈ `horizon` (e.g. horizon 8→1, 16→2, 32→3, 64→4), set in `LatentSDEModel.__init__`. `_MaskedGroupNorm` / `_masked_mean_pool` support it (pads zeroed before every dilated conv → eval outputs bit-equivalent to exact-length, no cross-pad leak).
 
 ## Latent z subsystem
 
-`use_latent_z=False` removes prior/posterior and KL (`z_dim=0`); joint observation context is unchanged.
-
-**Prior `p(z|h)`** (inference + KL target). MLP `LatentPrior` (Gaussian); VQ swaps in
-`LatentPriorVQ`. The prior consumes `ObservationContext.h`; the FiLM drift also reads this vector,
-while the token-KV drift reads the context's per-layer K/V. ResNet concatenates the image-window
-embedding and an embedding of the absolute
-`n_obs_steps` state window. SmolVLM2 appends one projected token per frame of that same causal state
-window, ordered oldest to newest, after the image-task prefix. `drift_uses_h=False` drops direct
-context from the drift, so context reaches the field only through `z`.
+**Prior `p(z|context)`** (inference + KL target) — the only module that reads observations; the
+drift sees them only through `z`. `context_encoder` fixes it. ResNet: MLP `LatentPrior` (Gaussian)
+on `ObservationContext.h`, the image-window embedding concatenated with an embedding of the absolute
+`n_obs_steps` state window; VQ swaps in `LatentPriorVQ`. SmolVLM2: `SmolVLMTokenKVPrior` (Gaussian
+only) — one learnable query runs through a SmolVLA-style action expert over the layer-wise K/V of
+the image-task prefix plus one projected token per causal state frame (oldest to newest), and heads
+give `(μ_p, σ_p)`.
 
 **Posterior `q(z | a_{0:H})`** (training only). It always encodes only the time-aligned
 demonstration action trajectory; observation context and state trajectories are not posterior
@@ -99,14 +98,15 @@ context projections, while frozen backbone parameters remain frozen.
 `use_vq`. The following formulas describe the default Euclidean path:
 
 ```
-non-VQ:  loss = (nll + beta·KL[q‖p])·sg(2σ²)   # Gaussian ELBO, rescaled; also the vanilla use_latent_z=False path
-         # sg(2σ²): ∂nll/∂μ = 1/(2σ²)·∂mse/∂μ, so the recon gradient = the plain MSE gradient (VQ/FSQ scale);
-         # β ratio unchanged; σ² is one scalar in every mode, so this holds in body mode too.
+non-VQ:  loss = (nll + beta·KL[q‖p])·sg(2σ̄²)  # Gaussian ELBO, rescaled
+         # σ̄² = mean σ² over coordinates. ∂nll/∂μ = 1/(2σ²)·∂mse/∂μ, so the recon gradient = the MSE gradient
+         # weighted by σ̄²/σ² (plain MSE in Euclidean mode, one σ²); β ratio unchanged.
          # Logged nll_loss / kl_loss are unscaled.
          nll  = mean_{H·D} [0.5·log(2πσ²) + (d*−μ)²/(2σ²)]
          d*   = (a−x)/s                      # standardized one-step target, std ≈ 1 (body mode: see below)
          KL   also divided by H·D            # shared 1/(H·D) scale → β keeps its meaning (β=1 = ELBO)
-         σ² = action_var (buffer)           # NOT gradient-trained: EMA of the analytic MLE mean‖d*−μ‖² (σ-VAE)
+         σ² = action_var (buffer)           # NOT gradient-trained: EMA of the analytic MLE mean‖d*−μ‖² (σ-VAE);
+                                            # body mode: one per position/rotation/gripper group
 VQ/FSQ:  loss = mean‖μ − d*‖² + other_loss  # MSE-mean recon (σ untrained here)
          other_loss = fsq_prior_weight·prior-CE            ("fsq"; no commit loss)
                     = vq_commit_weight·commit + vq_prior_weight·prior-CE   ("vq")
@@ -126,7 +126,7 @@ VQ/FSQ:  loss = mean‖μ − d*‖² + other_loss  # MSE-mean recon (σ untrain
 
 - **Train-only augmentation.** In Euclidean mode, `state_noise_std>0` perturbs the
   measured-state window by `std·s` per frame (i.i.d. per tick; `std` is a fraction of a typical
-  one-step action, default 0.3) and recomputes the corrective target toward the time-aligned (or
+  one-step action; preset pusht 0.3, libero 0) and recomputes the corrective target toward the time-aligned (or
   nearest) action. Pose mode uses the geometry-aware augmentation below.
 
 ## Opt-in body-frame product geometry
@@ -167,8 +167,8 @@ retract(x,u): p_out = p_x + R_x @ (0.05*u[:3])
 Training uses normalized body-controller increments: the model converts a clean relative controller
 action into a nominal endpoint, recomputes `local(query, target)`, concatenates the independent
 gripper command, and divides by the action scale `s` (one value per position/rotation 3-vector plus
-the gripper, so it commutes with the body rotation). Body mode shares the Euclidean scalar `action_var`
-(one σ² over all seven output coordinates). Sampling uses one ordinary Gaussian draw in those
+the gripper, so it commutes with the body rotation). Body mode keeps one `action_var` σ² per
+position/rotation/gripper group, each the residual of its group. Sampling uses one ordinary Gaussian draw in those
 same seven output coordinates (six body, one gripper) and clips only the final controller command.
 These output coordinates remain local to the current measured pose, not the chunk-start frame;
 controller conversion still uses the absolute current pose.
@@ -197,7 +197,7 @@ are this policy's design, not a claim that those papers implement LIBERO imitati
   teacher-forced drift trajectory, overlapping at the current frame. `H = horizon`;
   `n_action_steps ≤ horizon` is the deploy execute/refresh period.
 - `drop_n_last_frames` (default 0 with `do_mask_loss_for_padding=True`, else `max(0, horizon − n_action_steps − n_obs_steps + 1)`) drops the last anchors of each episode so the EXECUTED region stays within the episode; the predicted tail may be copy-padded and is masked iff `do_mask_loss_for_padding=True` (else included unmasked, DP-style default).
-- `deterministic_inference=True` (default) gives drift-only inference; otherwise the scalar
+- `deterministic_inference=True` (default) gives drift-only inference; otherwise
   `action_var` supplies noise. `deterministic_z_inference` uses `μ_p` instead of sampling
   `z` (debug/ablation).
 
@@ -211,9 +211,9 @@ Factory wiring: `policies/factory.py` (`get_policy_class` / `make_policy_config`
 
 **Env presets.** Env-dependent fields default to `None`; `__post_init__` fills them from
 `ENV_PRESETS[--env.type]`, reading the training CLI with `parser.parse_arg` (saved configs are already
-complete, so loading never needs it); explicit values win. `pusht` = DP recipe (resnet/film/euclidean,
-2/16/8, crop 84, DP normalization, Adam + diffusers cosine); `libero` = SmolVLA recipe
-(smolvlm2/token_kv/so3_r3_body, 1/50/10, IDENTITY normalization, padding mask, Adam +
+complete, so loading never needs it); explicit values win. `pusht` = DP recipe (resnet/euclidean,
+2/16/8, crop 84, DP normalization, state noise 0.3, Adam + diffusers cosine); `libero` = SmolVLA recipe
+(smolvlm2/so3_r3_body, 1/50/10, IDENTITY normalization, padding mask, no state noise, Adam +
 cosine_decay_with_warmup over 30k; train with `--steps=30000`). Without `--env.type` these fields must be
 given explicitly. The LIBERO setup and its justification are in `README_for_HC.md`.
 
@@ -223,17 +223,15 @@ by the base config interface. The settings and tensor layouts below are caller p
 automatically enforced compatibility guarantees. Stable rotation operations and valid nearest
 candidates remain algorithm requirements. Space selection rejects obsolete or unknown geometry modes.
 
-`context_encoder` (`"resnet"` | `"smolvlm2"`) · `conditioning` (`"film"` | `"token_kv"`;
-token-KV requires SmolVLM2) · SmolVLM2: `vlm_model_name`, `vlm_num_layers`,
-`vlm_context_dim`, `vlm_resize_shape`, `tokenizer_max_length` ·
+`context_encoder` (`"resnet"` | `"smolvlm2"`; also fixes the prior: MLP on `h` | token-KV expert,
+the latter Gaussian only) · SmolVLM2: `vlm_model_name`, `vlm_num_layers`, `vlm_resize_shape`, `tokenizer_max_length` ·
 `sde_geometry` (`"euclidean"` | `"so3_r3_body"`) ·
 `n_obs_steps`, `horizon` (= training-chunk length H), `n_action_steps` (= deploy h-refresh period; ≤ horizon) ·
 `action_scale` (per-dim std of the one-step target; None → swept from the dataset and cached, see `action_scale.py`) ·
-`use_latent_z`, `z_dim`, action-trajectory-only posterior, joint-context prior,
-`drift_uses_h` (False ⇒ drift reads `z` only, no direct `h`) ·
+`z_dim`, action-trajectory-only posterior, joint-context prior ·
 `beta` (β-VAE KL coefficient; replaces `kl_weight`), `sigma_activation` (`exp`|`softplus`), `z_sigma_min` ·
 `use_vq`, `quantizer` (`"fsq"` | `"vq"`) · FSQ: `fsq_levels` (per-dim levels; #codes = prod, z_dim = len), `fsq_prior_weight` · VQ: `vq_codebook_size` (#codes; ≤ batch), `vq_commit_weight`, `vq_decay`, `vq_prior_weight` (z_dim = configured z_dim) ·
-`state_noise_std` (train-only drift-window noise / corrective target, as a fraction of `s`; default 0.3), `do_mask_loss_for_padding` (mask copy-padded chunk ticks in recon + posterior) ·
+`state_noise_std` (train-only drift-window noise / corrective target, as a fraction of `s`; preset pusht 0.3, libero 0), `do_mask_loss_for_padding` (mask copy-padded chunk ticks in recon + posterior) ·
 `normalize_state` (clean chunk-start-relative drift inputs: subtraction in Euclidean mode,
 reference-frame pose features in body mode; only Euclidean posterior actions subtract x_0;
 drift targets, integration, and joint observation context remain unchanged) ·
@@ -251,8 +249,8 @@ RoPE theta 10000, eager attention, and B-sized vision calls per frame/camera. It
 `n_obs_steps` projected state tokens, ordered oldest to newest. Image/task queries cannot attend to
 state tokens; each state query can attend to the image/task prefix, itself, and earlier state tokens.
 Only the leading causal state window is encoded, never the future teacher-forced states.
-`conditioning="film"` pools the joint prefix; `"token_kv"` exposes its token K/V representation to
-the compatible head. The `n_obs_steps=1` layout and parameter shapes are unchanged; multi-frame
+The encoder returns only the per-layer token K/V, which the token-KV prior reads; the last VLM
+layer's output is not computed. The `n_obs_steps=1` layout and parameter shapes are unchanged; multi-frame
 checkpoints from the earlier current-state-only adapter are not behavior-equivalent.
 See the measured parity boundary, simple default-setting commands, and paper settings in
 `smolvlm2_head_baselines.md`.
@@ -269,10 +267,10 @@ configure this trainer's Accelerator. Standalone evaluation also needs its CUDA 
 set to BF16 when matching that precision choice. Delta integration preserves the measured-state dtype so
 BF16 drift outputs still produce float32 controller actions usable by NumPy.
 
-The token-KV expert inherits the loaded text config's BF16 dtype, while its newly initialized
-projections and residual stream can remain FP32. Cast activations to the consuming projection or
-MLP's weight dtype at each boundary, including cached latent `z`. Training and inference must work
-without autocast; do not force AMP or upcast the whole expert to work around a dtype mismatch.
+The token-KV expert inherits the loaded text config's BF16 dtype, while its learnable query, output
+head, and residual stream remain FP32. Cast activations to the consuming projection or MLP's weight
+dtype at each boundary. Training and inference must work without autocast; do not force AMP or
+upcast the whole expert to work around a dtype mismatch.
 
 ### Local integration smoke
 
@@ -317,7 +315,7 @@ conda run -n lerobot env MUJOCO_GL=egl uv run lerobot-eval \
   --output_dir=outputs/eval/latent_sde_libero_smoke
 ```
 
-`--env.type=libero` applies the LIBERO preset (SmolVLM2 token-KV, `so3_r3_body`, IDENTITY
+`--env.type=libero` applies the LIBERO preset (SmolVLM2 token-KV prior, `so3_r3_body`, IDENTITY
 normalization); the horizon overrides only shrink the smoke.
 
 The dataset metadata reports 10 FPS, while the installed LIBERO controller defaults to

@@ -25,6 +25,8 @@ class LayerKV:
 
 @dataclass(frozen=True, slots=True)
 class ObservationContext:
-    h: Tensor
+    """ResNet fills `h`; SmolVLM2 fills the per-layer prefix K/V and its valid-token mask."""
+
+    h: Tensor | None = None
     layer_kv: tuple[LayerKV, ...] | None = None
     valid_mask: Tensor | None = None

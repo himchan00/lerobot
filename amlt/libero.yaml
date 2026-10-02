@@ -175,7 +175,6 @@ jobs:
         # state feedback, whereas SmolVLA executes its 50-action chunk open-loop.
         LATENT_SDE_FLAGS=(
           --policy.context_encoder=smolvlm2
-          --policy.conditioning=token_kv
           --policy.n_obs_steps=1
           --policy.horizon=50
           --policy.n_action_steps=50
