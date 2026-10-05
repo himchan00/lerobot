@@ -332,6 +332,10 @@ class LiberoEnv(EnvConfig):
     observation_height: int = 360
     observation_width: int = 360
     is_libero_plus: bool = False
+    # Adds `observation.ft_wrench`, the EE-frame environment-interaction wrench at the wrist over the last
+    # control step (contact forces below the F/T site, envs/libero_ft.py); needs obs_type="pixels_agent_pos".
+    # Also matches the observation timing of datasets regenerated with examples/port_datasets/libero_hf.
+    ft_wrench: bool = False
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -415,6 +419,8 @@ class LiberoEnv(EnvConfig):
         }
         if self.task_ids is not None:
             kwargs["task_ids"] = self.task_ids
+        if self.ft_wrench:
+            kwargs["ft_wrench"] = True
         return kwargs
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):
@@ -441,6 +447,124 @@ class LiberoEnv(EnvConfig):
             PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
             PolicyProcessorPipeline(steps=[]),
         )
+
+
+@EnvConfig.register_subclass("square_ft")
+@dataclass
+class SquareFTEnv(EnvConfig):
+    """robosuite Square with a hidden peg offset that only the wrist F/T reveals (envs/square_ft.py).
+
+    Same observations as LiberoEnv with ft_wrench=True: agentview and eye-in-hand images, robot_state, and
+    `observation.ft_wrench`. Datasets: examples/port_datasets/square_ft.
+    """
+
+    task: str = "square_ft"
+    fps: int = 20
+    episode_length: int = 400
+    observation_height: int = 256
+    observation_width: int = 256
+    features: dict[str, PolicyFeature] = field(default_factory=dict)
+    features_map: dict[str, str] = field(
+        default_factory=lambda: {
+            ACTION: ACTION,
+            LIBERO_KEY_EEF_POS: f"{OBS_STATE}.eef_pos",
+            LIBERO_KEY_EEF_QUAT: f"{OBS_STATE}.eef_quat",
+            LIBERO_KEY_GRIPPER_QPOS: f"{OBS_STATE}.gripper_qpos",
+            LIBERO_KEY_PIXELS_AGENTVIEW: f"{OBS_IMAGES}.image",
+            LIBERO_KEY_PIXELS_EYE_IN_HAND: f"{OBS_IMAGES}.image2",
+        }
+    )
+
+    def __post_init__(self):
+        image = PolicyFeature(type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3))
+        self.features = {
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+            LIBERO_KEY_PIXELS_AGENTVIEW: image,
+            LIBERO_KEY_PIXELS_EYE_IN_HAND: image,
+            LIBERO_KEY_EEF_POS: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+            LIBERO_KEY_EEF_QUAT: PolicyFeature(type=FeatureType.STATE, shape=(4,)),
+            LIBERO_KEY_GRIPPER_QPOS: PolicyFeature(type=FeatureType.STATE, shape=(2,)),
+        }
+
+    @property
+    def gym_kwargs(self) -> dict:
+        return {
+            "episode_length": self.episode_length,
+            "observation_height": self.observation_height,
+            "observation_width": self.observation_width,
+        }
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .square_ft import create_square_ft_envs
+
+        return create_square_ft_envs(n_envs, self.gym_kwargs, _make_vec_env_cls(use_async_envs, n_envs))
+
+    def get_env_processors(self):
+        return (
+            PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
+            PolicyProcessorPipeline(steps=[]),
+        )
+
+
+@EnvConfig.register_subclass("wipe_ft")
+@dataclass
+class WipeFTEnv(SquareFTEnv):
+    """robosuite Wipe on a surface whose true height and tilt only the wrist F/T reveals (envs/wipe_ft.py).
+
+    Same observations as SquareFTEnv. Datasets: examples/port_datasets/wipe_ft.
+    """
+
+    task: str = "wipe_ft"
+    episode_length: int = 300
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .wipe_ft import create_wipe_ft_envs
+
+        return create_wipe_ft_envs(n_envs, self.gym_kwargs, _make_vec_env_cls(use_async_envs, n_envs))
+
+
+@EnvConfig.register_subclass("door_ft")
+@dataclass
+class DoorFTEnv(SquareFTEnv):
+    """robosuite Door whose hinge side (left or right post) only the wrist F/T reveals at first (envs/door_ft.py).
+
+    Same observations as SquareFTEnv. Datasets: examples/port_datasets/door_ft.
+    """
+
+    task: str = "door_ft"
+    episode_length: int = 350
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .door_ft import create_door_ft_envs
+
+        return create_door_ft_envs(n_envs, self.gym_kwargs, _make_vec_env_cls(use_async_envs, n_envs))
+
+
+@EnvConfig.register_subclass("ft3")
+@dataclass
+class FT3Env(SquareFTEnv):
+    """Square-FT, Wipe-FT and Door-FT as one language-conditioned multi-task suite, like a LIBERO suite.
+
+    Evaluates each task with its own episode length; results per task are logged as eval groups.
+    Datasets: examples/port_datasets/ft3.
+    """
+
+    task: str = "ft3"
+
+    def create_envs(self, n_envs: int, use_async_envs: bool = False):
+        from .door_ft import create_door_ft_envs
+        from .square_ft import create_square_ft_envs
+        from .wipe_ft import create_wipe_ft_envs
+
+        vec_env_cls = _make_vec_env_cls(use_async_envs, n_envs)
+        envs = {}
+        for cfg, create in (
+            (SquareFTEnv, create_square_ft_envs),
+            (WipeFTEnv, create_wipe_ft_envs),
+            (DoorFTEnv, create_door_ft_envs),
+        ):
+            envs.update(create(n_envs, {**self.gym_kwargs, "episode_length": cfg.episode_length}, vec_env_cls))
+        return envs
 
 
 @EnvConfig.register_subclass("metaworld")

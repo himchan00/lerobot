@@ -4,8 +4,9 @@ Latent-SDE policy for hierarchical manipulation (`research_brief.md` is the desi
 Built as a **like-for-like swap of DiffusionPolicy's denoising U-Net**: the ResNet path uses the
 same vision backbone (`DiffusionRgbEncoder`) and FiLM-with-scale conditioning, with the same
 `GroupNorm` / `down_dims` ladder. The FiLM drift replaces chunk-horizon Conv1d with **point-wise
-Linear** layers and is the light, per-tick part of the policy: it reads only the current state and
-`z` (its only FiLM conditioning). Observation context reaches it only through the prior's `z`. With
+Linear** layers and is the light, per-tick part of the policy: it reads only the current state (plus
+the wrist F/T with `use_ft`) and `z` (its only FiLM conditioning). Observation context reaches it
+only through the prior's `z`. With
 SmolVLM2 the prior reads the VLM token K/V the way SmolVLA's action expert does.
 
 ## Core idea
@@ -51,6 +52,8 @@ joint causal context.
   3-vector + gripper). Cached as JSON under `$HF_LEROBOT_HOME/latent_sde_action_scale/<repo_id>/`,
   reused when present, and written into `config.action_scale` so checkpoints carry it. Called from
   `LatentSDEPolicy.__init__` only when training from scratch (`dataset_meta` given, no pretrained path).
+- `ft_scale.py` — the same for the per-axis F/T scale of `ft_preprocess="forge"`: p90 of |w| over contact frames
+  after the FORGE EMA, cached under `$HF_LEROBOT_HOME/latent_sde_ft_scale/<repo_id>/`, written into `config.ft_scale`.
 - `__init__.py` — exports `LatentSDEConfig`, `LatentSDEPolicy`, `make_latent_sde_pre_post_processors`.
 
 ### `modeling_latent_sde.py` map
@@ -72,8 +75,8 @@ the image-task prefix plus one projected token per causal state frame (oldest to
 give `(μ_p, σ_p)`.
 
 **Posterior `q(z | a_{0:H})`** (training only). It always encodes only the time-aligned
-demonstration action trajectory; observation context and state trajectories are not posterior
-inputs. A 2-layer MLP trunk produces the Gaussian heads, and the VQ posterior mirrors the same
+demonstration action trajectory (each tick concatenated with that tick's F/T features under
+`use_ft`); observation context and state trajectories are not posterior inputs. A 2-layer MLP trunk produces the Gaussian heads, and the VQ posterior mirrors the same
 action-only trajectory contract.
 
 **Sampling.** Gaussian: reparam `z = μ_q + σ_q·ε`. Discrete (`use_vq=True`, flavor set by
@@ -184,6 +187,52 @@ for exponential-map change of variables, and [Riemannian Score-Based Generative 
 for geodesic random-walk SDE discretization. Action adapters and the local approximation above
 are this policy's design, not a claim that those papers implement LIBERO imitation.
 
+## Opt-in wrist F/T (`use_ft`)
+
+`observation.ft_wrench` `(25, 6)` per frame is the environment-interaction wrench at the wrist over the
+control step that ended at that frame. It is the sum of MuJoCo contact forces on the bodies below the
+PandaGripper F/T site, which is what a gravity- and inertia-compensated wrist sensor reads. It is taken
+about the EE point and rotated into the EE frame at each 2 ms physics step, `[F, τ]` in N and N·m, and is
+exactly 0 in free space.
+
+Datasets come from `examples/port_datasets/libero_hf` (raw LIBERO demos replayed with 500 Hz logging;
+frame 0 holds the last settle step). The LIBERO env produces the same with `--env.ft_wrench=true`
+(`envs/libero_ft.py`).
+
+Do not feed the raw sensor reading. With the static weight removed, it still carries the gripper's
+inertial reaction to the OSC acceleration, so in free space it predicts the previous command
+(held-out R² 0.94). A drift fed that reading copied its own last action and reached 5% vs 70%.
+
+`LatentSDEModel.ft_features` turns F/T into per-tick features as selected by `ft_preprocess`:
+- `"asinh"` (12-D): `asinh([last, mean] / c)` of the last control step, with c = 1 N and 0.1 N·m. Its
+  std of ~1 is about 10x the drift's state features.
+- `"forge"` (6-D): Isaac Lab FORGE's sensor model. It is an EMA with FORGE's time constant (0.25 per
+  1/120 s step = 29 ms) over the last 3 control steps, plus training noise `ft_noise·ft_scale` (5%),
+  followed by `tanh(w / ft_scale)`. At deploy, a 3-frame queue repeats the first frame after reset,
+  matching the dataset's padding.
+- `ft_scale` is per axis and comes from the training data unless given: the p90 of |w| over contact frames
+  (|F| > 0.5 N after the EMA), swept before training and cached like `action_scale` (`ft_scale.py`).
+  A typical contact maps to ~0.5 and impacts saturate. The scale has to follow the data: LIBERO's contact
+  p90 is 22/36/73 N, 1.0/3.3/1.8 N·m, Square-FT's 3.8/4.0/12.2 N, 0.63/0.24/0.16 N·m. Runs before
+  2026-10-05 used a fixed 260 N / 12 N·m (LIBERO contact p99) with 1 N / 0.1 N·m noise, which buried
+  Square-FT's contact signal (features 5–20x smaller than the state's). Evaluate those runs with
+  `--policy.ft_scale=[260,260,260,12,12,12]`.
+
+The posterior appends the features to each tick's action input, and the drift appends them to its state
+features. The prior is unchanged. `ft_usage_gap` is the recon error with batch-rolled F/T
+minus the recon error, so ~0 means the drift ignores F/T. Read it next to `z_usage_gap`, because F/T can
+explain actions that `z` would otherwise carry.
+
+- `hf.*` and `osc.*` dataset keys never reach the policy, because the preprocessor's `batch_to_transition`
+  keeps only `observation.*`, action and `*_is_pad` keys. A policy input must be an `observation.*` key.
+- Train on the policy view without those columns (`regenerate_libero_hf.py slim`, `himchan00/libero_hf_policy`).
+  lerobot gathers whole rows for every multi-frame window, so the wide `hf.*` rows make data loading
+  ~10x slower (162 vs 13 ms per sample).
+- The F/T logger refreshes derived quantities after every physics step. That leaves the rollout
+  unchanged, but observables then sample the state after substep 24 of 25 instead of 23. The regenerated
+  data has this timing, so evaluate any policy trained on it with `--env.ft_wrench=true`, even without
+  F/T input.
+
 ## Invariants & gotchas
 
 - Euclidean mode requires `action_dim == state_dim` (target-state actions) and uses `(action−state)/s`,
@@ -192,7 +241,7 @@ are this policy's design, not a claim that those papers implement LIBERO imitati
   posterior actions.
 - **`h` requires ≥1 image feature** — environment state does not replace visual context.
 - **Dataloader windows** come from the config properties: state always gets
-  `[1-n_obs_steps, horizon)`; images get `[1-n_obs_steps, 1)`; actions get `[0, horizon)`.
+  `[1-n_obs_steps, horizon)`; images get `[1-n_obs_steps, 1)`; actions get `[0, horizon)`; F/T (`use_ft`) gets `[1-ft_history, horizon)`.
   The leading `n_obs_steps` states form the causal context, while the trailing `H` states form the
   teacher-forced drift trajectory, overlapping at the current frame. `H = horizon`;
   `n_action_steps ≤ horizon` is the deploy execute/refresh period.
@@ -235,6 +284,8 @@ the latter Gaussian only) · SmolVLM2: `vlm_model_name`, `vlm_num_layers`, `vlm_
 `normalize_state` (clean chunk-start-relative drift inputs: subtraction in Euclidean mode,
 reference-frame pose features in body mode; only Euclidean posterior actions subtract x_0;
 drift targets, integration, and joint observation context remain unchanged) ·
+`use_ft`, `ft_preprocess` (`"asinh"` | `"forge"`; wrist F/T into the posterior and the drift, see above) ·
+`ft_scale` (forge per-axis scale; None → swept from the training data), `ft_noise` (forge train noise, fraction of `ft_scale`) ·
 `deterministic_z_inference` · vision/optim knobs copied verbatim from `DiffusionConfig` for fairness.
 
 ## SmolVLM2 / LIBERO usage

@@ -23,6 +23,11 @@ from lerobot.configs.parser import parse_arg
 from lerobot.optim import AdamConfig, CosineDecayWithWarmupSchedulerConfig, DiffuserSchedulerConfig
 from lerobot.utils.constants import OBS_STATE
 
+# Environment-interaction wrench at the wrist over the last control step (a gravity- and inertia-compensated
+# F/T; contact forces in sim), EE frame, (25, 6) per frame: examples/port_datasets/libero_hf datasets, and
+# the LIBERO env with --env.ft_wrench=true.
+OBS_FT_WRENCH = "observation.ft_wrench"
+
 # Env-dependent defaults: fields left None are filled in __post_init__ from ENV_PRESETS[--env.type];
 # explicit values win. pusht = the DP recipe, libero = the SmolVLA recipe.
 ENV_PRESETS = {
@@ -71,6 +76,10 @@ ENV_PRESETS = {
         "scheduler_decay_lr": 2.5e-6,
     },
 }
+# Square-FT, Wipe-FT and Door-FT (envs/square_ft.py, wipe_ft.py, door_ft.py) and their suite FT-3 have the LIBERO
+# robot, controller and observations.
+ENV_PRESETS["square_ft"] = ENV_PRESETS["wipe_ft"] = ENV_PRESETS["door_ft"] = ENV_PRESETS["libero"]
+ENV_PRESETS["ft3"] = ENV_PRESETS["libero"]
 
 
 @PreTrainedConfig.register_subclass("latent_sde")
@@ -227,6 +236,18 @@ class LatentSDEConfig(PreTrainedConfig):
     #   Drift targets, integration, and controller conversion keep their original coordinates.
     normalize_state: bool = True
 
+    # use_ft: the posterior and the drift also read `observation.ft_wrench` (OBS_FT_WRENCH) per tick; the prior is
+    #   unchanged. ft_preprocess picks the per-tick feature:
+    #   "asinh" — [last sample, mean] of the last control step, asinh(w / (1 N, 0.1 N·m)) (12-D).
+    #   "forge" — Isaac Lab FORGE's sensor model: an EMA with its 29 ms time constant over the last 3 control
+    #             steps, training noise N(0, ft_noise·ft_scale), then tanh(w / ft_scale) (6-D).
+    # ft_scale: forge per-axis scale. None → p90 of |w| over the training data's contact frames, swept before
+    #   training and cached (ft_scale.py). Runs before 2026-10-05 used [260]*3 + [12]*3 (LIBERO contact p99).
+    use_ft: bool = False
+    ft_preprocess: str = "asinh"  # "asinh" | "forge"
+    ft_scale: list[float] | None = None
+    ft_noise: float = 0.05
+
     # ---- Inference -----------------------------------------------------------------------------
     # If True, drift-only inference. False → SDE noise s·σ·ε with σ from the action_var EMA.
     deterministic_inference: bool = True
@@ -325,6 +346,8 @@ class LatentSDEConfig(PreTrainedConfig):
             )
         if self.action_anchor not in ("clean", "nearest"):
             raise ValueError(f"`action_anchor` must be 'clean' or 'nearest'. Got {self.action_anchor!r}.")
+        if self.ft_preprocess not in ("asinh", "forge"):
+            raise ValueError(f"`ft_preprocess` must be 'asinh' or 'forge'. Got {self.ft_preprocess!r}.")
 
         if self.use_vq:
             if self.context_encoder == "smolvlm2":
@@ -377,7 +400,16 @@ class LatentSDEConfig(PreTrainedConfig):
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
         # State always includes the causal n_obs_steps context window followed by the horizon-length
         # teacher-forced trajectory. The current frame (delta 0) belongs to both slices.
-        return {OBS_STATE: list(range(1 - self.n_obs_steps, self.horizon))}
+        # F/T covers the trajectory, plus the earlier control steps its per-tick feature reads.
+        windows = {OBS_STATE: list(range(1 - self.n_obs_steps, self.horizon))}
+        if self.use_ft:
+            windows[OBS_FT_WRENCH] = list(range(1 - self.ft_history, self.horizon))
+        return windows
+
+    @property
+    def ft_history(self) -> int:
+        """Control steps of F/T per tick feature: 3 for the FORGE EMA, else the last one."""
+        return 3 if self.ft_preprocess == "forge" else 1
 
     @property
     def action_delta_indices(self) -> list:

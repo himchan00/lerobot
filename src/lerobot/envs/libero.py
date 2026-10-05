@@ -32,6 +32,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
 
+from .libero_ft import N_SUBSTEPS, FTWrenchLogger
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
 
@@ -127,10 +128,14 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         is_libero_plus: bool = False,
+        ft_wrench: bool = False,
     ):
         super().__init__()
         self.task_id = task_id
         self.is_libero_plus = is_libero_plus
+        # Adds "ft_wrench": the EE-frame contact wrench at the wrist over the last control step (libero_ft.py).
+        self.ft_wrench = ft_wrench
+        self._ft_logger: FTWrenchLogger | None = None
         self.obs_type = obs_type
         self.render_mode = render_mode
         self.observation_width = observation_width
@@ -242,6 +247,10 @@ class LiberoEnv(gym.Env):
                     ),
                 }
             )
+            if self.ft_wrench:
+                self.observation_space["ft_wrench"] = spaces.Box(
+                    low=-np.inf, high=np.inf, shape=(N_SUBSTEPS, 6), dtype=np.float32
+                )
 
         self.action_space = spaces.Box(
             low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
@@ -332,6 +341,10 @@ class LiberoEnv(gym.Env):
         if self.init_states and self._init_states is not None:
             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
             self.init_state_id += self._reset_stride  # Change init_state_id when reset
+        if self.ft_wrench:  # reset may rebuild the sim
+            if self._ft_logger is not None:
+                self._ft_logger.detach()
+            self._ft_logger = FTWrenchLogger(self._env.env)
 
         # After reset, objects may be unstable (slightly floating, intersecting, etc.).
         # Step the simulator with a no-op action for a few frames so everything settles.
@@ -348,6 +361,8 @@ class LiberoEnv(gym.Env):
         else:
             raise ValueError(f"Invalid control mode: {self.control_mode}")
         observation = self._format_raw_obs(raw_obs)
+        if self._ft_logger is not None:
+            observation["ft_wrench"] = self._ft_logger.block()  # the last settle step
         info = {"is_success": False}
         return observation, info
 
@@ -372,6 +387,8 @@ class LiberoEnv(gym.Env):
             }
         )
         observation = self._format_raw_obs(raw_obs)
+        if self._ft_logger is not None:
+            observation["ft_wrench"] = self._ft_logger.block()
         if terminated:
             self.reset()
         truncated = False

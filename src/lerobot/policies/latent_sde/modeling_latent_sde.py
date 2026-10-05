@@ -26,7 +26,8 @@ from lerobot.utils.constants import (
 from ..diffusion.modeling_diffusion import DiffusionRgbEncoder
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
-from .configuration_latent_sde import LatentSDEConfig
+from .configuration_latent_sde import OBS_FT_WRENCH, LatentSDEConfig
+from .ft_scale import forge_ema_weights
 from .geometry import (
     action_to_endpoint,
     body_to_world,
@@ -57,7 +58,7 @@ class LatentSDEPolicy(PreTrainedPolicy):
     Inference duty cycle (research_brief.md §1.2): the observation context and z (per-episode
     latent, sampled from the prior on that context) are refreshed together every `n_action_steps`
     ticks — matching DP's context-encoder cadence. The light drift/diffusion net runs every tick
-    on the current measured state and z only.
+    on the current measured state (+ wrist F/T with use_ft) and z only.
     """
 
     config_class = LatentSDEConfig
@@ -71,6 +72,11 @@ class LatentSDEPolicy(PreTrainedPolicy):
             from .action_scale import resolve_action_scale
 
             config.action_scale = resolve_action_scale(config, kwargs["dataset_meta"])
+        forge = config.use_ft and config.ft_preprocess == "forge"
+        if forge and config.ft_scale is None and not config.pretrained_path and kwargs.get("dataset_meta") is not None:
+            from .ft_scale import resolve_ft_scale
+
+            config.ft_scale = resolve_ft_scale(config, kwargs["dataset_meta"])
 
         self._queues = None
         self._steps_until_refresh: int = 0
@@ -90,6 +96,8 @@ class LatentSDEPolicy(PreTrainedPolicy):
         }
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.use_ft:
+            self._queues[OBS_FT_WRENCH] = deque(maxlen=self.config.ft_history)
         self._steps_until_refresh = 0
         self._cached_z = None
         self._cached_x0 = None
@@ -132,7 +140,10 @@ class LatentSDEPolicy(PreTrainedPolicy):
             self._cached_x0 = x_now.clone()
             self._steps_until_refresh = self.config.n_action_steps
 
-        action = self.model.step(x_now, self._cached_z, x0=self._cached_x0, noise=noise)
+        ft = None
+        if self.config.use_ft:  # the queue repeats the first frame after reset, like the dataset's padding
+            ft = self.model.ft_features(torch.stack(list(self._queues[OBS_FT_WRENCH]), dim=1))[:, -1]
+        action = self.model.step(x_now, self._cached_z, x0=self._cached_x0, ft=ft, noise=noise)
         self._steps_until_refresh -= 1
         return action
 
@@ -196,6 +207,24 @@ class LatentSDEModel(nn.Module):
 
         self.normalize_state = config.normalize_state
 
+        # Optional wrist F/T (environment-interaction wrench), read by the posterior and the drift only; see
+        # `ft_preprocess` and `ft_features`. LIBERO contact wrench: 0 in free space; in contact median 19 N /
+        # 0.6 N·m, p99 260 N / 12 N·m after the FORGE EMA (raw 2 ms impacts reach 8.7 kN).
+        forge = config.ft_preprocess == "forge"
+        self.ft_dim = (6 if forge else 12) if config.use_ft else 0
+        if forge and config.use_ft:
+            if config.ft_scale is None:
+                raise ValueError(
+                    "ft_preprocess='forge' needs ft_scale: swept from the dataset when training from scratch, else "
+                    "pass --policy.ft_scale (runs before 2026-10-05: [260,260,260,12,12,12])."
+                )
+            scale = torch.tensor(config.ft_scale, dtype=torch.float32)
+            self.register_buffer("ft_ema_weights", forge_ema_weights(config.ft_history).float(), persistent=False)
+            self.register_buffer("ft_noise", config.ft_noise * scale, persistent=False)
+            self.register_buffer("ft_scale", scale, persistent=False)
+        else:
+            self.register_buffer("ft_scale", torch.tensor([1.0] * 3 + [0.1] * 3).repeat(2), persistent=False)
+
         self.z_dim = config.z_dim
         posterior_hidden = config.z_posterior_hidden_dim or latent_hidden_dim
         prior_hidden = config.z_prior_hidden_dim or latent_hidden_dim
@@ -217,7 +246,7 @@ class LatentSDEModel(nn.Module):
                 hidden_dim=prior_hidden,
             )
             self.posterior = LatentPosteriorTrajVQ(
-                input_dim=self.action_dim,
+                input_dim=self.action_dim + self.ft_dim,
                 z_dim=self.z_dim,
                 hidden_dim=posterior_hidden,
                 num_levels=tcn_levels,
@@ -262,7 +291,7 @@ class LatentSDEModel(nn.Module):
                     sigma_min=config.z_sigma_min,
                 )
             self.posterior = LatentPosteriorTraj(
-                input_dim=self.action_dim,
+                input_dim=self.action_dim + self.ft_dim,
                 z_dim=self.z_dim,
                 hidden_dim=posterior_hidden,
                 sigma_activation=config.sigma_activation,
@@ -272,9 +301,9 @@ class LatentSDEModel(nn.Module):
             )
             self.vq = None
 
-        # Light per-tick drift: current state features in, z as the only FiLM conditioning.
+        # Light per-tick drift: current state features (+ F/T) in, z as the only FiLM conditioning.
         self.net = LatentSDEDriftDiffusionNet(
-            input_dim=self.state_feature_dim,
+            input_dim=self.state_feature_dim + self.ft_dim,
             action_dim=config.action_feature.shape[0],
             cond_dim=self.z_dim,
             down_dims=config.down_dims,
@@ -346,6 +375,18 @@ class LatentSDEModel(nn.Module):
     def _dim_var(self) -> Tensor:
         """σ² per output coordinate (its group's value in body mode, the scalar in Euclidean mode)."""
         return self.action_var[self.sigma_group] if self.pose_geometry else self.action_var
+
+    def ft_features(self, ft_wrench: Tensor) -> Tensor:
+        """(..., T, 25, 6) per-frame EE-frame F/T blocks → (..., T - ft_history + 1, ft_dim) per-tick features."""
+        ft_wrench = ft_wrench.float()
+        if self.config.ft_preprocess == "asinh":
+            return torch.asinh(torch.cat((ft_wrench[..., -1, :], ft_wrench.mean(dim=-2)), dim=-1) / self.ft_scale)
+        # Each tick reads its last ft_history blocks, oldest first: (..., T-h+1, h·25, 6).
+        windows = ft_wrench.unfold(-3, self.config.ft_history, 1).movedim(-1, -3).flatten(-3, -2)
+        wrench = (windows * self.ft_ema_weights[:, None]).sum(dim=-2)
+        if self.training:
+            wrench = wrench + torch.randn_like(wrench) * self.ft_noise
+        return torch.tanh(wrench / self.ft_scale)
 
     def _state_features(self, state: Tensor, reference_state: Tensor | None = None) -> Tensor:
         if self.pose_geometry:
@@ -446,11 +487,16 @@ class LatentSDEModel(nn.Module):
             eps = torch.randn(mu_p.shape, dtype=mu_p.dtype, device=mu_p.device, generator=generator)
             return mu_p + sigma_p * eps
 
-    def predict_drift(self, state: Tensor, z: Tensor, *, x0: Tensor | None = None) -> Tensor:
-        """Evaluate raw (B,H,D) states under FiLM(z), optionally relative to the clean (B,1,D) chunk origin."""
+    def predict_drift(
+        self, state: Tensor, z: Tensor, *, x0: Tensor | None = None, ft: Tensor | None = None
+    ) -> Tensor:
+        """Evaluate raw (B,H,D) states (+ (B,H,12) F/T features) under FiLM(z), optionally relative to the
+        clean (B,1,D) chunk origin."""
         if self.normalize_state and x0 is None:
             raise ValueError("normalize_state=True requires the clean chunk-initial state x0.")
         state = self._state_features(state, x0 if self.normalize_state else None)
+        if ft is not None:
+            state = torch.cat((state, ft.to(state.dtype)), dim=-1)
         batch_size, horizon = state.shape[:2]
         flat_z = z[:, None].expand(batch_size, horizon, -1).reshape(batch_size * horizon, -1)
         return self.net(state.reshape(batch_size * horizon, -1), flat_z).reshape(batch_size, horizon, -1)
@@ -460,6 +506,7 @@ class LatentSDEModel(nn.Module):
         x_now: Tensor,
         z: Tensor,
         x0: Tensor | None = None,
+        ft: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
@@ -471,12 +518,18 @@ class LatentSDEModel(nn.Module):
             x0: (B, state_dim) clean chunk-initial state, required when normalize_state=True.
                 Euclidean drift inputs subtract x0; pose inputs use its position and rotation as a
                 fixed reference frame. Integration and controller conversion still use absolute x_now.
+            ft: (B, ft_dim) `ft_features` of the current F/T, required when use_ft=True.
             noise: (B, action_dim) optional standardized noise. Mirrors
                    `DiffusionModel.conditional_sample(noise=...)`: when given, replaces the
                    internal `randn`; ignored when `deterministic_inference` is True.
                    Body mode uses ordinary Gaussian noise in normalized body-controller coordinates.
         """
-        mu = self.predict_drift(x_now[:, None], z, x0=x0[:, None] if x0 is not None else None)[:, 0]
+        mu = self.predict_drift(
+            x_now[:, None],
+            z,
+            x0=x0[:, None] if x0 is not None else None,
+            ft=ft[:, None] if ft is not None else None,
+        )[:, 0]
         if self.pose_geometry:
             mu = mu.to(torch.float64 if x_now.dtype == torch.float64 else torch.float32)
         # Keep controller actions in the measured-state dtype under autocast.
@@ -517,13 +570,14 @@ class LatentSDEModel(nn.Module):
         x_seq is the measured state trajectory from the dataset (no teacher-forcing). Train and
         inference see the same state distribution only when state_noise_std==0; under state-noise the
         drift input is perturbed at train time (corrective augmentation), while inference stays clean.
-        The posterior reads only the demonstration actions.
+        The posterior reads only the demonstration actions (+ the per-tick F/T with use_ft).
 
         Expected `batch` (normalized + on device; LatentSDEPolicy.forward stacks images):
             "observation.state":  (B, n_obs_steps-1+horizon, state_dim) — causal context + horizon
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
             "action":             (B, horizon, action_dim)
             "action_is_pad":      (B, horizon) — used iff do_mask_loss_for_padding
+            "observation.ft_wrench": (B, ft_history-1+horizon, 25, 6) — iff use_ft
 
         Padding handling: `drop_n_last_frames` keeps the EXECUTED region unpadded, but the
         predicted tail may be copy-padded at episode ends. When do_mask_loss_for_padding=True,
@@ -587,6 +641,10 @@ class LatentSDEModel(nn.Module):
         post_action = action_target
         if x0 is not None and not self.pose_geometry:
             post_action = action_target - x0
+        # F/T per drift tick (deltas 0..H-1), read by the posterior and the drift.
+        ft = self.ft_features(batch[OBS_FT_WRENCH]) if self.config.use_ft else None
+        if ft is not None:
+            post_action = torch.cat((post_action, ft.to(post_action.dtype)), dim=-1)
 
         if self.use_vq:
             prior_logits = self._prior(context)
@@ -610,7 +668,7 @@ class LatentSDEModel(nn.Module):
             eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
             z_q = mu_q + sigma_q * eps_z
 
-        mu = self.predict_drift(x_seq, z_q, x0=x0)
+        mu = self.predict_drift(x_seq, z_q, x0=x0, ft=ft)
 
         if self.pose_geometry:
             assert pose_drift_target is not None
@@ -703,18 +761,25 @@ class LatentSDEModel(nn.Module):
             if nll_loss is not None:
                 loss_dict["nll_loss"] = nll_loss.detach().item()
             # z_usage_gap: extra recon error from a batch-rolled (mismatched) z. ~0 ⇒ z ignored.
-            mu_rolled = self.predict_drift(x_seq, torch.roll(z_q, shifts=1, dims=0), x0=x0)
+            mu_rolled = self.predict_drift(x_seq, torch.roll(z_q, shifts=1, dims=0), x0=x0, ft=ft)
             rolled_se = (mu_rolled - drift_target) ** 2
             if self.config.do_mask_loss_for_padding:
                 rolled_se = rolled_se * valid.unsqueeze(-1)
             recon_loss_rolled = rolled_se.mean()
             loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
+            if ft is not None:
+                # ft_usage_gap: the same with batch-rolled F/T. ~0 ⇒ the drift ignores F/T.
+                mu_ft_rolled = self.predict_drift(x_seq, z_q, x0=x0, ft=torch.roll(ft, shifts=1, dims=0))
+                ft_rolled_se = (mu_ft_rolled - drift_target) ** 2
+                if self.config.do_mask_loss_for_padding:
+                    ft_rolled_se = ft_rolled_se * valid.unsqueeze(-1)
+                loss_dict["ft_usage_gap"] = (ft_rolled_se.mean() - recon_loss).item()
             # recon_loss_prior: recon with z ~ p(z|context) — the DEPLOY-time z (training uses q). The
             # posterior's recon gain transfers to deployment only if this stays near recon_loss; if
             # it rises toward the rolled (mismatched-z) level, the gain is posterior LEAKAGE — z
             # encodes trajectory info the prior can't reproduce. prior_recon_gap = the deploy penalty.
             z_prior = self.sample_z_from_prior(context)   # (B, z_dim), deploy prior distribution
-            mu_prior = self.predict_drift(x_seq, z_prior, x0=x0)
+            mu_prior = self.predict_drift(x_seq, z_prior, x0=x0, ft=ft)
             prior_se = (mu_prior - drift_target) ** 2
             if self.config.do_mask_loss_for_padding:
                 prior_se = prior_se * valid.unsqueeze(-1)
@@ -985,7 +1050,7 @@ class LatentSDEDriftDiffusionNet(nn.Module):
     DiffusionConditionalUnet1d (horizon-axis Conv1d → Linear).
 
     Inputs:
-        x:    (B, input_dim)     — current state features.
+        x:    (B, input_dim)     — current state features (+ F/T features with use_ft).
         cond: (B, cond_dim)      — the latent z (FiLM); the drift never reads observation context.
     Output:
         mu:   (B, action_dim) — SDE drift. The action-decoder σ is a calibrated EMA buffer on
