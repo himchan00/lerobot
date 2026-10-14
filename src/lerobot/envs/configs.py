@@ -449,18 +449,24 @@ class LiberoEnv(EnvConfig):
         )
 
 
-@EnvConfig.register_subclass("square_ft")
+@EnvConfig.register_subclass("ft4")
 @dataclass
-class SquareFTEnv(EnvConfig):
-    """robosuite Square with a hidden peg offset that only the wrist F/T reveals (envs/square_ft.py).
+class FT4Env(EnvConfig):
+    """FT-4: robosuite Square, Stack, Wipe and Door as one language-conditioned suite under perception error
+    (envs/ft4.py). Each task runs with its own episode length.
 
     Same observations as LiberoEnv with ft_wrench=True: agentview and eye-in-hand images, robot_state, and
-    `observation.ft_wrench`. Datasets: examples/port_datasets/square_ft.
+    `observation.ft_wrench`. `camera_error` scales the camera calibration error drawn every episode
+    (ft4.perturb_cameras; 0: none). `contact_rules`: crushing or dropping the block (Stack) and wiping outside 5-25 N
+    (Wipe) fail. Datasets: examples/port_datasets/ft4.
     """
 
-    task: str = "square_ft"
+    task: str = "ft4"
+    tasks: list[str] = field(default_factory=list)  # empty: all four
+    camera_error: float = 1.0
+    contact_rules: bool = True
     fps: int = 20
-    episode_length: int = 400
+    episode_length: int = 400  # each task uses its own (ft4.EPISODE_LENGTH)
     observation_height: int = 256
     observation_width: int = 256
     features: dict[str, PolicyFeature] = field(default_factory=dict)
@@ -495,76 +501,16 @@ class SquareFTEnv(EnvConfig):
         }
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):
-        from .square_ft import create_square_ft_envs
+        from .ft4 import create_ft4_envs
 
-        return create_square_ft_envs(n_envs, self.gym_kwargs, _make_vec_env_cls(use_async_envs, n_envs))
+        vec_env_cls = _make_vec_env_cls(use_async_envs, n_envs)
+        return create_ft4_envs(n_envs, self.gym_kwargs, vec_env_cls, self.tasks, self.camera_error, self.contact_rules)
 
     def get_env_processors(self):
         return (
             PolicyProcessorPipeline(steps=[LiberoProcessorStep()]),
             PolicyProcessorPipeline(steps=[]),
         )
-
-
-@EnvConfig.register_subclass("wipe_ft")
-@dataclass
-class WipeFTEnv(SquareFTEnv):
-    """robosuite Wipe on a surface whose true height and tilt only the wrist F/T reveals (envs/wipe_ft.py).
-
-    Same observations as SquareFTEnv. Datasets: examples/port_datasets/wipe_ft.
-    """
-
-    task: str = "wipe_ft"
-    episode_length: int = 300
-
-    def create_envs(self, n_envs: int, use_async_envs: bool = False):
-        from .wipe_ft import create_wipe_ft_envs
-
-        return create_wipe_ft_envs(n_envs, self.gym_kwargs, _make_vec_env_cls(use_async_envs, n_envs))
-
-
-@EnvConfig.register_subclass("door_ft")
-@dataclass
-class DoorFTEnv(SquareFTEnv):
-    """robosuite Door whose hinge side (left or right post) only the wrist F/T reveals at first (envs/door_ft.py).
-
-    Same observations as SquareFTEnv. Datasets: examples/port_datasets/door_ft.
-    """
-
-    task: str = "door_ft"
-    episode_length: int = 350
-
-    def create_envs(self, n_envs: int, use_async_envs: bool = False):
-        from .door_ft import create_door_ft_envs
-
-        return create_door_ft_envs(n_envs, self.gym_kwargs, _make_vec_env_cls(use_async_envs, n_envs))
-
-
-@EnvConfig.register_subclass("ft3")
-@dataclass
-class FT3Env(SquareFTEnv):
-    """Square-FT, Wipe-FT and Door-FT as one language-conditioned multi-task suite, like a LIBERO suite.
-
-    Evaluates each task with its own episode length; results per task are logged as eval groups.
-    Datasets: examples/port_datasets/ft3.
-    """
-
-    task: str = "ft3"
-
-    def create_envs(self, n_envs: int, use_async_envs: bool = False):
-        from .door_ft import create_door_ft_envs
-        from .square_ft import create_square_ft_envs
-        from .wipe_ft import create_wipe_ft_envs
-
-        vec_env_cls = _make_vec_env_cls(use_async_envs, n_envs)
-        envs = {}
-        for cfg, create in (
-            (SquareFTEnv, create_square_ft_envs),
-            (WipeFTEnv, create_wipe_ft_envs),
-            (DoorFTEnv, create_door_ft_envs),
-        ):
-            envs.update(create(n_envs, {**self.gym_kwargs, "episode_length": cfg.episode_length}, vec_env_cls))
-        return envs
 
 
 @EnvConfig.register_subclass("metaworld")

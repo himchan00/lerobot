@@ -289,147 +289,130 @@ F/T가 중요한 sim benchmark 후보인 MimicGen에서, demo action에 F/T 정�
   - task 성공에 접촉이 중요해도, 접촉은 어떤 demo가 성공으로 남는지만 거름.
 - 결론: F/T에 반응하는 policy를 BC로 시험하려면, 시연자(스크립트 전문가 또는 RL 전문가)가 F/T에 반응해야 함. 기존 sim demo(LIBERO, MimicGen)에는 그런 action이 없음.
 
-### 2.7 Square-FT: F/T에 반응하는 스크립트 전문가 demo (2026-10-04)
+### 2.7 (지움) Square-FT, Wipe-FT, Door-FT, FT-3, FT-N, FT-4 v1 (2026-10-04~11)
 
-robosuite Square(MimicGen Square D1 배치)를 F/T 없이는 끼우기 어렵게 바꾼 task (`src/lerobot/envs/square_ft.py`, `--env.type=square_ft`).
+숨은 오프셋(충돌 형상만 옮김)이나 원본과 다른 장면을 쓴 이전 F/T 벤치마크들이다. 영상과 물리가 어긋나거나 장면이 원본이 아니어서 2026-10-12에 코드와 데이터를 지웠다. 코드와 이 README의 기록(옛 §2.7–2.11)은 커밋 `6a305f32`에, 학습 기록은 wandb에 남아 있다.
 
-- task:
-  - 페그 한 변을 41 mm로 키움 (너트 구멍 45.5 mm, 한쪽 틈새 2.25 mm).
-  - 에피소드마다 페그의 충돌 박스만 그려진 박스에서 L∞ 4~8 mm 옮김. 카메라로는 구멍 위치를 알 수 없음.
-  - 너트–페그 마찰 0.3 (기본 1 / 0.95). 손가락 패드(마찰 2)로 잡는 데는 영향 없음.
-  - OSC_POSE, kp 150, 20 Hz, 관측은 LIBERO와 같음 (카메라 2대 256, state 8, `observation.ft_wrench` (25, 6)). 언어: "put the square nut on the square peg".
-  - 주의: MuJoCo 3는 고정 바디 geom의 월드 자세를 다시 계산하지 않음. 그래서 오프셋은 컴파일 후 `geom_pos`가 아니라 XML(`_load_model`)에 넣음. 앞의 방식은 효과가 없었음.
-- 전문가 (`examples/port_datasets/square_ft/generate_square_ft.py`):
-  - 참 너트 자세와 그려진 페그만 보고, 숨은 오프셋은 모름.
-  - 너트를 그려진 페그 위로 옮겨 내리다가, 페그 윗면에 닿으면 2 step 눌러 지지력의 CoP(토크/힘)를 읽음.
-  - 그 뒤 윗면에 닿은 채로 CoP 쪽으로 미끄러뜨리고, 매 step 현재 렌치로 CoP를 다시 읽음. 지지력이 사라지면(0.8 N 미만) 삽입.
-  - CoP는 항상 구멍의 페그 쪽에 있어서, 매 step의 행동이 현재 F/T의 함수임.
-  - 성공률 약 75% (실패는 잡기 실패, 삽입 중 걸림 등). 성공 에피소드만 저장.
-- F/T 정보 검사 (전문가 demo 1,200개 중 성공분, 테스트 에피소드 177개, `mimicgen_data/tools/ft_phase.py`): 미끄러뜨리기 프레임의 다음 action 위치 R².
+### 2.8 FT-4: 지각 오차 아래의 네 robosuite 과제 (2026-10-12, gpu9)
 
-  | 입력 | F/T 없음 | F/T 있음 |
-  |---|---|---|
-  | state | −0.11 | 0.45 |
-  | state + a(t-1) | 0.59 | 0.69 |
-  | state(t, t-1) + a(t-1) | 0.60 | 0.68 |
+목적은 force-reactive 데모가 필요한지 보는 것이다. latent_sde를 native / reactive 데모 × F/T 있음 / 없음으로 학습한다(2 × 2).
 
-  - 방향을 처음 고르는 step에서는 0 → 0.16~0.19.
-  - LIBERO와 MimicGen에서는 같은 검사에서 이득이 0 이하였음 (2.6).
-  - 시행착오: 누른 뒤 들어 올려 옮기는 전문가는 옮길 때 F/T가 0이라, 직전 action이 있으면 F/T 이득이 없었음 (velocity-blind drift는 따라 할 수 없음).
-- 데이터: 1,000 에피소드, 201,475 프레임, 전문가 시도 1,337번 중 성공분 (`generate_square_ft.py shards --episodes 1000 --workers 16 --seed 500000`, 이어서 `aggregate`, 48분) → `/PublicSSD/himchan/square_ft/data/final` (`himchan00/square_ft`, fps 20).
-  - CPU 렌더링(OSMesa, `LP_NUM_THREADS=1`)으로 생성. EGL과의 차이는 평균 0.8 / 0.45 단계 (영상 압축 오차보다 작음).
-  - `expert.phase`, `expert.peg_offset` 열은 분석용 (policy 입력 아님).
-- 학습 (`outputs/queue_square_ft/queue.sh`, tmux `latent_sde:squareft`): `_ftforge` (F/T, FORGE 전처리)와 control을 5090에서 동시에, 30k step, 10k마다 50 에피소드 평가. wandb `himchan00/lerobot_square_ft`.
-  - latent_sde preset은 LIBERO와 같음 (`ENV_PRESETS["square_ft"]`).
-  - run: `_ftforge` 6n6wzif6, control sparm4d3. 10-04 22:54 시작, 두 run 동시에 약 0.6 s/step, 10-05 05시경 종료 예상.
-  - 데이터 생성은 worker당 RAM 약 2.5 GB라 gpu9(60 GB)에서는 16개까지 (28개로 돌렸을 때 메모리 부족으로 중단됨).
-- 결과 (학습 중 평가, 50 에피소드, GPU 렌더링):
+**장면** (`src/lerobot/envs/ft4.py`, `--env.type=ft4`): robosuite 원본 Square, Stack, Wipe(WipingGripper), Door(걸쇠 있음).
+- F/T 때문에 바꾼 것은 Square 페그 폭 하나다(32 → 41 mm, 너트 구멍 45.5 mm라 틈새가 한쪽 2.25 mm).
+- 평가 때 매 에피소드 카메라 보정을 틀어 지각 오차를 넣는다(`perturb_cameras`).
+  - 3인칭 카메라: 축마다 ±5 mm, ±0.5°. 손목 카메라: ±2 mm, ±0.5°.
+  - `--env.camera_error`로 크기를 조절하고, 0이면 끈다.
+- 접촉 규칙(`contact_rules`):
+  - Stack: 블록을 20 N 넘게 누르거나 3 mm 넘게 떨어뜨리면 실패.
+  - Wipe: 5–25 N으로 고르게(압력 중심이 패드 가운데 60%) 눌러야 닦이고, 40 N을 넘으면 실패. robosuite의 조기 종료(팔이 테이블에 닿음, 관절 한계)도 실패.
+  - Square와 Door는 robosuite 규칙 그대로다.
 
-  | step | `_ftforge` 6n6wzif6 | control sparm4d3 |
-  |---|---|---|
-  | 10k | 8% | 16% |
-  | 20k | 18% | 26% |
-  | 30k | 38% | 22% |
+**데모** (`examples/port_datasets/ft4/`, 데이터 `/PublicSSD/himchan/ft4/data/<task>_native`, `<task>_conv`)
+- native(`generate_ft4.py`): 지각이 정확한 비반응 전문가의 데모다. 전문가는 `square_expert.py`(Square)와 `experts.py`(Stack, Wipe, Door)에 있다.
+  - 과제당 1000개. seed는 square 900000, door 910000, wipe 920000, stack 940000(split 16).
+  - 실패가 특정 시작 조건에 몰리지 않게 고쳤다(10-12).
+    - Square는 너트를 옮기며 손잡이가 로봇 쪽을 향하게 돌린다.
+    - Door는 손가락 방향을 고정한다.
+    - Wipe는 천천히 닿은 뒤 8 mm로 누른다.
+  - 전문가 성공률: Square 98%, Stack 93%, Wipe 93%, Door 99%. 성공한 에피소드만 남긴다.
+- conv(`convert_native.py`): native 데모를 지각 오차 데모로 바꾼 것이다.
+  - native 에피소드를 seed chain에서 그대로 재생해 장면 전체를 얻는다(문 위치, Wipe 경로, gripper 명령, OSC 자세까지 정확히 일치).
+  - 목표에 대해 움직이는 구간에서 힘 반응 전문가에게 넘긴다. 이 전문가는 목표를 δ만큼 틀리게 알아서, 빗나가게 닿은 뒤 F/T로 고친다. 실패하면 δ를 새로 뽑아 3번까지 시도한다.
+  - δ 범위: Square 페그 xy L∞ 4–12 mm, Stack 옆 ±5 mm·높이 4–10 mm, Wipe 높이 ±15 mm·기울기 ±3°, Door 경첩 ±3 cm.
+  - label: `expert.perception_error`, `expert.source`(native seed, k).
+- 묶기(`build_ft4.py` + `recorder.views`): `/PublicSSD/himchan/ft4/data/ft4v2_native`, `ft4v2_reactive`(policy view, depth 없음).
+- pilot(변환 성공 / 같은 오차에 반응 없음 / native 재생, 접촉 규칙 적용):
 
-  - 학습 지표는 거의 같음: recon 0.030 / 0.031, prior recon 0.040 / 0.040, `z_usage_gap` 1.17 / 1.18. `ft_usage_gap` 0.0015 (LIBERO FORGE run은 0.06).
-- 계측 평가 (30k, 같은 seed 10000~10099, CPU 렌더링, `/PublicSSD/himchan/square_ft/diag/diag_eval.py` + `analyze_diag.py`):
-
-  | 조건 | 성공 | 잡음 | 그려진 페그 위 | 윗면 착지 | 착지 후 삽입 | 윗면 체류 중앙값 |
-  |---|---|---|---|---|---|---|
-  | F/T policy | 32% | 75% | 68% | 64% | 50% | 44 step |
-  | F/T policy, 평가 때 F/T = 0 | 19% | 72% | 59% | 58% | 33% | 99 step |
-  | control | 26% | 79% | 67% | 66% | 39% | 68 step |
-
-  - F/T를 0으로 넣으면 성공이 32% → 19% (짝지은 McNemar p = 0.019). 윗면에서 옆으로 움직이는 step 비율도 73% → 17%로 떨어짐. policy가 F/T를 접촉 감지 신호로 씀.
-  - 하지만 방향은 못 읽음: 윗면에서의 수평 명령과 숨은 구멍 방향의 cos 중앙값 −0.12 (양수 비율 48%, control은 0.19 / 58%).
-  - F/T vs control은 짝지은 비교에서 19 vs 13 (p = 0.38). 학습 중 평가와 합치면 34% vs 25%.
-  - 공통 병목: 잡기 실패 21~28%.
-- 해석: FORGE 스케일이 LIBERO용(260 N, 12 N·m, 노이즈 1 N / 0.1 N·m)이라, 결정 구간(힘 중앙값 6.8 N, 토크 0.33 N·m)의 F/T 특징 표준편차가 0.005~0.04로 state 위치 특징(0.05~0.13)보다 5~20배 작고, 신호 대 노이즈 비도 0.6~5. 접촉 유무는 보이지만 CoP(토크/힘 비)는 묻힘.
-- 조치 (10-05): F/T 스케일을 학습 데이터에서 계산 (`policies/latent_sde/ft_scale.py`, `action_scale`과 같은 방식).
-  - `--policy.ft_scale`을 주지 않으면, 처음부터 학습할 때 FORGE EMA를 거친 F/T의 접촉 프레임(|F| > 0.5 N)에서 축별 |w|의 p90을 스윕해 `config.ft_scale`에 저장하고 캐시함. 학습 노이즈는 `ft_noise`(기본 0.05) × 스케일.
-  - 값: Square-FT 힘 3.7 / 4.0 / 12.2 N, 토크 0.63 / 0.24 / 0.16 N·m. LIBERO 22 / 36 / 73 N, 1.0 / 3.3 / 1.8 N·m.
-  - 이전 run(6n6wzif6, LIBERO의 e7fsi0qh)을 다시 평가할 때는 `--policy.ft_scale=[260,260,260,12,12,12]`.
-  - run: `..._ftdata` = 5kmn2jce (`outputs/queue_ft/queue3.sh`).
-
-### 2.8 Wipe-FT: 숨은 표면에서 힘을 맞춰 닦기 (2026-10-05)
-
-Square-FT가 F/T로 "어디로"(구멍 방향)를 읽는 task라면, Wipe-FT는 "얼마나 세게"(수직 힘)를 매 step 맞추는 task (`src/lerobot/envs/wipe_ft.py`, `--env.type=wipe_ft`).
-
-- task: robosuite Wipe (robosuite 벤치마크 9개 task 중 하나), Panda + WipingGripper (손가락 없는 12×5 cm 패드), OSC_POSE kp 150, 20 Hz.
-  - 테이블 충돌면만 그려진 테이블에서 높이 ±15 mm, roll/pitch ±2° 숨겨서 옮김. 카메라에는 평평한 원래 테이블만 보임.
-  - 마커 40개 (robosuite 경로 생성, 5 mm 간격, 약 20 cm). 도구가 마커를 덮고 수직력이 5~20 N일 때만 닦임 (robosuite 원래 판정은 위치만 봄). 35 N 넘게 누르면 실패로 끝남. 전부 닦으면 성공.
-  - 측정해 보니 OSC 목표를 표면 아래로 9 mm 두면 19 N, 21 mm면 36 N. 닦이는 범위가 목표 깊이로 약 7 mm 폭이라 숨은 높이(±15 mm + 기울기)를 모르면 맞추기 어려움.
-  - 관측: Square-FT와 같음. 그리퍼 state는 0, action은 7차원 중 마지막을 무시 (데이터에는 −1).
-- 전문가 (`examples/port_datasets/wipe_ft/generate_wipe_ft.py`): 마커 경로는 알고 숨은 표면은 모름.
-  - 첫 마커 위에서 내려가다 (그려진 표면 3.5 cm 위부터 3 mm/step) F/T 위쪽 힘이 2 N을 넘으면 접촉.
-  - 경로를 8 mm/step으로 따라가며 매 step 높이 목표를 `z_tgt -= 0.3 mm/N × (10 N − F)` (step당 ±2 mm 제한)로 갱신. 수직 명령이 매 step 현재 F/T의 함수.
-  - 경로 끝에서 덜 닦인 마커가 있으면 한 번 되돌아 닦음.
-  - 성공률 약 85% (실패는 착지 지연, 끝 마커 미닦기 등). 닦는 동안 힘 p10/p50/p90 5.2 / 9.4 / 12.7 N.
-- F/T 정보 검사 (전문가 demo 600개 중 성공분, 테스트 에피소드 102개, 닦기 프레임 6,250개, `mimicgen_data/tools/wphase.py`): 다음 action 수직 성분 R².
-
-  | 입력 | F/T 없음 | F/T 있음 |
-  |---|---|---|
-  | state | 0.04 | 0.53 |
-  | state + a(t-1) | 0.91 | 0.91 |
-  | state(t, t-1) + a(t-1) | 0.93 | 0.91 |
-
-  - 현재 프레임만 보는 drift에는 큰 정보. 하지만 직전 action을 알면 정보가 없음: 준정적 접촉에서 F ≈ K(x_d − x)라 자기 명령과 위치로 힘을 계산할 수 있음. Square-FT는 접촉점(토크) 덕분에 직전 action을 알아도 +0.08이 남았음.
-- 데이터: 1,000 에피소드 (`generate_wipe_ft.py shards --episodes 1000 --workers 16 --seed 600000`, 이어서 `aggregate`) → `/PublicSSD/himchan/wipe_ft/data/final` (`himchan00/wipe_ft`, fps 20).
-- 학습 (`outputs/queue_ft/queue3.sh`, tmux `latent_sde:squareft`, wandb `himchan00/lerobot_wipe_ft`): Square-FT `_ftdata` (5kmn2jce)와 Wipe-FT `_ftdata`를 동시에, 이어서 Wipe-FT control. Wipe run은 CPU smoke test가 통과해야(`/PublicSSD/himchan/wipe_ft/SMOKE_OK`) 시작.
-  - 10-05 18:11에 큐를 바꾸려고 tmux 창에 Ctrl-C를 보내 먼저 시작된 Square `_ftdata`(gd4d9vgm, 13분)를 끊었음. 같은 설정으로 18:12에 다시 시작 (5kmn2jce).
-
-### 2.9 Door-FT: 경첩 쪽이 숨은 문 열기 (2026-10-05)
-
-robosuite Door (`src/lerobot/envs/door_ft.py`, `--env.type=door_ft`). F/T가 묶인 운동의 방향(어느 쪽으로 열리는지)을 알려 주는 task.
-
-- task: 손잡이를 문 중앙의 대칭 막대로 옮기고, 실제 경첩을 에피소드마다 왼쪽 또는 오른쪽 기둥에 숨겨 둠 (두 기둥은 똑같이 보임). 걸쇠 없음.
-  - 열림 범위 0~1.6 rad, 0.7 rad 넘게 열면 성공. 손–문 순 힘이 100 N을 넘으면 실패로 끝남 (똑바로만 당겨 0.7 rad까지 열면 옆 어긋남 약 7.5 cm, 약 110 N).
-  - 원래 Door는 경첩이 오른쪽 기둥에 고정되어 영상과 문 위치로 알 수 있음.
-- 전문가 (`examples/port_datasets/door_ft/generate_door_ft.py`): 손잡이 자세와 문 형상(경첩이 중심에서 0.255 m)은 알고, 경첩 쪽은 모름.
-  - 막대 받침 옆을 앞에서 잡고(손가락 수직), 8 step 똑바로 당기며 옆 방향 F/T로 경첩 쪽을 판정 (왼쪽 약 −7 N, 오른쪽 +1~4 N, 기준 −2.5 N).
-  - 판정한 경첩을 중심으로 0.04 rad/step씩 호를 따라 당김. 옆 힘이 25 N을 3 step 넘으면 반대쪽으로 바꿈. 당기는 동안 그리퍼 yaw 고정 (yaw를 따라 돌리면 막대가 비틀려 힘이 튐).
-  - 성공률: 오른쪽 79%, 왼쪽 22% (왼쪽은 0.8 rad 근처에서 팔이 한계에 닿음). 데이터는 좌우 500개씩 맞춤.
-- 데이터: 1,000 에피소드 (`generate_door_ft.py shards --episodes 1000 --workers 20 --seed 700000`, gpu17 CPU) → `/PublicSSD/himchan/door_ft/data/final` (`himchan00/door_ft`).
-
-### 2.10 세 F/T 벤치마크 × 세 policy (2026-10-05 밤, gpu9/17/19, 10-06 오전까지)
-
-| | latent_sde + F/T (데이터 기반 스케일) | latent_sde, F/T 없음 | SmolVLA |
-|---|---|---|---|
-| Square-FT | 5kmn2jce (gpu9) | sparm4d3 (완료) | tld3q4g2 (gpu19) |
-| Wipe-FT | jex7tu6k (gpu9) | gpu9 | dh59wfjm (gpu19) |
-| Door-FT | dqzh7cu4 (gpu17) | p2dutj2a (gpu17) | gpu19 |
-| FT-3 (2.11) | gpu17 | gpu9 | gpu19 |
-
-- 모두 30k step, batch 64, 10k마다 50 에피소드 평가. SmolVLA는 2.3절 레시피 (SmolVLM2 가중치, 실행 10 step).
-- 큐: gpu9 `outputs/queue_ft/queue3.sh`, gpu17 `queue_door.sh`, gpu19 `queue_sv.sh` (각 서버 tmux). 상태는 `outputs/queue_ft/status*.txt`.
-- gpu19 환경: `~/miniconda3/envs/latent_sde` (gpu9의 `pip freeze`로 버전 고정). `/tmp/robosuite.log`가 다른 사용자 파일이라 robosuite `macros_private.py`에서 파일 로그를 끔.
-- 서버끼리 ssh가 안 돼서 데이터셋은 이 PC를 거쳐 `ssh A tar | ssh B tar`로 옮김.
-- gpu17에는 OSMesa가 없어서 생성·smoke·평가 모두 `MUJOCO_GL=egl`.
-
-### 2.11 FT-3: 세 F/T 과제를 한 policy로 (LIBERO식 multi-task, 2026-10-05 밤)
-
-- 데이터 `himchan00/ft3` (`/PublicSSD/himchan/ft3/data/final`, gpu9/17/19 모두): Square-FT + Wipe-FT + Door-FT 각 1,000 에피소드 = 3,000 에피소드, 568,647 프레임.
-  - task 0/1/2 = "put the square nut on the square peg" / "wipe the marked path on the table" / "open the door".
-  - 과제별 숨은 라벨(`expert.peg_offset`, `expert.surface`, `expert.hinge_side`)은 빼고 `expert.phase`만 남김. 원본과 프레임·F/T·action이 같은지 확인함.
-  - 데이터 기반 F/T 스케일: [2.6, 6.5, 12.1, 0.87, 1.06, 0.55].
-- 평가 `--env.type=ft3`: LIBERO suite처럼 과제마다 50 에피소드, 에피소드 길이는 과제별 원래 값(400/300/350).
-  - wandb에는 전체 성공률만 올라감. 과제별 성공률은 학습 로그의 `Suite per_task aggregated` 줄에 있음.
-- 학습 설정은 2.10과 같음. wandb `himchan00/lerobot_ft3`.
-- 큐 `outputs/queue_ft/queue_ft3.sh {ctrl|ft|smolvla}` (각 서버 tmux 창 `ft3`, 상태 `status_ft3.txt`).
-  - gpu9은 F/T 없음, gpu17은 F/T, gpu19는 SmolVLA.
-  - 각 서버의 단일 과제 run 하나가 끝나면 시작.
+  | 과제 | 변환 성공 | 같은 오차, 반응 없음 | native 재생 |
+  |---|---|---|---|
+  | Square | 23/32 | 14/32 | 32/32 |
+  | Stack | 40/40 | 1/40 | 40/40 |
+  | Wipe | 24/24 | 0/24 | 24/24 |
+  | Door | 32/32 | 32/32 | 32/32 (경첩 오차가 결과를 바꾸지 않는 대조군) |
 
 ```bash
-# 데이터셋 (세 데이터셋이 있는 서버에서; gpu19에서 만듦)
-python examples/port_datasets/ft3/build_ft3.py --out /PublicSSD/himchan/ft3/data \
-    --sources /PublicSSD/himchan/square_ft/data/final /PublicSSD/himchan/wipe_ft/data/final /PublicSSD/himchan/door_ft/data/final
-# latent_sde + F/T (F/T 없음: use_ft/ft_preprocess 빼기. SmolVLA: 2.3 명령에 --env.type=ft3, 같은 dataset)
-lerobot-train --policy.type=latent_sde --policy.use_ft=true --policy.ft_preprocess=forge --policy.z_dim=32 \
-    --policy.state_noise_std=0 '--policy.down_dims=[512,1024,2048]' --policy.push_to_hub=false --env.type=ft3 \
-    --dataset.repo_id=himchan00/ft3 --dataset.root=/PublicSSD/himchan/ft3/data/final --dataset.video_backend=torchcodec \
-    --steps=30000 --batch_size=64 --save_freq=5000 --env_eval_freq=10000 \
-    --eval.n_episodes=50 --eval.batch_size=10 --eval.use_async_envs=false
+cd examples/port_datasets/ft4   # latent_sde env, MUJOCO_GL=egl, D=/PublicSSD/himchan/ft4/data
+python generate_ft4.py shards --task square_ft_native --episodes 1000 --splits 16 --workers 14 --seed 900000 --out $D/square_ft_native
+python generate_ft4.py finish --out $D/square_ft_native --repo-id himchan00/square_ft_native
+python convert_native.py pilot --task square_ft --per-worker 1 --workers 4    # replay check, conversion and its controls
+python convert_native.py shards --task square_ft --workers 14 --out $D/square_ft_conv
+python convert_native.py finish --out $D/square_ft_conv --repo-id himchan00/square_ft_conv
+python build_ft4.py --sources $D/{square,stack,wipe,door}_ft_native/final --out $D/ft4v2_native --repo-id himchan00/ft4v2_native
+python -c "import recorder; recorder.views('$D/ft4v2_native')"
 ```
+recording worker 하나가 약 2.5 GB를 쓴다. gpu9(60 GB)에서는 녹화 작업을 한 번에 하나만 돌린다.
+
+**학습** (gpu9, wandb `himchan00/lerobot_ft4`, 2026-10-12~13)
+- latent_sde, 30k step, batch 64. 두 run을 같이 돌리면 각각 1.42 step/s이고, 평가까지 약 7시간 걸린다.
+- 평가는 `ft4`(카메라 오차 1, 접촉 규칙)로 10k마다 과제당 50 에피소드다.
+- run 이름: `latent_sde_ft4v2_{native,reactive}_{ft,noft}_30k`. F/T 없는 run은 `--policy.use_ft`, `--policy.ft_preprocess`를 뺀다.
+- `--wandb.notes` 같은 문자열 인자에 `: `를 넣으면 draccus가 YAML로 읽어 시작 직후 죽는다.
+```bash
+lerobot-train --policy.type=latent_sde --policy.z_dim=32 --policy.state_noise_std=0 '--policy.down_dims=[512,1024,2048]' \
+    --policy.use_ft=true --policy.ft_preprocess=forge --policy.push_to_hub=false --env.type=ft4 \
+    --dataset.repo_id=himchan00/ft4v2_reactive --dataset.root=$D/ft4v2_reactive/policy --dataset.video_backend=torchcodec \
+    --steps=30000 --batch_size=64 --save_freq=5000 --env_eval_freq=10000 \
+    --eval.n_episodes=50 --eval.batch_size=10 --eval.use_async_envs=false \
+    --wandb.enable=true --wandb.entity=himchan00 --wandb.project=lerobot_ft4 \
+    --output_dir=outputs/train/latent_sde_ft4v2_reactive_ft_30k --job_name=latent_sde_ft4v2_reactive_ft_30k
+```
+
+결과 (30k, 성공률 %, 과제당 50 에피소드, seed 1개):
+
+| 데모 | F/T | Square | Stack | Wipe | Door | 평균 | wandb |
+|---|---|---|---|---|---|---|---|
+| native | 있음 | 52 | 44 | 50 | 82 | 57.0 | `2gws75gq` |
+| native | 없음 | 22 | 48 | 8 | 82 | 40.0 | `v5zmqg6l` |
+| reactive | 있음 | 48 | 66 | 38 | 68 | 55.0 | `4qx5x4s0` |
+| reactive | 없음 | 52 | 38 | 2 | 86 | 44.5 | `eamw8hho` |
+
+**추가 평가** (2026-10-13, 같은 30k 체크포인트): 카메라 오차 0과 1로 다시 평가했다. seed가 1000부터라 학습 중 평가와 장면이 같다.
+```bash
+lerobot-eval --policy.path=outputs/train/latent_sde_ft4v2_native_ft_30k/checkpoints/030000/pretrained_model --env.type=ft4 \
+    --env.camera_error=0 --eval.n_episodes=50 --eval.batch_size=10 --eval.use_async_envs=false --output_dir=<out>
+```
+실패 단계는 매 step 과제 상태를 기록하는 임시 스크립트로 봤다(`/PublicSSD/himchan/ft4/analysis`, repo 밖).
+
+성공률 %, 각 칸은 카메라 오차 0 / 1(재평가) / 1(학습 중 평가, 위 표):
+
+| 데모 | F/T | Square | Stack | Wipe | Door | 평균 |
+|---|---|---|---|---|---|---|
+| native | 있음 | 56 / 52 / 52 | 50 / 44 / 44 | 50 / 58 / 50 | 84 / 80 / 82 | 60.0 / 58.5 / 57.0 |
+| native | 없음 | 44 / 42 / 22 | 48 / 44 / 48 | 12 / 8 / 8 | 78 / 80 / 82 | 45.5 / 43.5 / 40.0 |
+| reactive | 있음 | 54 / 48 / 48 | 62 / 70 / 66 | 24 / 32 / 38 | 72 / 64 / 68 | 53.0 / 53.5 / 55.0 |
+| reactive | 없음 | 54 / 46 / 52 | 48 / 48 / 38 | 4 / 6 / 2 | 84 / 86 / 86 | 47.5 / 46.5 / 44.5 |
+
+- 카메라 오차는 거의 영향이 없다. 평균이 −0.5~+2점만 바뀌고, Square만 네 run 모두 오차 0에서 조금 높다(평균 +5).
+- F/T 이득도 오차 0에서 그대로다(native +14.5, reactive +5.5). F/T가 돕는 것은 지각 오차 보정이 아니라 접촉 제어다.
+- 같은 체크포인트를 같은 장면에서 다시 평가해도 정책 샘플링 노이즈로 과제당 최대 20점 차이가 난다(native F/T 없음 Square 22 vs 42). 그래서 아래는 세 평가를 합쳐 본다(과제당 150 에피소드, 장면은 같은 50개).
+
+| 세 평가 평균 | Square | Stack | Wipe | Door | 평균 |
+|---|---|---|---|---|---|
+| native + F/T | 53 | 46 | 53 | 82 | 58.5 |
+| native, F/T 없음 | 36 | 47 | 9 | 80 | 43.0 |
+| reactive + F/T | 50 | 66 | 31 | 68 | 53.8 |
+| reactive, F/T 없음 | 51 | 45 | 4 | 85 | 46.2 |
+
+reactive 데모가 돕지 않는 이유. conv 데모에는 접촉 전에 보이지 않는 틀린 목표(δ)를 겨냥하는 부분과 접촉 후 F/T로 고치는 부분이 섞여 있다. 정책은 앞부분을 무작위 조준 오차로 따라 하고, 뒷부분은 F/T로 배운다(아래는 오차 0과 1 재평가를 합친 100 에피소드).
+- Square는 상쇄된다.
+  - reactive 정책은 너트가 페그에 처음 닿을 때 중앙에서 7–8 mm(L∞ 중앙값) 벗어나 있다. native는 5 mm다. 오차 0에서도 같아서 δ를 따라 한 것이다.
+  - 틈새(2.25 mm) 안으로 바로 닿는 비율은 1–7%로, native의 13–28%보다 낮다.
+  - 대신 6–12 mm 벗어났을 때 성공률은 67–81%로, native의 25–64%보다 높다.
+- Stack은 reactive + F/T만 +20점이다.
+  - native 데모는 블록 1 mm 위에서 놓는다(놓을 때 0.6 N). 판단 시점에 접촉이 없으니 F/T로 배울 신호가 없다.
+  - native + F/T는 100번 중 23번 떨어뜨리고 11번 짓누른다.
+  - reactive + F/T는 닿은 뒤 놓아서 짓누름 0번, 떨어뜨림 4번이다. 잡은 뒤 성공률은 90%다(다른 조합은 55–68%).
+- Wipe는 reactive + F/T가 −21점이다.
+  - 접촉 품질(5–25 N 98–100%, 기울기 0.1° 안팎)과 마커 90개까지의 속도(약 365 step)는 native + F/T와 같다.
+  - 실패한 에피소드는 마지막 마커 약 15개를 남기고 600 step 시간 초과로 끝난다(성공은 100개 전부). 원인은 못 찾았다.
+  - F/T가 없으면 패드가 기울고 압력이 고르지 않다. Wipe에서 F/T의 이득은 대부분 여기서 온다.
+    - native: 기울기 0.55°, 고른 압력 19–23%. 100번 중 관절 한계 23번, 40 N 초과 18번.
+    - reactive: 기울기 0.4°, 고른 압력 31–40%. 대부분 시간 초과다.
+- Door는 reactive + F/T가 −14점이다.
+  - 실패는 네 run 모두 손잡이는 돌렸는데 문이 0.11 rad에서 멈추는 모양이다.
+  - 이 실패가 reactive + F/T에서만 두 배다. 원인은 못 찾았다.
+
+결론: native 재생 + F/T가 가장 좋다(58.5). native 전문가의 판단 시점에 접촉이 있어야 F/T가 배울 신호가 생긴다(Stack). 확인된 것은 이 변환(접촉 전에 틀린 목표를 겨냥)이 돕지 않는다는 것까지다. 접촉 전 행동을 참 목표 쪽으로 라벨링하는 DART 방식은 시험하지 않았다. 학습 seed는 하나다.
 
 ## 3. LIBERO 학습 세팅과 근거 (논문용)
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python
-"""FT-3: Square-FT, Wipe-FT and Door-FT merged into one language-conditioned dataset, like a LIBERO suite.
+"""FT-4: the four task datasets merged into one language-conditioned dataset, like a LIBERO suite.
 
-Each source keeps its task string. The task-specific hidden labels (expert.peg_offset, expert.surface,
-expert.hinge_side) are dropped so the features match (expert.phase stays), then the sources are merged with the
-Array2D-safe aggregate of examples/port_datasets/libero_hf.
+Each source keeps its task string. The task-specific labels (expert.* other than expert.phase, e.g.
+expert.perception_error) are dropped so the features match, then the sources are merged with the Array2D-safe
+aggregate of examples/port_datasets/libero_hf. recorder.views(<out>) then writes the policy views.
 
-    python build_ft3.py --sources <square_ft root> <wipe_ft root> <door_ft root> --out /PublicSSD/himchan/ft3/data
+    python build_ft4.py --sources <data>/{square,stack,wipe,door}_ft_native/final --out <data>/ft4v2_native \
+        --repo-id himchan00/ft4v2_native
 """
 
 import argparse
@@ -50,7 +51,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sources", nargs="+", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--repo-id", default="himchan00/ft3")
+    p.add_argument("--repo-id", default="himchan00/ft4")
     a = p.parse_args()
     out = Path(a.out)
     shutil.rmtree(out, ignore_errors=True)

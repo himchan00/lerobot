@@ -76,10 +76,9 @@ ENV_PRESETS = {
         "scheduler_decay_lr": 2.5e-6,
     },
 }
-# Square-FT, Wipe-FT and Door-FT (envs/square_ft.py, wipe_ft.py, door_ft.py) and their suite FT-3 have the LIBERO
-# robot, controller and observations.
-ENV_PRESETS["square_ft"] = ENV_PRESETS["wipe_ft"] = ENV_PRESETS["door_ft"] = ENV_PRESETS["libero"]
-ENV_PRESETS["ft3"] = ENV_PRESETS["libero"]
+# FT-4 (envs/ft4.py: Square, Stack, Wipe and Door under perception error) has the LIBERO robot, controller and
+# observations.
+ENV_PRESETS["ft4"] = ENV_PRESETS["libero"]
 
 
 @PreTrainedConfig.register_subclass("latent_sde")
