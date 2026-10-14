@@ -84,9 +84,12 @@ import torch
 import torch.utils.data
 import tqdm
 
+from lerobot.configs import DEPTH_MILLIMETER_UNIT
 from lerobot.datasets import LeRobotDataset
 from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD, SUCCESS
 from lerobot.utils.utils import init_logging
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_FOXGLOVE_PORT = 8765
 DEFAULT_RERUN_PORT = 9090
@@ -184,12 +187,14 @@ def visualize_dataset(
         )
         return None
 
+    repo_id = dataset.repo_id
+
+    rrd_path: Path | None = None
     if save:
         assert output_dir is not None, (
             "Set an output directory where to write .rrd files with `--output-dir path/to/directory`."
         )
-
-    repo_id = dataset.repo_id
+        rrd_path = output_dir / f"{repo_id.replace('/', '_')}_episode_{episode_index}.rrd"
 
     logging.info("Loading dataloader")
     dataloader = torch.utils.data.DataLoader(
@@ -228,6 +233,9 @@ def visualize_dataset(
 
     logging.info("Logging to Rerun")
 
+    # Depth frames and stats are dequantized to the dataset's depth_output_unit on load.
+    depth_meter = 1000.0 if dataset.depth_output_unit == DEPTH_MILLIMETER_UNIT else 1.0
+
     # Use the dataset's q01/q99 depth statistics for robust depth range bounds
     depth_ranges = {}
     for key in dataset.meta.depth_keys:
@@ -254,6 +262,7 @@ def visualize_dataset(
                     depth = to_hwc_float32_numpy(batch[key][i])
                     depth_entity = rr.DepthImage(
                         depth,
+                        meter=depth_meter,
                         colormap=rr.components.Colormap.Viridis,
                         depth_range=depth_ranges.get(key),
                     )
@@ -281,10 +290,8 @@ def visualize_dataset(
                 rr.log(SUCCESS, rr.Scalars(batch[SUCCESS][i].item()))
 
     # save .rrd locally
-    if mode == "local" and save:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        repo_id_str = repo_id.replace("/", "_")
-        rrd_path = output_dir / f"{repo_id_str}_episode_{episode_index}.rrd"
+    if mode == "local" and rrd_path is not None:
+        rrd_path.parent.mkdir(parents=True, exist_ok=True)
         rr.save(rrd_path)
         return rrd_path
 
@@ -294,7 +301,9 @@ def visualize_dataset(
             while True:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("Ctrl-C received. Exiting.")
+            logger.info("Ctrl-C received. Exiting.")
+
+    return None
 
 
 def main():
@@ -314,9 +323,9 @@ def main():
     )
     parser.add_argument(
         "--root",
-        type=Path,
+        type=str,
         default=None,
-        help="Root directory for the dataset stored locally (e.g. `--root data`). By default, the dataset will be loaded from hugging face cache folder, or downloaded from the hub if available.",
+        help="Root directory for the dataset stored locally (e.g. `--root data`), or an object-store URI for storage formats that read in place (e.g. `--root s3://bucket/dataset`). Converting to Path would mangle URIs, so this stays a string. By default, the dataset will be loaded from hugging face cache folder, or downloaded from the hub if available.",
     )
     parser.add_argument(
         "--output-dir",

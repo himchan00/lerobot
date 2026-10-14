@@ -24,7 +24,8 @@ import os
 
 import numpy as np
 
-from lerobot.types import RobotAction, RobotObservation
+from lerobot.configs import DEPTH_MILLIMETER_UNIT, infer_depth_unit
+from lerobot.lerobot_types import RobotAction, RobotObservation
 
 from .constants import ACTION, ACTION_PREFIX, OBS_PREFIX, OBS_STR
 from .import_utils import require_package
@@ -51,7 +52,8 @@ def init_rerun(
     require_package("rerun-sdk", extra="viz", import_name="rerun")
     import rerun as rr
 
-    log_rerun_data.blueprint = None  # Reset blueprint cache for new session
+    # Reset the blueprint cache for the new session.
+    log_rerun_data.blueprint = None  # type: ignore[attr-defined]
 
     batch_size = os.getenv("RERUN_FLUSH_NUM_BYTES", "8000")
     os.environ["RERUN_FLUSH_NUM_BYTES"] = batch_size
@@ -103,7 +105,7 @@ def _ensure_blueprint(observation_paths: set[str], action_paths: set[str], image
     import rerun as rr
 
     blueprint = _build_blueprint(observation_paths, action_paths, image_paths)
-    log_rerun_data.blueprint = blueprint
+    log_rerun_data.blueprint = blueprint  # type: ignore[attr-defined]
     rr.send_blueprint(blueprint)
 
 
@@ -161,7 +163,13 @@ def log_rerun_data(
                     observation_paths.add(key)
                 else:
                     if arr.shape[-1] == 1:
-                        img_entity = rr.DepthImage(arr, colormap=rr.components.Colormap.Viridis)
+                        # At record time, the depth unit is inferred from the frame type.
+                        depth_unit = infer_depth_unit(arr.dtype)
+                        img_entity = rr.DepthImage(
+                            arr,
+                            meter=1000.0 if depth_unit == DEPTH_MILLIMETER_UNIT else 1.0,
+                            colormap=rr.components.Colormap.Viridis,
+                        )
                     else:
                         img_entity = rr.Image(arr).compress() if compress_images else rr.Image(arr)
                     rr.log(key, entity=img_entity, static=True)

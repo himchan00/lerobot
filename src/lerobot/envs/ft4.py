@@ -30,7 +30,7 @@ from robosuite.environments.manipulation.stack import Stack
 from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.utils.mjcf_utils import array_to_string, string_to_array
 
-from lerobot.types import RobotObservation
+from lerobot.lerobot_types import RobotObservation
 
 from .libero_ft import N_SUBSTEPS, FTWrenchLogger
 from .utils import _LazyAsyncVectorEnv
@@ -375,7 +375,7 @@ class FT4Env(gym.Env):
 
 
 class _FT4SyncVectorEnv(gym.vector.SyncVectorEnv):
-    """Allow repeated evaluation after close(), as `libero._LiberoSyncVectorEnv`."""
+    """Allow repeated evaluation after close() (eval closes each task env after use)."""
 
     def reset(self, **kwargs: Any) -> tuple[Any, dict[str, Any]]:
         self.closed = False
