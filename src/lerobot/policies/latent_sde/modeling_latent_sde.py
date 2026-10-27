@@ -7,6 +7,7 @@
 # into per-block residuals. FiLM-with-scale / GroupNorm / Mish / down_dims widths / FiLM
 # conditioning are preserved verbatim for architectural fairness vs. DiffusionPolicy.
 
+import copy
 import math
 from collections import deque
 
@@ -27,15 +28,21 @@ from ..diffusion.modeling_diffusion import DiffusionRgbEncoder
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
 from .configuration_latent_sde import OBS_FT_WRENCH, LatentSDEConfig
-from .ft_scale import forge_ema_weights
 from .geometry import (
+    IMPEDANCE_GROUPS,
     action_to_endpoint,
     body_to_world,
+    hand_to_grip_site,
+    impedance_action,
+    impedance_next_state,
+    impedance_one_step,
     local,
     nearest_pose_indices,
     perturb_pose_state,
     pose_from_state,
+    retract,
     pose_state_features,
+    tick_mean_wrench,
 )
 from .modeling_context import ObservationContext
 
@@ -72,11 +79,14 @@ class LatentSDEPolicy(PreTrainedPolicy):
             from .action_scale import resolve_action_scale
 
             config.action_scale = resolve_action_scale(config, kwargs["dataset_meta"])
-        forge = config.use_ft and config.ft_preprocess == "forge"
-        if forge and config.ft_scale is None and not config.pretrained_path and kwargs.get("dataset_meta") is not None:
-            from .ft_scale import resolve_ft_scale
+        if config.use_ft and config.ft_scale is None and not config.pretrained_path and (
+            kwargs.get("dataset_meta") is not None
+        ):
+            from .action_scale import resolve_action_scale
 
-            config.ft_scale = resolve_ft_scale(config, kwargs["dataset_meta"])
+            impedance = copy.copy(config)  # W̄_k's scale: the one-step W̄_{t+1} target's, from the same (cached) sweep
+            impedance.impedance_targets = True
+            config.ft_scale = resolve_action_scale(impedance, kwargs["dataset_meta"])[6:12]
 
         self._queues = None
         self._steps_until_refresh: int = 0
@@ -97,10 +107,11 @@ class LatentSDEPolicy(PreTrainedPolicy):
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.use_ft:
-            self._queues[OBS_FT_WRENCH] = deque(maxlen=self.config.ft_history)
+            self._queues[OBS_FT_WRENCH] = deque(maxlen=1)
         self._steps_until_refresh = 0
         self._cached_z = None
         self._cached_x0 = None
+        self._prev_state = None
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -118,6 +129,8 @@ class LatentSDEPolicy(PreTrainedPolicy):
         """
         batch = dict(batch)
         batch.pop(ACTION, None)
+        if self.model.pose_geometry:  # body mode works in the grip-site (TCP) frame
+            batch[OBS_STATE] = hand_to_grip_site(batch[OBS_STATE])
 
         camera_keys = self.config.image_features
         if camera_keys:
@@ -141,14 +154,18 @@ class LatentSDEPolicy(PreTrainedPolicy):
             self._steps_until_refresh = self.config.n_action_steps
 
         ft = None
-        if self.config.use_ft:  # the queue repeats the first frame after reset, like the dataset's padding
-            ft = self.model.ft_features(torch.stack(list(self._queues[OBS_FT_WRENCH]), dim=1))[:, -1]
+        if self.config.use_ft:  # the tick-mean wrench reads the frame turn over the tick
+            previous = x_now if self._prev_state is None else self._prev_state
+            ft = self.model.ft_features(self._queues[OBS_FT_WRENCH][-1][:, None], x_now[:, None], previous[:, None])[:, -1]
+        self._prev_state = x_now
         action = self.model.step(x_now, self._cached_z, x0=self._cached_x0, ft=ft, noise=noise)
         self._steps_until_refresh -= 1
         return action
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, float] | None]:
         """Run the batch through the model and compute the loss for training or validation."""
+        if self.model.pose_geometry:  # body mode works in the grip-site (TCP) frame
+            batch = {**batch, OBS_STATE: hand_to_grip_site(batch[OBS_STATE])}
         camera_keys = self.config.image_features
         if camera_keys:
             batch = dict(batch)
@@ -170,7 +187,10 @@ class LatentSDEModel(nn.Module):
         super().__init__()
         self.config = config
         self.state_dim = config.robot_state_feature.shape[0]
-        self.action_dim = config.action_feature.shape[0]
+        # Tier-3 impedance targets replace the dataset's 7-D OSC command (whose gripper they keep) by the one-step
+        # likelihood's 14 outputs: Gaussian x̂_{t+1}, hurdle W̄_{t+1}, Bernoulli gripper.
+        self.impedance_targets = config.impedance_targets
+        self.action_dim = 14 if self.impedance_targets else config.action_feature.shape[0]
         if config.sde_geometry not in ("euclidean", "so3_r3_body"):
             raise ValueError(f"Unsupported SDE geometry {config.sde_geometry!r}.")
         self.pose_geometry = config.sde_geometry == "so3_r3_body"
@@ -207,23 +227,10 @@ class LatentSDEModel(nn.Module):
 
         self.normalize_state = config.normalize_state
 
-        # Optional wrist F/T (environment-interaction wrench), read by the posterior and the drift only; see
-        # `ft_preprocess` and `ft_features`. LIBERO contact wrench: 0 in free space; in contact median 19 N /
-        # 0.6 N·m, p99 260 N / 12 N·m after the FORGE EMA (raw 2 ms impacts reach 8.7 kN).
-        forge = config.ft_preprocess == "forge"
-        self.ft_dim = (6 if forge else 12) if config.use_ft else 0
-        if forge and config.use_ft:
-            if config.ft_scale is None:
-                raise ValueError(
-                    "ft_preprocess='forge' needs ft_scale: swept from the dataset when training from scratch, else "
-                    "pass --policy.ft_scale (runs before 2026-10-05: [260,260,260,12,12,12])."
-                )
-            scale = torch.tensor(config.ft_scale, dtype=torch.float32)
-            self.register_buffer("ft_ema_weights", forge_ema_weights(config.ft_history).float(), persistent=False)
-            self.register_buffer("ft_noise", config.ft_noise * scale, persistent=False)
-            self.register_buffer("ft_scale", scale, persistent=False)
-        else:
-            self.register_buffer("ft_scale", torch.tensor([1.0] * 3 + [0.1] * 3).repeat(2), persistent=False)
+        # Wrist F/T: the drift (OSC: also the posterior) reads the tick-mean wrench W̄_k (`ft_features`) over ft_scale.
+        self.ft_dim = 6 if config.use_ft else 0
+        if config.use_ft:
+            self.register_buffer("ft_scale", torch.tensor(config.ft_scale, dtype=torch.float32), persistent=False)
 
         self.z_dim = config.z_dim
         posterior_hidden = config.z_posterior_hidden_dim or latent_hidden_dim
@@ -232,6 +239,8 @@ class LatentSDEModel(nn.Module):
         # TCN posterior depth auto-sized so its receptive field (RF ≈ 4·2^L) matches the chunk
         # length (horizon), kernel 3. E.g. horizon 8→1, 16→2, 32→3, 64→4.
         tcn_levels = max(1, round(math.log2(config.horizon / 4)))
+        # per tick the action + W̄_k; impedance targets: [x̂_{k+1}, W̄_{k+1}, gripper], which hold the F/T
+        posterior_dim = 13 if self.impedance_targets else self.action_dim + self.ft_dim
 
         if self.use_vq:
             # Discrete latent (config.quantizer): FSQ or VQ. num_codes = size of the flat index
@@ -246,7 +255,7 @@ class LatentSDEModel(nn.Module):
                 hidden_dim=prior_hidden,
             )
             self.posterior = LatentPosteriorTrajVQ(
-                input_dim=self.action_dim + self.ft_dim,
+                input_dim=posterior_dim,
                 z_dim=self.z_dim,
                 hidden_dim=posterior_hidden,
                 num_levels=tcn_levels,
@@ -291,7 +300,7 @@ class LatentSDEModel(nn.Module):
                     sigma_min=config.z_sigma_min,
                 )
             self.posterior = LatentPosteriorTraj(
-                input_dim=self.action_dim + self.ft_dim,
+                input_dim=posterior_dim,
                 z_dim=self.z_dim,
                 hidden_dim=posterior_hidden,
                 sigma_activation=config.sigma_activation,
@@ -304,7 +313,7 @@ class LatentSDEModel(nn.Module):
         # Light per-tick drift: current state features (+ F/T) in, z as the only FiLM conditioning.
         self.net = LatentSDEDriftDiffusionNet(
             input_dim=self.state_feature_dim + self.ft_dim,
-            action_dim=config.action_feature.shape[0],
+            action_dim=self.action_dim,
             cond_dim=self.z_dim,
             down_dims=config.down_dims,
             n_groups=config.n_groups,
@@ -316,13 +325,15 @@ class LatentSDEModel(nn.Module):
         # WARM-STARTED from the first training batch. Warm-start matters: a σ²=1 init down-weights recon
         # by ~1/σ² and stalls early convergence (posterior collapses under β before σ calibrates). Feeds
         # the Gaussian NLL and SDE noise σ. One scalar in Euclidean mode; body mode keeps one σ² per
-        # action-scale group (position, rotation, gripper), whose residuals differ in kind.
-        # Euclidean VQ keeps σ²=1.
-        self.register_buffer("action_var", torch.ones((3,) if self.pose_geometry else ()))
+        # action-scale group (position, rotation, gripper; impedance targets: the Gaussian IMPEDANCE_GROUPS), whose
+        # residuals differ in kind. Euclidean VQ keeps σ²=1.
+        groups = IMPEDANCE_GROUPS if self.impedance_targets else [[0, 1, 2], [3, 4, 5], [6]]
+        self.register_buffer("action_var", torch.ones((len(groups),) if self.pose_geometry else ()))
         self.register_buffer("sigma_initialized", torch.zeros((), dtype=torch.bool))
         if self.pose_geometry:
             # Output coordinate → σ² group.
-            self.register_buffer("sigma_group", torch.tensor([0, 0, 0, 1, 1, 1, 2]), persistent=False)
+            group_of = [g for g, dims in enumerate(groups) for _ in dims]
+            self.register_buffer("sigma_group", torch.tensor(group_of), persistent=False)
         # Per-dim action scale s (config.action_scale): drift target d/s, output s·μ.
         scale = config.action_scale if config.action_scale is not None else [1.0] * self.action_dim
         if len(scale) != self.action_dim:
@@ -376,22 +387,43 @@ class LatentSDEModel(nn.Module):
         """σ² per output coordinate (its group's value in body mode, the scalar in Euclidean mode)."""
         return self.action_var[self.sigma_group] if self.pose_geometry else self.action_var
 
-    def ft_features(self, ft_wrench: Tensor) -> Tensor:
-        """(..., T, 25, 6) per-frame EE-frame F/T blocks → (..., T - ft_history + 1, ft_dim) per-tick features."""
+    def ft_features(self, ft_wrench: Tensor, state: Tensor, previous: Tensor | None = None) -> Tensor:
+        """(..., T, 25, 6) per-frame EE-frame F/T blocks of the frames with grip-site state8 (..., T, 8), and the frame
+        before them if given → (..., T, 6) tick-mean wrenches W̄_k over ft_scale."""
         ft_wrench = ft_wrench.float()
-        if self.config.ft_preprocess == "asinh":
-            return torch.asinh(torch.cat((ft_wrench[..., -1, :], ft_wrench.mean(dim=-2)), dim=-1) / self.ft_scale)
-        # Each tick reads its last ft_history blocks, oldest first: (..., T-h+1, h·25, 6).
-        windows = ft_wrench.unfold(-3, self.config.ft_history, 1).movedim(-1, -3).flatten(-3, -2)
-        wrench = (windows * self.ft_ema_weights[:, None]).sum(dim=-2)
-        if self.training:
-            wrench = wrench + torch.randn_like(wrench) * self.ft_noise
-        return torch.tanh(wrench / self.ft_scale)
+        with torch.autocast(device_type=ft_wrench.device.type, enabled=False):
+            previous = None if previous is None else previous.to(ft_wrench.dtype)
+            return tick_mean_wrench(state.to(ft_wrench.dtype), ft_wrench, previous) / self.ft_scale
+
+    def _recon_error(self, mu: Tensor, target: Tensor) -> Tensor:
+        """Per-element recon error: the squared error; with impedance_targets the BCE of the contact / gripper logits."""
+        error = (mu - target) ** 2
+        if self.impedance_targets:
+            logits = F.binary_cross_entropy_with_logits(mu[..., 12:], target[..., 12:], reduction="none")
+            error = torch.cat((error[..., :12], logits), dim=-1)
+        return error
+
+    def _one_step_estimate(self, mu: Tensor, on: Tensor | None = None) -> Tensor:
+        """impedance_targets: the [x̂_{t+1} increments, W̄_{t+1}] handed on, W̄ = μ_W, zeroed where the gate `on` is
+        False."""
+        estimate = mu[..., :12] * self.action_scale[:12].to(mu.dtype)
+        if on is None:
+            return estimate
+        return torch.cat((estimate[..., :6], estimate[..., 6:12] * on.to(mu.dtype)), dim=-1)
 
     def _state_features(self, state: Tensor, reference_state: Tensor | None = None) -> Tensor:
         if self.pose_geometry:
             return pose_state_features(state, reference_state)
         return state - reference_state if reference_state is not None else state
+
+    def _pose_noise(self, state: Tensor) -> Tensor:
+        """Body-frame state noise ε (B, H, 6) for a (B, H) window: N(0, (std·s)²) per position / rotation entry,
+        ramped over the chunk under the linear schedule."""
+        std = self.config.state_noise_std * self.action_scale[:6].to(state.dtype)
+        if self.config.state_noise_schedule == "linear":
+            horizon = state.shape[1]
+            std = std * (torch.arange(1, horizon + 1, device=state.device, dtype=state.dtype) / horizon)[:, None]
+        return torch.randn_like(state[..., :6]) * std
 
     def _prepare_pose_training(
         self,
@@ -420,11 +452,7 @@ class LatentSDEModel(nn.Module):
         post_action = torch.cat((local(pose, target_pose), target_gripper), dim=-1) / self.action_scale.to(state.dtype)
         query = state
         if augment:
-            std: float | Tensor = self.config.state_noise_std * self.action_scale[:6].to(state.dtype)
-            if self.config.state_noise_schedule == "linear":
-                ramp = torch.arange(1, horizon + 1, device=state.device, dtype=state.dtype) / horizon
-                std = std * ramp[None, :, None]
-            query = perturb_pose_state(state, torch.randn_like(state[..., :6]) * std)
+            query = perturb_pose_state(state, self._pose_noise(state))
             if self.config.do_mask_loss_for_padding:
                 query = torch.where(candidates[..., None], query, state)
             if self.config.action_anchor == "nearest":
@@ -532,6 +560,20 @@ class LatentSDEModel(nn.Module):
         )[:, 0]
         if self.pose_geometry:
             mu = mu.to(torch.float64 if x_now.dtype == torch.float64 else torch.float32)
+        if self.impedance_targets:  # x̂_{t+2}, W̄_{t+2} for the controller: the model's own step from (x̂_{t+1}, W̄_{t+1})
+            # whose W̄_{t+1} input is gated by the contact probability π > 0.5 (0 off contact, like the measured W̄)
+            state1, wrench1 = impedance_next_state(x_now, self._one_step_estimate(mu, torch.sigmoid(mu[..., 12:13]) > 0.5))
+            mu2 = self.predict_drift(
+                state1[:, None].to(x_now.dtype),
+                z,
+                x0=x0[:, None] if x0 is not None else None,
+                ft=(wrench1 / self.ft_scale.to(wrench1.dtype))[:, None],
+            )[:, 0].to(mu.dtype)
+            gripper = torch.where(mu[..., 13:] > 0, 1.0, -1.0).to(mu.dtype)
+            on = None  # the controller's W̄: μ_W, zeroed while the measured |W̄_t| force is below wrench_gate (no F_d)
+            if self.config.wrench_gate > 0:
+                on = (ft[..., :3] * self.ft_scale[:3].to(ft.dtype)).norm(dim=-1, keepdim=True) >= self.config.wrench_gate
+            return impedance_action(self._one_step_estimate(mu, on), self._one_step_estimate(mu2, on), gripper)
         # Keep controller actions in the measured-state dtype under autocast.
         integration_anchor = x_now.new_zeros(mu.shape) if self.pose_geometry else x_now
         action = self._sde_step(
@@ -565,32 +607,41 @@ class LatentSDEModel(nn.Module):
         Body mode uses local(query, nominal endpoint), expressed in controller units, as the delta
         target, with one σ² EMA per position/rotation/gripper group. The same H*7 normalization applies.
         This is a local tangent approximation, not a globally normalized manifold transition.
-        Nearest augmentation relabels endpoints, not the clean posterior actions.
+        Nearest augmentation relabels endpoints, not the clean posterior actions. With impedance_targets the
+        targets are geometry.impedance_one_step's plus the contact and gripper labels (H*14: Gaussian x̂_{t+1} where
+        x_{t+1} is known and W̄_{t+1} where in contact, BCE for the logits), from state / F/T windows that run to tick H;
+        under state noise x̂_{t+1} runs from x̃_k = x_k ⊕ ε_k to x_{k+1} ⊕ (1−β)ε_k (β = state_noise_gain).
 
         x_seq is the measured state trajectory from the dataset (no teacher-forcing). Train and
         inference see the same state distribution only when state_noise_std==0; under state-noise the
         drift input is perturbed at train time (corrective augmentation), while inference stays clean.
-        The posterior reads only the demonstration actions (+ the per-tick F/T with use_ft).
+        The posterior reads only the demonstration actions (+ the clean W̄_k with use_ft; impedance_targets: the clean
+        one-step targets, which hold the F/T).
 
         Expected `batch` (normalized + on device; LatentSDEPolicy.forward stacks images):
-            "observation.state":  (B, n_obs_steps-1+horizon, state_dim) — causal context + horizon
+            "observation.state":  (B, n_obs_steps-1+horizon, state_dim) — causal context + horizon (+1 tick
+                                  with impedance_targets; "observation.state_is_pad" marks frames past the episode)
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
             "action":             (B, horizon, action_dim)
             "action_is_pad":      (B, horizon) — used iff do_mask_loss_for_padding
-            "observation.ft_wrench": (B, ft_history-1+horizon, 25, 6) — iff use_ft
+            "observation.ft_wrench": (B, horizon+1, 25, 6) — iff use_ft
 
         Padding handling: `drop_n_last_frames` keeps the EXECUTED region unpadded, but the
         predicted tail may be copy-padded at episode ends. When do_mask_loss_for_padding=True,
         those ticks are masked out of the recon MSE and the posterior valid_mask
         (`valid = ~action_is_pad`); otherwise they are included unmasked (DP-style default).
         """
-        action_target = batch[ACTION]                        # (B, H, action_dim)
-        B, H, action_dim = action_target.shape
+        action_target = batch[ACTION]                        # (B, H, dataset action_dim)
+        B, H = action_target.shape[:2]
+        action_dim = self.action_dim
 
         # Leading n_obs frames form causal context; trailing H frames supervise the pointwise drift.
         state_full = batch[OBS_STATE]
         n_lead = self.config.n_obs_steps - 1
         state_seq = state_full[:, n_lead:]                    # (B, H, state_dim) — horizon states (clean)
+        if self.impedance_targets:  # the window runs one tick past the horizon, for the labels
+            state_ext, state_seq = state_seq, state_seq[:, :H]
+            real_ext = ~batch[f"{OBS_STATE}_is_pad"][:, n_lead:]
         noise = self.training and self.config.state_noise_std > 0
         std = self.config.state_noise_std * self.action_scale.to(state_seq.dtype)
 
@@ -599,7 +650,25 @@ class LatentSDEModel(nn.Module):
         # state_noise_schedule: "uniform" = std·s on every tick; "linear" ramps it (1/H → 1)× over the chunk.
         pose_drift_target = None
         pose_candidates = None
-        if self.pose_geometry:
+        dim_mask = None
+        if self.impedance_targets:
+            # [Δ¹ (where x_{t+1} is known), W̄_{t+1} (in contact), contact = 1[W̄_{t+1} ≠ 0], gripper closed]
+            one, known1 = impedance_one_step(state_ext, real_ext, batch[OBS_FT_WRENCH])
+            contact = (one[..., 6:12] != 0).any(dim=-1, keepdim=True)
+            closed = (action_target[..., 6:7] > 0).to(one.dtype)
+            state_win, step = state_seq, one
+            if noise:  # corrective: the F/T input, the W̄ label and the posterior (clean `one`) stay clean
+                eps = self._pose_noise(state_seq)
+                state_win = perturb_pose_state(state_seq, eps)
+                goal = retract(retract(pose_from_state(state_seq), one[..., :6]), (1 - self.config.state_noise_gain) * eps)
+                step = torch.cat((local(pose_from_state(state_win), goal), one[..., 6:]), dim=-1)
+            pose_drift_target = torch.cat((step, contact.to(one.dtype), closed), dim=-1)
+            dim_mask = torch.cat(
+                (known1[..., None].expand(-1, -1, 6), contact.expand(-1, -1, 6), torch.ones_like(contact).expand(-1, -1, 2)),
+                dim=-1,
+            )
+            pose_candidates = real_ext[:, :H]
+        elif self.pose_geometry:
             # action_target becomes the posterior input: clean body-frame increment / s.
             state_seq, action_target, state_win, pose_drift_target, pose_candidates = self._prepare_pose_training(
                 state_seq, action_target, batch.get("action_is_pad")
@@ -636,19 +705,39 @@ class LatentSDEModel(nn.Module):
             valid = ~batch["action_is_pad"]                  # (B, H) True = real frame
         else:
             valid = torch.ones(B, H, dtype=torch.bool, device=x_seq.device)
+        # Per-element loss mask: the valid ticks, and with impedance targets x̂_{t+1} where x_{t+1} is known, W̄ in contact.
+        loss_mask = valid.unsqueeze(-1) if dim_mask is None else valid.unsqueeze(-1) & dim_mask
 
         # Pose mode already holds body-frame increments; only Euclidean target states are re-centered.
-        post_action = action_target
-        if x0 is not None and not self.pose_geometry:
+        post_action, post_valid = action_target, valid
+        if self.impedance_targets:  # the clean one-step targets / s + gripper, where x_{t+1} is known
+            post_valid = valid & known1
+            post_action = torch.cat((one / self.action_scale[:12].to(one.dtype), action_target[..., 6:7].to(one.dtype)), -1)
+            post_action = post_action * post_valid.unsqueeze(-1)
+        elif x0 is not None and not self.pose_geometry:
             post_action = action_target - x0
-        # F/T per drift tick (deltas 0..H-1), read by the posterior and the drift.
-        ft = self.ft_features(batch[OBS_FT_WRENCH]) if self.config.use_ft else None
-        if ft is not None:
-            post_action = torch.cat((post_action, ft.to(post_action.dtype)), dim=-1)
+        # W̄_k per tick (deltas 0..H-1), from the window's states: the drift's input (and the OSC posterior's).
+        ft = None
+        if self.config.use_ft:
+            previous = state_full[:, n_lead - 1 : n_lead] if n_lead else None
+            ft = self.ft_features(batch[OBS_FT_WRENCH], state_full[:, n_lead:], previous)[:, :H]
+            if not self.impedance_targets:
+                post_action = torch.cat((post_action, ft.to(post_action.dtype)), dim=-1)
+            if self.training and self.config.wrench_noise_std > 0:  # corrective W̄ noise ∝ ‖W̄_k‖ (see config)
+                scale = self.ft_scale.to(ft.dtype)
+                w = ft * scale
+                size = torch.cat([w[..., i : i + 3].norm(dim=-1, keepdim=True).expand(-1, -1, 3) for i in (0, 3)], -1)
+                eps_w = torch.randn_like(w) * self.config.wrench_noise_std * size
+                ft = ft + eps_w / scale
+                if self.impedance_targets:  # the W̄_{t+1} label moves by (1−β)ε_k
+                    shift = (1 - self.config.wrench_noise_gain) * eps_w.to(pose_drift_target.dtype)
+                    pose_drift_target = torch.cat(
+                        (pose_drift_target[..., :6], pose_drift_target[..., 6:12] + shift, pose_drift_target[..., 12:]), -1
+                    )
 
         if self.use_vq:
             prior_logits = self._prior(context)
-            z_e = self.posterior(post_action, valid)
+            z_e = self.posterior(post_action, post_valid)
             if self.config.quantizer == "fsq":
                 # FSQ: STE through the fixed grid — no learnable codebook, no commitment loss.
                 z_q_quant, idx_q = self.vq(z_e.unsqueeze(1))
@@ -664,7 +753,7 @@ class LatentSDEModel(nn.Module):
             mu_p = sigma_p = mu_q = sigma_q = None
         else:
             mu_p, sigma_p = self._prior(context)
-            mu_q, sigma_q = self.posterior(post_action, valid)
+            mu_q, sigma_q = self.posterior(post_action, post_valid)
             eps_z = torch.randn(mu_q.shape, dtype=mu_q.dtype, device=mu_q.device)
             z_q = mu_q + sigma_q * eps_z
 
@@ -686,22 +775,24 @@ class LatentSDEModel(nn.Module):
                 a_anchor = action_target
             drift_target = a_anchor - x_seq
         drift_target = drift_target / self.action_scale.to(drift_target.dtype)
-        sq_err = (mu - drift_target) ** 2                 # (B, H, action_dim) — unmasked
+        sq_err = self._recon_error(mu, drift_target)      # (B, H, action_dim) — unmasked
         # Plain-MSE recon (zero copy-padded ticks, normalize by NOMINAL B·H·D, reduces to a plain mean
         # when nothing is masked). Not the training objective in the Gaussian path — kept for logging
         # and the z-usage / prior-leakage diagnostics below, which compare recon MSE across z choices.
-        masked_se = sq_err * valid.unsqueeze(-1) if self.config.do_mask_loss_for_padding else sq_err
+        masked_se = sq_err * loss_mask if self.config.do_mask_loss_for_padding else sq_err
         recon_loss = masked_se.mean()
 
         if not self.use_vq or self.pose_geometry:
             if self.pose_geometry:
                 # Pool sufficient statistics, not rank-local means: valid counts may differ.
-                error = sq_err.detach().to(
+                gaussian = self.sigma_group.numel()  # impedance targets: not the logits
+                error = sq_err.detach()[..., :gaussian].to(
                     torch.float64 if sq_err.dtype == torch.float64 else torch.float32
                 )
-                dim_sums = (error * valid.unsqueeze(-1)).sum(dim=(0, 1))
-                sums = dim_sums.new_zeros(3).index_add_(0, self.sigma_group, dim_sums)
-                counts = valid.sum().to(sums) * torch.bincount(self.sigma_group).to(sums)
+                observed = loss_mask.expand_as(sq_err)[..., :gaussian].to(error)
+                n_groups = self.action_var.numel()
+                sums = error.new_zeros(n_groups).index_add_(0, self.sigma_group, (error * observed).sum(dim=(0, 1)))
+                counts = error.new_zeros(n_groups).index_add_(0, self.sigma_group, observed.sum(dim=(0, 1)))
                 stats = torch.cat((sums, counts))
                 if (
                     self.training
@@ -709,9 +800,9 @@ class LatentSDEModel(nn.Module):
                     and torch.distributed.is_initialized()
                 ):
                     torch.distributed.all_reduce(stats)
-                batch_var = (stats[:3] / stats[3:]).clamp_min(1e-8)
+                batch_var = (stats[:n_groups] / stats[n_groups:]).clamp_min(1e-8)
             elif self.config.do_mask_loss_for_padding:
-                batch_var = (sq_err.detach() * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim).clamp_min(1)
+                batch_var = (sq_err.detach() * loss_mask).sum() / (valid.sum() * action_dim).clamp_min(1)
             else:
                 batch_var = sq_err.detach().mean()
             if self.training:
@@ -735,9 +826,12 @@ class LatentSDEModel(nn.Module):
             loss = recon_loss + other_loss
         else:
             var = self._dim_var()                            # σ² — detached buffer, so only μ gets a gradient
-            nll_elem = 0.5 * math.log(2 * math.pi) + 0.5 * var.log() + sq_err / (2 * var)
+            gaussian = var.shape[-1] if var.dim() else sq_err.shape[-1]
+            nll_elem = 0.5 * math.log(2 * math.pi) + 0.5 * var.log() + sq_err[..., :gaussian] / (2 * var)
+            if self.impedance_targets:  # the logits' NLL is their BCE
+                nll_elem = torch.cat((nll_elem, sq_err[..., gaussian:]), dim=-1)
             if self.config.do_mask_loss_for_padding:
-                nll_elem = nll_elem * valid.unsqueeze(-1)    # padded ticks are not observations
+                nll_elem = nll_elem * loss_mask              # padded ticks (and unknown x̂, W̄ off contact) are not observed
             # nll (sum over H·D) and KL (sum over z_dim) both /(H·D): shrinks magnitude, β meaning kept.
             norm = H * action_dim
             nll_loss = nll_elem.sum(dim=(1, 2)).mean() / norm
@@ -753,26 +847,30 @@ class LatentSDEModel(nn.Module):
                 "recon_loss": recon_loss.detach().item(),
                 "effective_sigma": self._dim_var().mean().sqrt().item(),
                 "target_rms": (
-                    (drift_target.detach().pow(2) * valid.unsqueeze(-1)).sum() / (valid.sum() * action_dim)
+                    (drift_target.detach().pow(2) * loss_mask).sum() / loss_mask.expand_as(drift_target).sum()
                 ).sqrt().item(),
             }
             if self.pose_geometry:
-                loss_dict.update(zip(("sigma_pos", "sigma_rot", "sigma_grip"), self.action_var.sqrt().tolist()))
+                names = ("pos", "rot", "force", "torque") if self.impedance_targets else ("pos", "rot", "grip")
+                loss_dict.update(zip((f"sigma_{n}" for n in names), self.action_var.sqrt().tolist()))
+                if self.impedance_targets:  # the logits' mean BCE over their observed ticks
+                    bce = (sq_err[..., 12:] * loss_mask[..., 12:]).sum(dim=(0, 1)) / loss_mask[..., 12:].sum(dim=(0, 1))
+                    loss_dict.update(bce_contact=bce[0].item(), bce_grip=bce[1].item())
             if nll_loss is not None:
                 loss_dict["nll_loss"] = nll_loss.detach().item()
             # z_usage_gap: extra recon error from a batch-rolled (mismatched) z. ~0 ⇒ z ignored.
             mu_rolled = self.predict_drift(x_seq, torch.roll(z_q, shifts=1, dims=0), x0=x0, ft=ft)
-            rolled_se = (mu_rolled - drift_target) ** 2
+            rolled_se = self._recon_error(mu_rolled, drift_target)
             if self.config.do_mask_loss_for_padding:
-                rolled_se = rolled_se * valid.unsqueeze(-1)
+                rolled_se = rolled_se * loss_mask
             recon_loss_rolled = rolled_se.mean()
             loss_dict["z_usage_gap"] = (recon_loss_rolled - recon_loss).item()
             if ft is not None:
                 # ft_usage_gap: the same with batch-rolled F/T. ~0 ⇒ the drift ignores F/T.
                 mu_ft_rolled = self.predict_drift(x_seq, z_q, x0=x0, ft=torch.roll(ft, shifts=1, dims=0))
-                ft_rolled_se = (mu_ft_rolled - drift_target) ** 2
+                ft_rolled_se = self._recon_error(mu_ft_rolled, drift_target)
                 if self.config.do_mask_loss_for_padding:
-                    ft_rolled_se = ft_rolled_se * valid.unsqueeze(-1)
+                    ft_rolled_se = ft_rolled_se * loss_mask
                 loss_dict["ft_usage_gap"] = (ft_rolled_se.mean() - recon_loss).item()
             # recon_loss_prior: recon with z ~ p(z|context) — the DEPLOY-time z (training uses q). The
             # posterior's recon gain transfers to deployment only if this stays near recon_loss; if
@@ -780,9 +878,9 @@ class LatentSDEModel(nn.Module):
             # encodes trajectory info the prior can't reproduce. prior_recon_gap = the deploy penalty.
             z_prior = self.sample_z_from_prior(context)   # (B, z_dim), deploy prior distribution
             mu_prior = self.predict_drift(x_seq, z_prior, x0=x0, ft=ft)
-            prior_se = (mu_prior - drift_target) ** 2
+            prior_se = self._recon_error(mu_prior, drift_target)
             if self.config.do_mask_loss_for_padding:
-                prior_se = prior_se * valid.unsqueeze(-1)
+                prior_se = prior_se * loss_mask
             recon_loss_prior = prior_se.mean()
             loss_dict["recon_loss_prior"] = recon_loss_prior.item()
             loss_dict["prior_recon_gap"] = (recon_loss_prior - recon_loss).item()

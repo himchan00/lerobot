@@ -43,6 +43,7 @@ class FTWrenchLogger:
             raise ValueError(f"Expected {N_SUBSTEPS} physics steps per control step, got {n_sub}.")
         self._f6 = np.zeros(6)
         self.samples: deque[np.ndarray] = deque(maxlen=N_SUBSTEPS)
+        self.rotations: deque[np.ndarray] = deque(maxlen=N_SUBSTEPS)  # EE orientation of each sample
         self._orig_step = self.sim.step
         self.sim.step = self._step  # instance override; robosuite calls self.sim.step()
 
@@ -60,6 +61,7 @@ class FTWrenchLogger:
         self.ctrl.update(force=True)  # runs sim.forward()
         self.ctrl.new_update = flag
         self.samples.append(self._wrench())
+        self.rotations.append(np.array(self.ctrl.ee_ori_mat))
 
     def _wrench(self) -> np.ndarray:
         p_ee = np.array(self.ctrl.ee_pos)
@@ -83,3 +85,7 @@ class FTWrenchLogger:
         if len(self.samples) != N_SUBSTEPS:
             raise RuntimeError(f"F/T logger holds {len(self.samples)} samples, expected {N_SUBSTEPS}.")
         return np.stack(self.samples).astype(np.float32)
+
+    def world_mean(self) -> np.ndarray:
+        """The block's mean wrench in the world frame, each sample rotated by its own EE orientation."""
+        return np.mean([np.r_[r @ s[:3], r @ s[3:]] for r, s in zip(self.rotations, self.samples)], axis=0)

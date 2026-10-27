@@ -219,6 +219,17 @@ class LatentSDEConfig(PreTrainedConfig):
     #               `state_noise_std` is the PEAK (last-tick) std.
     state_noise_schedule: str = "uniform"  # "uniform" | "linear"
 
+    # impedance_targets: the share β of the state noise ε_k that the relabelled one-step target returns per tick
+    # (Δ¹ from x̃_k = x_k ⊕ ε_k to x_{k+1} ⊕ (1−β)ε_k; 1 = back on the demo in one tick).
+    state_noise_gain: float = 1.0
+
+    # use_ft: train-only corrective noise on the drift's W̄_k input, proportional to its size (so none in free space):
+    # W̃_k = W̄_k + ε_k, ε_k ~ N(0, (σ‖·‖)²) per force / torque 3-vector, σ = `wrench_noise_std`. With impedance_targets
+    # the W̄_{t+1} label moves by (1−β)ε_k, β = `wrench_noise_gain` (labels of ticks leaving contact stay out of the
+    # hurdle's Gaussian). Default σ = β = 0.3 with no state noise (ft4 preset): the 2026-10-27 FT-4 setting.
+    wrench_noise_std: float = 0.3
+    wrench_noise_gain: float = 0.3
+
     # Recon target d* = a_anchor − x̃ (one-step full return to a demo action from the noised anchor
     # x̃). action_anchor picks which demo action a_anchor:
     #   "clean"   — the corresponding-index action a_k (== legacy corrective target).
@@ -235,17 +246,27 @@ class LatentSDEConfig(PreTrainedConfig):
     #   Drift targets, integration, and controller conversion keep their original coordinates.
     normalize_state: bool = True
 
-    # use_ft: the posterior and the drift also read `observation.ft_wrench` (OBS_FT_WRENCH) per tick; the prior is
-    #   unchanged. ft_preprocess picks the per-tick feature:
-    #   "asinh" — [last sample, mean] of the last control step, asinh(w / (1 N, 0.1 N·m)) (12-D).
-    #   "forge" — Isaac Lab FORGE's sensor model: an EMA with its 29 ms time constant over the last 3 control
-    #             steps, training noise N(0, ft_noise·ft_scale), then tanh(w / ft_scale) (6-D).
-    # ft_scale: forge per-axis scale. None → p90 of |w| over the training data's contact frames, swept before
-    #   training and cached (ft_scale.py). Runs before 2026-10-05 used [260]*3 + [12]*3 (LIBERO contact p99).
+    # impedance_targets (so3_r3_body; FT-4 Tier 3, envs/ft4_impedance.py with --env.impedance=true): instead of the OSC
+    #   command the drift models the one-step likelihood p(s_{k+1} | s_k, z) of s = (pose, W̄, gripper), W̄ the tick-mean
+    #   wrench, in the current grip-site frame G_t: 14 outputs [x̂_{t+1} body increments (Gaussian) | W̄_{t+1} (hurdle:
+    #   Gaussian where in contact) | contact logit (Bernoulli, contact = W̄_{t+1} ≠ 0) | gripper logit (Bernoulli)], one
+    #   σ² and scale per Gaussian 3-vector (geometry.IMPEDANCE_GROUPS). The labels (geometry.impedance_one_step) come
+    #   from state / F/T windows one tick longer; the frame past an episode's end is extrapolated. At deployment the
+    #   model steps once more from (x̂_{t+1}, W̄_{t+1}) for the controller's x̂_{t+2}, W̄_{t+2} (W̄: μ_W). The posterior
+    #   reads the clean one-step targets [x̂_{k+1}, W̄_{k+1}] / s + gripper (they hold the F/T already). Needs use_ft
+    #   (the drift reads W̄_k, which it predicts) and do_mask_loss_for_padding.
+    # wrench_gate (impedance_targets, deployment only): the controller's W̄_{t+1}, W̄_{t+2} are zeroed while the measured
+    #   |W̄_t| force (the drift's F/T input) is below this many N, so F_d ramps to 0 off contact; 0 = off.
+    impedance_targets: bool = False
+    wrench_gate: float = 1.0
+
+    # use_ft (so3_r3_body): the drift also reads `observation.ft_wrench` (OBS_FT_WRENCH) per tick as the tick-mean
+    #   wrench W̄_k in the current grip-site frame (geometry.tick_mean_wrench) over ft_scale (6-D), and so does the
+    #   posterior with each action (impedance targets: their one-step targets hold it already); the prior is unchanged.
+    # ft_scale: per force / torque axis, the data std of the impedance one-step W̄_{t+1} target (its action_scale
+    #   [6:12]); None → swept with the action scale when training from scratch.
     use_ft: bool = False
-    ft_preprocess: str = "asinh"  # "asinh" | "forge"
     ft_scale: list[float] | None = None
-    ft_noise: float = 0.05
 
     # ---- Inference -----------------------------------------------------------------------------
     # If True, drift-only inference. False → SDE noise s·σ·ε with σ from the action_var EMA.
@@ -345,8 +366,13 @@ class LatentSDEConfig(PreTrainedConfig):
             )
         if self.action_anchor not in ("clean", "nearest"):
             raise ValueError(f"`action_anchor` must be 'clean' or 'nearest'. Got {self.action_anchor!r}.")
-        if self.ft_preprocess not in ("asinh", "forge"):
-            raise ValueError(f"`ft_preprocess` must be 'asinh' or 'forge'. Got {self.ft_preprocess!r}.")
+        if (self.use_ft and self.sde_geometry != "so3_r3_body") or (
+            self.impedance_targets and not (self.use_ft and self.do_mask_loss_for_padding)
+        ):
+            raise ValueError(
+                "`use_ft` needs sde_geometry='so3_r3_body' (W̄ is read in the grip-site frame); `impedance_targets` "
+                "needs use_ft and do_mask_loss_for_padding."
+            )
 
         if self.use_vq:
             if self.context_encoder == "smolvlm2":
@@ -399,16 +425,12 @@ class LatentSDEConfig(PreTrainedConfig):
     def observation_delta_indices_per_key(self) -> dict[str, list[int]]:
         # State always includes the causal n_obs_steps context window followed by the horizon-length
         # teacher-forced trajectory. The current frame (delta 0) belongs to both slices.
-        # F/T covers the trajectory, plus the earlier control steps its per-tick feature reads.
-        windows = {OBS_STATE: list(range(1 - self.n_obs_steps, self.horizon))}
+        # F/T covers the trajectory. Impedance targets reach x_{t+1} and W̄_{t+1}.
+        end = self.horizon + (1 if self.impedance_targets else 0)
+        windows = {OBS_STATE: list(range(1 - self.n_obs_steps, end))}
         if self.use_ft:
-            windows[OBS_FT_WRENCH] = list(range(1 - self.ft_history, self.horizon))
+            windows[OBS_FT_WRENCH] = list(range(end))
         return windows
-
-    @property
-    def ft_history(self) -> int:
-        """Control steps of F/T per tick feature: 3 for the FORGE EMA, else the last one."""
-        return 3 if self.ft_preprocess == "forge" else 1
 
     @property
     def action_delta_indices(self) -> list:

@@ -52,8 +52,6 @@ joint causal context.
   3-vector + gripper). Cached as JSON under `$HF_LEROBOT_HOME/latent_sde_action_scale/<repo_id>/`,
   reused when present, and written into `config.action_scale` so checkpoints carry it. Called from
   `LatentSDEPolicy.__init__` only when training from scratch (`dataset_meta` given, no pretrained path).
-- `ft_scale.py` — the same for the per-axis F/T scale of `ft_preprocess="forge"`: p90 of |w| over contact frames
-  after the FORGE EMA, cached under `$HF_LEROBOT_HOME/latent_sde_ft_scale/<repo_id>/`, written into `config.ft_scale`.
 - `__init__.py` — exports `LatentSDEConfig`, `LatentSDEPolicy`, `make_latent_sde_pre_post_processors`.
 
 ### `modeling_latent_sde.py` map
@@ -75,8 +73,8 @@ the image-task prefix plus one projected token per causal state frame (oldest to
 give `(μ_p, σ_p)`.
 
 **Posterior `q(z | a_{0:H})`** (training only). It always encodes only the time-aligned
-demonstration action trajectory (each tick concatenated with that tick's F/T features under
-`use_ft`); observation context and state trajectories are not posterior inputs. A 2-layer MLP trunk produces the Gaussian heads, and the VQ posterior mirrors the same
+demonstration action trajectory (each tick with that tick's W̄_k under `use_ft`; impedance targets: the clean
+one-step targets, see below); observation context and state trajectories are not posterior inputs. A 2-layer MLP trunk produces the Gaussian heads, and the VQ posterior mirrors the same
 action-only trajectory contract.
 
 **Sampling.** Gaussian: reparam `z = μ_q + σ_q·ε`. Discrete (`use_vq=True`, flavor set by
@@ -138,8 +136,8 @@ VQ/FSQ:  loss = mean‖μ − d*‖² + other_loss  # MSE-mean recon (σ untrain
 `STATE=IDENTITY`, `ACTION=IDENTITY` statistical normalization. Visual preprocessing is unchanged.
 The caller is responsible for matching the environment and observation layout.
 
-Keep raw state8/action7, the existing temporal windows, and the clean action-only posterior
-(fed body-frame increments / s, see Padding & masking).
+Keep raw state8/action7, the existing temporal windows (impedance targets extend the state and F/T windows by one
+tick), and the clean action-only posterior (fed body-frame increments / s, see Padding & masking).
 Geometry uses flat poses `[p(3), q_xyzw(4)]` and six-dimensional normalized body increments,
 but state features remain 11-dimensional: `[p, R[:,0], R[:,1], finger_qpos]`, with no feature scaling.
 Joint observation context always uses absolute pose features. With the default
@@ -157,6 +155,43 @@ window; it is held for `n_action_steps` ticks and cleared on reset. Training use
 origin even when drift queries are augmented. `normalize_state=False` keeps absolute drift features.
 This is a drift-input coordinate change, not full-policy frame invariance: context still contains
 absolute proprioception and camera information.
+
+Body mode works in the grip-site (TCP) frame G, the controller's and the F/T's. robosuite's `eef_quat` is the hand
+body's rotation instead (its Panda grippers, FT-4's and LIBERO's, are mounted turned −90° about the hand's z:
+`R_site = R_hand @ Rz(−90°)`; the position is the grip site's already). The policy converts state8 once
+(`hand_to_grip_site` in `forward` / `select_action`), so the prior's absolute pose features, the drift's
+chunk-start-relative (G_0) features and the drift's body outputs (G_t) all use G. World controller
+commands and the action scale (one value per 3-vector) do not change. Checkpoints trained before 2026-10-14 (hand
+frame) need the code before this change.
+
+**Tier-3 impedance targets (`impedance_targets=True`, FT-4 with `--env.impedance=true`).** Instead of the OSC
+command, the drift models the one-step likelihood p(s_{k+1} | s_k, z) of s = (pose relative to x_0, W̄, gripper),
+whose product over the chunk is the chunk's likelihood: 14 outputs, Gaussian `local(x_t, x_{t+1})`, a hurdle W̄_{t+1}
+(Bernoulli contact = W̄_{t+1} ≠ 0 × Gaussian W̄ where in contact) and a Bernoulli gripper, one action scale and σ² per
+Gaussian 3-vector (`IMPEDANCE_GROUPS`), the logits' NLL their BCE. W̄_i is the tick mean of frame i's F/T samples in
+G_i (each sample in its physics step's frame, `geometry.tick_mean_wrench`); W̄_{t+1} is rotated into G_t. The labels
+(`geometry.impedance_one_step`) come from state and F/T windows one tick past the horizon. The data has no state after
+an episode's last action: that frame is extrapolated at constant body velocity from the last two (`_extend_past_end`;
+0.15 mm median error on FT-4) with the F/T held; a window that starts at an episode's last frame cannot extrapolate and
+its x̂_{t+1} leaves the loss (a per-element loss mask). The drift reads W̄_k (`use_ft`, over the W̄
+target's scale), the quantity it predicts, so at deployment `step()` takes the model's own second step from
+(x̂_{t+1}, W̄_{t+1}) (`geometry.impedance_next_state`) and composes the controller's 25 targets x̂_{t+1}, x̂_{t+2},
+W̄_{t+1}, W̄_{t+2}, gripper (`geometry.impedance_action`: metres, radians, N, N·m, gripper).
+The second step's input W̄_{t+1} is gated (1[π > 0.5]·μ_W, 0 off contact like the measured W̄); the controller's
+W̄_{t+1}, W̄_{t+2} are μ_W, zeroed while the measured |W̄_t| force is below `wrench_gate` (default 1 N), so F_d ramps
+to 0 off contact (2026-10-20 evals: gating by the measured force beat the policy's contact probability; 5 N starved
+the Door turn). The posterior reads the clean one-step targets [x̂_{k+1}, W̄_{k+1}]/s and the gripper command, without
+the F/T feature (they hold it), and skips ticks whose x̂_{k+1} is unknown. The controller (`envs/ft4_impedance.py`)
+starts each tick's reference at the measured state and F_d at the measured W̄_t, applies the targets at the measured
+pose and uses the full Λ (deploy ablation 2026-10-23, reactive z16, /240: this 81 vs a reference continued from the
+previous tick 50). State noise (train only, `action_anchor="clean"`) relabels x̂_{t+1} from x̃_k = x_k ⊕ ε_k toward
+x_{k+1} ⊕ (1−β)ε_k, β = `state_noise_gain` the share of ε returned per tick; the F/T input, the W̄ label and the
+posterior stay clean. Wrench noise (train only, `wrench_noise_std` σ, `wrench_noise_gain` β) is its force analogue:
+the drift reads W̃_k = W̄_k + ε_k, ε_k ~ N(0, (σ‖·‖)²) per force / torque 3-vector (none in free space), and the
+W̄_{t+1} label moves by (1−β)ε_k (ticks leaving contact stay out of the hurdle's Gaussian). Needs `use_ft` and the
+padding mask. Options dropped on 2026-10-27 (proportional σ², prior / drift history, a state-trajectory
+posterior, mean / gated controller W̄, the controller's κ anchor, continued reference and decoupled Λ) and checkpoints with
+the earlier 25 two-step outputs (before 2026-10-16) need the code saved with their run (`outputs/queue_tier3/<run>.code.patch`).
 
 Fixed LIBERO unit conversion (0.05 m / 0.5 rad per command) stays private to `geometry.py`;
 it is not a tunable metric or diffusion setting.
@@ -203,23 +238,17 @@ Do not feed the raw sensor reading. With the static weight removed, it still car
 inertial reaction to the OSC acceleration, so in free space it predicts the previous command
 (held-out R² 0.94). A drift fed that reading copied its own last action and reached 5% vs 70%.
 
-`LatentSDEModel.ft_features` turns F/T into per-tick features as selected by `ft_preprocess`:
-- `"asinh"` (12-D): `asinh([last, mean] / c)` of the last control step, with c = 1 N and 0.1 N·m. Its
-  std of ~1 is about 10x the drift's state features.
-- `"forge"` (6-D): Isaac Lab FORGE's sensor model. It is an EMA with FORGE's time constant (0.25 per
-  1/120 s step = 29 ms) over the last 3 control steps, plus training noise `ft_noise·ft_scale` (5%),
-  followed by `tanh(w / ft_scale)`. At deploy, a 3-frame queue repeats the first frame after reset,
-  matching the dataset's padding.
-- `ft_scale` is per axis and comes from the training data unless given: the p90 of |w| over contact frames
-  (|F| > 0.5 N after the EMA), swept before training and cached like `action_scale` (`ft_scale.py`).
-  A typical contact maps to ~0.5 and impacts saturate. The scale has to follow the data: LIBERO's contact
-  p90 is 22/36/73 N, 1.0/3.3/1.8 N·m, Square-FT's 3.8/4.0/12.2 N, 0.63/0.24/0.16 N·m. Runs before
-  2026-10-05 used a fixed 260 N / 12 N·m (LIBERO contact p99) with 1 N / 0.1 N·m noise, which buried
-  Square-FT's contact signal (features 5–20x smaller than the state's). Evaluate those runs with
-  `--policy.ft_scale=[260,260,260,12,12,12]`.
+F/T (`use_ft`, body mode) is read as the tick-mean wrench, the quantity the impedance drift predicts, so OSC and
+impedance policies see the same input: `LatentSDEModel.ft_features` turns each frame's block into W̄_k, the mean of
+its 25 samples, each rotated from its physics step's frame (the body slerp from the previous frame) into the frame's
+grip-site frame G_k (`geometry.tick_mean_wrench`), over `ft_scale`: the data std of the impedance one-step W̄_{t+1}
+target (its `action_scale[6:12]`), taken from the same cached sweep for OSC too. The earlier `ft_preprocess` features
+(`"asinh"`, and `"forge"`: FORGE's EMA + noise + tanh over a p90 scale; LIBERO and FT-4 OSC runs) were removed on
+2026-10-27; their checkpoints need the code before that.
 
-The posterior appends the features to each tick's action input, and the drift appends them to its state
-features. The prior is unchanged. `ft_usage_gap` is the recon error with batch-rolled F/T
+The drift appends W̄_k to its state features, and the OSC posterior to each action (the impedance posterior's
+one-step targets hold W̄ already). The prior is unchanged. Wrench noise perturbs the drift's W̄_k in both modes.
+`ft_usage_gap` is the recon error with batch-rolled F/T
 minus the recon error, so ~0 means the drift ignores F/T. Read it next to `z_usage_gap`, because F/T can
 explain actions that `z` would otherwise carry.
 
@@ -241,7 +270,9 @@ explain actions that `z` would otherwise carry.
   posterior actions.
 - **`h` requires ≥1 image feature** — environment state does not replace visual context.
 - **Dataloader windows** come from the config properties: state always gets
-  `[1-n_obs_steps, horizon)`; images get `[1-n_obs_steps, 1)`; actions get `[0, horizon)`; F/T (`use_ft`) gets `[1-ft_history, horizon)`.
+  `[1-n_obs_steps, horizon)`; images get `[1-n_obs_steps, 1)`; actions get `[0, horizon)`; F/T (`use_ft`) gets `[0, horizon)`.
+  With `impedance_targets` the state and F/T windows end at `horizon + 1`; a window that starts at an episode's last
+  frame has no earlier frame to extrapolate from, so that tick's x̂ target is masked and the posterior skips it.
   The leading `n_obs_steps` states form the causal context, while the trailing `H` states form the
   teacher-forced drift trajectory, overlapping at the current frame. `H = horizon`;
   `n_action_steps ≤ horizon` is the deploy execute/refresh period.
@@ -284,8 +315,10 @@ the latter Gaussian only) · SmolVLM2: `vlm_model_name`, `vlm_num_layers`, `vlm_
 `normalize_state` (clean chunk-start-relative drift inputs: subtraction in Euclidean mode,
 reference-frame pose features in body mode; only Euclidean posterior actions subtract x_0;
 drift targets, integration, and joint observation context remain unchanged) ·
-`use_ft`, `ft_preprocess` (`"asinh"` | `"forge"`; wrist F/T into the posterior and the drift, see above) ·
-`ft_scale` (forge per-axis scale; None → swept from the training data), `ft_noise` (forge train noise, fraction of `ft_scale`) ·
+`impedance_targets` (body mode: Tier-3 one-step likelihood of the next pose, tick-mean wrench and gripper, 14 outputs;
+`wrench_gate`, `state_noise_gain`, `wrench_noise_std`, `wrench_noise_gain` (default 0.3 / 0.3, no state noise on FT-4);
+see body-frame geometry) ·
+`use_ft`, `ft_scale` (body mode: the drift and the OSC posterior read the tick-mean wrench W̄_k, see above) ·
 `deterministic_z_inference` · vision/optim knobs copied verbatim from `DiffusionConfig` for fairness.
 
 ## SmolVLM2 / LIBERO usage

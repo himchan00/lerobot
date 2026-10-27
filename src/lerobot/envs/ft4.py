@@ -252,10 +252,15 @@ EPISODE_LENGTH = {"square_ft": 400, "stack_ft": 300, "wipe_ft": 600, "door_ft": 
 
 
 def make_ft4_task(name: str, image_size: int | None = 256, native: bool = False, camera_depths: bool = False,
-                  contact_rules: bool | None = None):
-    """robosuite env of an FT-4 task: Panda, OSC_POSE kp 150, 20 Hz. `image_size=None` skips rendering."""
+                  contact_rules: bool | None = None, impedance: bool = False):
+    """robosuite env of an FT-4 task: Panda, OSC_POSE kp 150, 20 Hz. `image_size=None` skips rendering.
+    `impedance=True` swaps in the Tier-3 impedance variant of the OSC (ft4_impedance.py, 24 arm action entries)."""
     controller = load_controller_config(default_controller="OSC_POSE")
     controller["kp"] = [150.0] * 6
+    if impedance:
+        from .ft4_impedance import IMPEDANCE
+
+        controller["type"] = IMPEDANCE
     cams = image_size is not None
     return TASKS[name][0](
         native=native,
@@ -277,13 +282,13 @@ def make_ft4_task(name: str, image_size: int | None = 256, native: bool = False,
 
 class FT4Env(gym.Env):
     """An FT-4 task as a gym env. An episode ends at success, or as a failure when a contact rule is broken or Wipe
-    terminates early."""
+    terminates early. `impedance` runs the Tier-3 impedance controller (25-D action, ft4_impedance.py)."""
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 20}
 
     def __init__(self, task: str, contact_rules: bool = True, episode_length: int | None = None,
                  observation_height: int = 256, observation_width: int = 256, render_mode: str = "rgb_array",
-                 camera_error: float = 0.0):
+                 camera_error: float = 0.0, impedance: bool = False):
         super().__init__()
         if observation_height != observation_width:
             raise ValueError("FT-4 renders square images.")
@@ -291,6 +296,9 @@ class FT4Env(gym.Env):
         self.render_mode = render_mode
         self.camera_error = camera_error  # scale of the per-episode camera calibration error (perturb_cameras)
         self.task, self.task_description, self.settle_action = task, TASKS[task][1], TASKS[task][2]
+        self.impedance = impedance
+        if impedance:  # settle by holding the pose: zero targets and wrench, the same gripper command
+            self.settle_action = np.r_[np.zeros(24), self.settle_action[6:]]
         self.contact_rules = contact_rules
         self._max_episode_steps = episode_length or EPISODE_LENGTH[task]
         self._env = None  # created in the worker on first reset (EGL context)
@@ -310,11 +318,15 @@ class FT4Env(gym.Env):
                 "ft_wrench": spaces.Box(low=-np.inf, high=np.inf, shape=(N_SUBSTEPS, 6), dtype=np.float32),
             }
         )
-        self.action_space = spaces.Box(low=-1, high=1, shape=(7,), dtype=np.float32)
+        if impedance:  # metres, radians, N, N·m, then the gripper command
+            self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(25,), dtype=np.float32)
+        else:
+            self.action_space = spaces.Box(low=-1, high=1, shape=(7,), dtype=np.float32)
 
     def _ensure_env(self) -> None:
         if self._env is None:
-            self._env = make_ft4_task(self.task, self.image_size, native=True, contact_rules=self.contact_rules)
+            self._env = make_ft4_task(self.task, self.image_size, native=True, contact_rules=self.contact_rules,
+                                      impedance=self.impedance)
 
     def _format_raw_obs(self, raw_obs: dict) -> RobotObservation:
         robot, data = self._env.robots[0], self._env.sim.data
@@ -357,8 +369,10 @@ class FT4Env(gym.Env):
         return self._format_raw_obs(raw_obs), {"is_success": False}
 
     def step(self, action: np.ndarray) -> tuple[RobotObservation, float, bool, bool, dict[str, Any]]:
-        if action.ndim != 1:
-            raise ValueError(f"Expected a 1-D action, got shape {action.shape}.")
+        if action.shape != self.action_space.shape:  # e.g. an impedance policy on the OSC env (or the reverse)
+            raise ValueError(f"Expected an action of shape {self.action_space.shape}, got {action.shape}.")
+        if self.impedance:  # F_d starts at the measured W̄_t, the world-frame mean of the last F/T block
+            self._env.robots[0].controller.wbar = self._ft_logger.world_mean()
         raw_obs, reward, done, info = self._env.step(action[: self._env.action_dim])
         is_success = bool(self._env._check_success())
         failed = bool(self._env.failed)

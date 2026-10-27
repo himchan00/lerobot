@@ -345,11 +345,12 @@ recording worker 하나가 약 2.5 GB를 쓴다. gpu9(60 GB)에서는 녹화 작
 **학습** (gpu9, wandb `himchan00/lerobot_ft4`, 2026-10-12~13)
 - latent_sde, 30k step, batch 64. 두 run을 같이 돌리면 각각 1.42 step/s이고, 평가까지 약 7시간 걸린다.
 - 평가는 `ft4`(카메라 오차 1, 접촉 규칙)로 10k마다 과제당 50 에피소드다.
-- run 이름: `latent_sde_ft4v2_{native,reactive}_{ft,noft}_30k`. F/T 없는 run은 `--policy.use_ft`, `--policy.ft_preprocess`를 뺀다.
+- run 이름: `latent_sde_ft4v2_{native,reactive}_{ft,noft}_30k`. F/T 없는 run은 `--policy.use_ft`를 뺀다.
+- 아래 결과의 F/T run은 F/T를 FORGE 방식(3 tick EMA + noise + tanh, `--policy.ft_preprocess=forge`)으로 읽었다. 이 옵션은 2026-10-27에 지웠다. 지금 코드는 F/T를 tick 평균 W̄_k로 읽으므로(§2.9) 같은 명령이라도 F/T run은 결과가 다를 수 있다. wrench noise 기본값(§2.10)도 이 실험에는 없었으므로 `--policy.wrench_noise_std=0`으로 끈다.
 - `--wandb.notes` 같은 문자열 인자에 `: `를 넣으면 draccus가 YAML로 읽어 시작 직후 죽는다.
 ```bash
 lerobot-train --policy.type=latent_sde --policy.z_dim=32 --policy.state_noise_std=0 '--policy.down_dims=[512,1024,2048]' \
-    --policy.use_ft=true --policy.ft_preprocess=forge --policy.push_to_hub=false --env.type=ft4 \
+    --policy.use_ft=true --policy.wrench_noise_std=0 --policy.push_to_hub=false --env.type=ft4 \
     --dataset.repo_id=himchan00/ft4v2_reactive --dataset.root=$D/ft4v2_reactive/policy --dataset.video_backend=torchcodec \
     --steps=30000 --batch_size=64 --save_freq=5000 --env_eval_freq=10000 \
     --eval.n_episodes=50 --eval.batch_size=10 --eval.use_async_envs=false \
@@ -413,6 +414,179 @@ reactive 데모가 돕지 않는 이유. conv 데모에는 접촉 전에 보이�
   - 이 실패가 reactive + F/T에서만 두 배다. 원인은 못 찾았다.
 
 결론: native 재생 + F/T가 가장 좋다(58.5). native 전문가의 판단 시점에 접촉이 있어야 F/T가 배울 신호가 생긴다(Stack). 확인된 것은 이 변환(접촉 전에 틀린 목표를 겨냥)이 돕지 않는다는 것까지다. 접촉 전 행동을 참 목표 쪽으로 라벨링하는 DART 방식은 시험하지 않았다. 학습 seed는 하나다.
+
+### 2.9 Latent-SDE body mode의 frame과 Tier-3 impedance 출력 (2026-10-14~)
+
+기호
+- W: world.
+- G: grip site(TCP, 손가락 끝 사이) frame. controller와 F/T가 쓰는 frame이다.
+- G_0: chunk 시작(context와 z를 새로 뽑는 시점, 10 tick마다) 때의 G. G_t: 지금 tick의 G.
+- H: 손 body(`robot0_right_hand`) frame. robosuite의 `robot0_eef_quat`가 이 자세다.
+- G = H·Rz(−90°)이다(FT-4와 LIBERO의 Panda 그리퍼 공통). 위치는 둘 다 grip site 점이다.
+
+| 대상 | 들어가는 것 | frame |
+|---|---|---|
+| 데이터 `observation.state` | 위치, 자세(axis-angle), finger | 위치 W, 자세 H. policy 입구(`forward`, `select_action`)에서 `hand_to_grip_site`로 자세를 G로 한 번 바꾼다 |
+| 데이터 `observation.ft_wrench` | 환경이 그리퍼에 주는 wrench(grip site 점 기준) | 2 ms sample마다 그 순간의 G. policy는 tick 평균 W̄_k를 G_k로 돌려 읽는다(`geometry.tick_mean_wrench`) |
+| Prior 입력 | 이미지 + chunk 시작 state | W에서 본 G_0의 위치와 자세, finger 절대값 |
+| Posterior 입력(학습만) | tick마다 깨끗한 1-step 라벨 | OSC 출력이면 body increment / s + gripper, 그리고 W̄_k(`use_ft`). impedance 출력이면 [x̂_{k+1}, W̄_{k+1}] / s + gripper(F/T 없이, 라벨에 이미 들어 있다) |
+| Drift 입력 | 지금 state + F/T + z | state는 G_0 기준 상대값, F/T는 W̄_k(G_t, `use_ft`; OSC와 impedance가 같은 입력과 scale `ft_scale`) |
+| Drift 출력(OSC) | 다음 step body increment + gripper | G_t. OSC에 넣을 때 W 명령으로 바꾼다 |
+| Drift 출력(impedance, `--policy.impedance_targets=true`) | 1-step likelihood: x̂_{t+1}(Gaussian), W̄_{t+1}(hurdle: 접촉 Bernoulli × Gaussian), 접촉 logit, gripper logit (14) | G_t. 배포 때 모델이 한 step 더 가서 x̂_{t+2}, W̄_{t+2}를 만들고 25개로 controller에 넣는다 |
+| Tier-3 impedance controller 입력(`envs/ft4_impedance.py`, `--env.impedance=true`) | x̂_{t+1}, x̂_{t+2}, W̄_{t+1}, W̄_{t+2} | G_t 기준 상대값. 받자마자 W reference로 복원하고, 계산은 모두 W다 |
+
+**Impedance 출력의 라벨** (`geometry.impedance_one_step`)
+- x̂_{t+1}: 다음 frame에서 실제로 잰 pose를 G_t 기준 body increment로 나타낸 것이다.
+- W̄_{t+1}: frame t+1의 `ft_wrench` 25개 sample 평균(tick 평균)을 G_t로 돌린 것이다. sample마다 기록된 physics step의 frame이 다르므로, 앞뒤 frame 사이를 slerp한 frame으로 각각 돌린 뒤 평균낸다.
+- 접촉 라벨은 W̄_{t+1} ≠ 0이고, gripper 라벨은 command > 0이다. W̄의 Gaussian 항은 접촉 tick에만 loss에 들어간다.
+- 에피소드 끝: 데이터에는 마지막 action 뒤의 state가 없다.
+  - 그 한 frame은 마지막 두 frame의 속도를 유지해 외삽하고(데이터로 잰 오차 0.15 mm), wrench는 마지막 frame 값을 그대로 쓴다.
+  - window가 에피소드의 마지막 frame에서 시작하면 외삽할 앞 frame이 없다. 그래서 그 tick의 x̂는 loss와 posterior에서 뺀다(sample의 약 0.3%). W̄와 gripper는 그대로 학습한다.
+- 정규화: 위치·회전·힘·토크 4묶음마다 데이터 std로 나누고, σ²도 묶음마다 하나다. reactive 데이터에서 2.27 mm, 0.51°, 10.1 N, 0.53 N·m다. 두 logit은 BCE로 학습한다.
+
+**배포** (모델 → controller)
+- 모델이 x̂_{t+1}, W̄_{t+1}을 낸 뒤, 그 상태에서 한 step 더 가서 x̂_{t+2}, W̄_{t+2}를 만든다. 이 두 번째 step의 입력 W̄_{t+1}은 1[π > 0.5]·μ_W다(접촉 확률이 낮으면 0).
+- controller에는 25개 값을 넘긴다: x̂_{t+1}, x̂_{t+2}, W̄_{t+1}, W̄_{t+2}(μ_W), gripper. 측정 힘 |W̄_t|가 `wrench_gate`(1 N) 미만이면 두 W̄를 0으로 둔다.
+- controller(`envs/ft4_impedance.py`)는 매 tick 측정 상태에서 다음 목표까지 quintic reference를 만든다. F_d는 tick 중간(h/2)에서 W̄_{t+1}을 지나는 꺾은선이다(측정 W̄_t → W̄_{t+1} → (W̄_{t+1}+W̄_{t+2})/2).
+- reset 직후 첫 tick은 직전 tick이 없다. 그래서 x̂_{t+1}을 측정 pose에 대해 같은 속도로 거꾸로 이어 직전 tick을 만들고, 시작 속도와 가속도를 구한다. FT-4는 첫 tick이 settle(정지 유지)이라 이 값들과 F_d가 모두 0이다.
+- controller 세팅(aligned, κ = 1, full Λ)과 그 근거는 §2.10에 있다.
+
+**F/T 입력** (OSC와 impedance 공통): drift는 W̄_k를 `ft_scale`로 나눠 읽는다. `ft_scale`은 impedance one-step W̄_{t+1} 라벨의 데이터 std이고, OSC run도 같은 데이터에서 같은 값을 쓴다. OSC posterior는 action과 함께 W̄_k를 읽는다.
+
+**이 코드로 불러오지 못하는 체크포인트**
+- 2026-10-14 이전(자세가 H frame): commit `02005dd5`의 코드로 평가한다.
+- 2026-10-16 이전의 2-step impedance(25출력).
+- 2026-10-27에 뺀 옵션으로 학습한 것:
+  - policy: σ² 비례 모델(`sigma_model=proportional`), `prior_history`·`drift_history`, state 궤적 posterior(`posterior_commands=false`), `wrench_estimate`.
+  - controller: κ < 1, 직전 reference 이어 붙이기, decoupled Λ.
+- F/T를 asinh나 FORGE 방식(`ft_preprocess`)으로 읽은 OSC·LIBERO run. 지금은 F/T를 tick 평균 W̄_k로만 읽는다.
+- `ft_scale`이 config에 없는 impedance 체크포인트는 `ft_scale = action_scale[6:12]`을 config에 써 넣으면 그대로 동작한다.
+
+### 2.10 Tier-3 impedance: 고정한 세팅과 wrench noise 결과 (2026-10)
+
+기호(x̂, W̄, π, μ_W, G)는 §2.9, native / reactive 데이터는 §2.8을 따른다. 아래 세팅이 2026-10-27 코드의 기본값이다.
+
+**평가 방법.** 이 절의 /240 숫자는 모두 다음 명령을 S = 1000, 2000, 3000으로 한 번씩 돌린 합이다. 과제마다 20 × 3 = 60 에피소드이고, 네 과제를 합하면 240이다.
+
+```bash
+lerobot-eval --policy.path=<checkpoint>/pretrained_model --env.type=ft4 --env.impedance=true \
+  --env.camera_error=1.0 --env.contact_rules=true \
+  --eval.n_episodes=20 --eval.batch_size=10 --eval.use_async_envs=false --seed=S --policy.device=cuda
+```
+
+- `camera_error=1.0`: 에피소드마다 카메라 위치와 각도를 흔든다(agentview ±5 mm·±0.5°, wrist ±2 mm·±0.5°).
+- `contact_rules=true`: Stack에서 블록을 짓누르거나 떨어뜨리면 실패다. Wipe에서 40 N을 넘거나 팔이 테이블에 닿아도 실패다. Wipe 마커는 패드 힘이 5–25 N이고 압력 중심이 패드 가운데 60% 안일 때만 지워진다.
+- OSC policy는 `--env.impedance=true`를 빼고 같은 명령으로 잰다.
+- 유의성은 두 비율의 z 검정이다. |z| ≥ 2를 유의로 본다.
+- "학습 중 eval"은 학습하면서 10k step마다 같은 env로 과제당 50 에피소드(seed 1000부터)를 돈 결과다. 에피소드가 달라서 /240 숫자와 직접 비교하지 않는다.
+- 학습 seed는 run마다 하나다.
+
+**고정한 세팅**
+
+| 부분 | 세팅 |
+|---|---|
+| 데이터 | `himchan00/ft4v2_reactive`. reactive 데모는 native보다 학습 중 eval이 약 2배다(30k: native 12.0% → reactive 22.5–27.5%, z_dim 8–64. 대부분 Stack에서 오르고, 아래 aligned controller 이전 값이다). |
+| 출력 | one-step likelihood 14개(§2.9). σ²는 위치·회전·힘·토크 묶음마다 상수다. |
+| 학습 noise | wrench noise σ 0.3, β 0.3이고 state noise는 없다(아래 "Wrench noise"). |
+| z | prior에서 샘플하고 10 tick마다 새로 뽑는다. |
+| 배포 W̄ | 모델의 두 번째 step 입력 W̄_{t+1}은 1[π > 0.5]·μ_W다. controller로 가는 W̄_{t+1}, W̄_{t+2}는 μ_W이고, 측정 힘 \|W̄_t\|가 1 N 미만이면 0이다(`wrench_gate`). |
+| controller | aligned, κ = 1, full Λ(아래). |
+
+학습 명령(z_dim 16 기준; noise 값은 기본값이라 따로 주지 않는다):
+
+```bash
+lerobot-train --policy.type=latent_sde --policy.z_dim=16 '--policy.down_dims=[512,1024,2048]' \
+  --policy.use_ft=true --policy.impedance_targets=true --policy.push_to_hub=false \
+  --env.type=ft4 --env.impedance=true \
+  --dataset.repo_id=himchan00/ft4v2_reactive --dataset.root=<ft4v2_reactive/policy> --dataset.video_backend=torchcodec \
+  --batch_size=64 --steps=30000 --save_freq=5000 --env_eval_freq=10000 \
+  --eval.n_episodes=50 --eval.batch_size=10 --eval.use_async_envs=false \
+  --output_dir=outputs/train/<run> --job_name=<run>
+```
+
+**Controller 비교** (reactive z16, noise 없음, wrench gate 1 N, /240)
+
+비교한 변형:
+- reference 시작: "이어 붙이기"는 tick마다 reference를 직전 tick reference의 끝 상태에서 이어 간다(처음 구현). "aligned"는 tick마다 측정 상태(pose, 속도, 직전 tick의 평균 가속도)에서 새로 시작하고, F_d도 측정 W̄_t에서 시작한다.
+- κ: 정책의 목표(현재 pose 기준 상대값)를 어디에 붙이는지 정한다. κ = 1이면 측정 pose에, κ = 0.5면 측정 pose와 직전 reference 끝의 중간에 붙인다.
+- z: prior에서 샘플하거나, prior 평균을 쓴다.
+- Λ: full은 위치와 자세를 묶은 6×6 operational-space 관성이다. decoupled는 robosuite OSC 기본처럼 둘을 따로 계산한다.
+
+| reference | κ | z | full Λ | decoupled Λ |
+|---|---|---|---|---|
+| 이어 붙이기 | 1 | 샘플 | 50 | 31 |
+| 이어 붙이기 | 1 | 평균 | 69 | 30 |
+| 이어 붙이기 | 0.5 | 샘플 | 112 | 35 |
+| 이어 붙이기 | 0.5 | 평균 | 138 | 46 |
+| **aligned (채택)** | **1** | **샘플** | **81** | 47 |
+| aligned | 1 | 평균 | 103 | 60 |
+
+- **full Λ.** decoupled는 모든 조합에서 크게 떨어지고 Square와 Door가 0에 가까워진다.
+  - full Λ는 예측한 다음 pose x̂_{t+1}을 0.1–0.4 mm로 따라가지만, decoupled는 0.6–2.0 mm(Door 접촉 중 3.5 mm) 벗어난다.
+  - impedance label은 데모에서 실제로 일어난 결과라 controller가 그대로 재현해야 한다. OSC label은 데모 때 같은 controller에 준 명령이라 decoupled여도 괜찮다.
+- **aligned.** 같은 κ = 1, 같은 z에서 이어 붙이기보다 항상 낫다(full Λ에서 +31, +34).
+- **κ = 1, z 샘플.**
+  - 점수는 이어 붙이기 + κ 0.5 + z 평균이 가장 높다.
+  - κ 0.5는 직전 reference의 끝을 목표에 섞는 별도의 적분기다. aligned는 직전 reference를 쓰지 않으므로 κ = 1을 짝으로 정했다. aligned + κ 0.5는 재지 않았다.
+  - z는 정책 정의대로 샘플한다.
+- **wrench gate 1 N.** 켰을 때와 껐을 때의 결과가 엇갈린다.
+  - 이어 붙이기 + κ 0.5 + z 평균: 138 vs 128(켬이 낫다).
+  - 이어 붙이기 + κ 1 + z 샘플: 50 vs 62(끔이 낫다).
+  - aligned에서는 비교하지 않았다.
+  - sim에서는 free space의 W̄가 정확히 0이라 1 N 문턱이 의미가 있다. 실제 센서에서는 다시 정해야 한다.
+
+**Wrench noise.** state noise처럼 F/T 입력에도 교정용 noise를 준다.
+- 정의:
+  - 학습 때 drift 입력을 W̃_k = W̄_k + ε_k로 바꾼다. ε_k ~ N(0, (σ‖W̄_k‖)²)은 힘과 토크 3-vector마다 따로 뽑으므로, free space에서는 0이다.
+  - label W̄_{t+1}은 (1−β)ε_k만큼 옮긴다. 다음 tick에 noise의 β만큼 되돌아오라는 뜻이다.
+  - 값은 σ = 0.3, β = 0.3(`wrench_noise_std`, `wrench_noise_gain`)이다.
+  - σ 0.3은 W̄가 한 tick에 변하는 양(중앙값)의 4–8배이고, Wipe에서는 약 4.2 N이다.
+- state noise(sn): pose 입력에 같은 방식으로 noise를 주고 label을 다시 만든다. σ = 1(action scale 단위, 축당 2.27 mm / 0.51°), β = 0.3이다.
+
+같은 평가 방법, 같은 controller(위 고정 세팅), z16:
+
+| run | Square | Stack | Wipe | Door | 합계 /240 | seed별 /80 |
+|---|---|---|---|---|---|---|
+| noise 없음 (`..._onestep_constant_z16_30k`) | 15 | 39 | 3 | 21 | 78 (32.5%) | 31 / 25 / 22 |
+| wn (`..._z16_wn03_g03_30k`) | 19 | 22 | 5 | 59 | 105 (43.8%) | 41 / 32 / 32 |
+| wn + sn (`..._z16_wn03_g03_sn1_g03_30k`) | 40 | 18 | 0 | 59 | 117 (48.8%) | 42 / 38 / 37 |
+
+(run 이름 앞부분은 `latent_sde_ft4v2_reactive_ft_tcp_onestep_constant_`이다.)
+
+- 합계는 noise 없음 대비 wn이 z ≈ 2.5, wn + sn이 z ≈ 3.6으로 유의하게 오른다. 세 seed 모두 같은 방향이다. wn과 wn + sn의 차이는 유의하지 않다(z ≈ 1.1).
+- 이득의 대부분은 Door다(21 → 59).
+- Square는 state noise를 같이 넣을 때만 오른다(15 → 40).
+- Stack은 39 → 18–22로 유의하게 떨어진다(z ≈ 3.1, 3.8). 원인은 아직 보지 않았다.
+- Wipe는 여전히 거의 0이다.
+- 해석(검증하지 않음): noise 전 Door 실패를 분석해 보니, 정책이 측정 힘을 "문을 얼마나 돌렸나"의 신호로 쓰다가 너무 일찍 당기고 있었다.
+  - F/T 입력만 1.3배로 키우면 Door가 43 → 4/60으로 무너졌다(native 체크포인트, 이전 controller). 입력 힘↑ → F_d↑ → 측정 힘↑의 양의 되먹임이다.
+  - W̄ 입력에 noise를 주면 힘의 정확한 크기에 덜 기대게 되어, 이 되먹임이 약해졌을 수 있다.
+
+학습 중 eval(30k, 과제당 50 에피소드, %):
+
+| run | Square | Stack | Wipe | Door | 전체 |
+|---|---|---|---|---|---|
+| z16 wn | 30 | 60 | 20 | 96 | 51.5 |
+| z16 wn + sn | 52 | 36 | 0 | 98 | 46.5 |
+| z32 wn | 42 | 66 | 16 | 100 | 56.0 |
+| z32 wn + sn | 50 | 44 | 0 | 100 | 48.5 |
+
+- z_dim 32는 16과 같은 수준이다(+2–5, 오차 범위).
+- sn이 Square를 올리고 Stack·Wipe를 내리는 경향은 두 z_dim에서 같다.
+- 여기서는 wn이 wn + sn보다 높아 위 /240 표와 순서가 반대다. 그래서 둘 중 무엇이 나은지는 정하지 않았다. 기본값은 진행 중인 run과 같은 wn이다.
+
+예전 controller에서 state noise만 넣었을 때(학습 중 eval):
+- native 데이터 impedance: 12.0 → 23.5%(Square 8 → 58, Stack 28 → 16).
+- OSC policy에 같은 크기의 state noise: 이득이 없었다(50.5 → 46.5%).
+
+**진행 중**(2026-10-27 시작) — z32 wn 세팅에서 한 가지씩 바꾼 두 run:
+- `latent_sde_ft4v2_native_ft_tcp_onestep_constant_z32_wn03_g03_30k`: reactive 대신 native 데이터.
+- `latent_sde_ft4v2_reactive_ft_tcp_osc_z32_wn03_g03_30k`: impedance 대신 OSC 출력(`--policy.impedance_targets`, `--env.impedance`를 뺌). OSC도 같은 W̄_k 입력과 `ft_scale`, 같은 wrench noise를 쓴다(label 이동은 없음). 그래서 F/T 입력까지 맞춘 OSC 비교가 된다.
+
+**남은 문제: Wipe.** eval 노트북(`src/lerobot/policies/latent_sde/ft4_eval_viz.ipynb`)으로 wn + sn의 seed 1000 에피소드를 보면, 접촉 tick의 85–91%가 "uneven"(압력 중심이 가운데 60% 밖)이다.
+- 압력 중심은 패드 긴 축의 가장자리에 붙어 있다.
+- 패드는 접촉 전부터 짧은 축을 중심으로 3–5° 기울어 있다.
+- 마커 100개 중 84–88개는 패드가 한 번도 지나가지 않았다.
 
 ## 3. LIBERO 학습 세팅과 근거 (논문용)
 

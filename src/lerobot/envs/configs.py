@@ -467,13 +467,16 @@ class FT4Env(EnvConfig):
     Same observations as LiberoEnv with ft_wrench=True: agentview and eye-in-hand images, robot_state, and
     `observation.ft_wrench`. `camera_error` scales the camera calibration error drawn every episode
     (ft4.perturb_cameras; 0: none). `contact_rules`: crushing or dropping the block (Stack) and wiping outside 5-25 N
-    (Wipe) fail. Datasets: examples/port_datasets/ft4.
+    (Wipe) fail. `impedance`: the Tier-3 impedance controller (envs/ft4_impedance.py), whose 25-D action holds the
+    next two poses and the tick-mean wrenches of the next two ticks in the grip-site frame, then the gripper command
+    (Wipe steps with the first 24). Datasets: examples/port_datasets/ft4.
     """
 
     task: str = "ft4"
     tasks: list[str] = field(default_factory=list)  # empty: all four
     camera_error: float = 1.0
     contact_rules: bool = True
+    impedance: bool = False
     fps: int = 20
     episode_length: int = 400  # each task uses its own (ft4.EPISODE_LENGTH)
     observation_height: int = 256
@@ -493,7 +496,7 @@ class FT4Env(EnvConfig):
     def __post_init__(self):
         image = PolicyFeature(type=FeatureType.VISUAL, shape=(self.observation_height, self.observation_width, 3))
         self.features = {
-            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
+            ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(25 if self.impedance else 7,)),
             LIBERO_KEY_PIXELS_AGENTVIEW: image,
             LIBERO_KEY_PIXELS_EYE_IN_HAND: image,
             LIBERO_KEY_EEF_POS: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
@@ -507,6 +510,7 @@ class FT4Env(EnvConfig):
             "episode_length": self.episode_length,
             "observation_height": self.observation_height,
             "observation_width": self.observation_width,
+            "impedance": self.impedance,
         }
 
     def create_envs(self, n_envs: int, use_async_envs: bool = False):
